@@ -1,5 +1,5 @@
 // user management file. This controller allows an Admin to manage their team.
-import User from "../models/User.js";
+import User from "../models/user.js";
 
 // =====================================================
 // GET ALL USERS IN ORGANIZATION
