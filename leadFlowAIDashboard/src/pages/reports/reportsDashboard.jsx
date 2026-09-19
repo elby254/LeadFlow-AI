@@ -25,7 +25,7 @@
  * ==========================================================
  */
 
-import MainLayout from "../../components/layout/mainLayout";
+import MainLayout from "../../components/layout/mainlayout";
 
 import PageHeader from "../../components/common/pageHeader";
 

@@ -56,7 +56,7 @@ import {
   MessageCircle,
 } from "lucide-react";
 
-import MainLayout from "../../components/layout/mainLayout";
+import MainLayout from "../../components/layout/mainlayout";
 import PageHeader from "../../components/common/pageHeader";
 import LoadingSpinner from "../../components/common/loadingSpinner";
 import ErrorCard from "../../components/common/errorCard";

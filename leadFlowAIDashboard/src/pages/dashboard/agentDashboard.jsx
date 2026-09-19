@@ -12,7 +12,7 @@
  * ==========================================================
  */
 
-import MainLayout from "../../components/layout/mainLayout";
+import MainLayout from "../../components/layout/mainlayout";
 
 import DashboardHeader from "../../components/dashboard/agent/dashboardHeader";
 import TodayWork from "../../components/dashboard/agent/todaysWork";

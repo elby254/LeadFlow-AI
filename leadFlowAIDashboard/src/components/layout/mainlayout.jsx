@@ -31,8 +31,8 @@ import { useState } from "react";
 
 import { Outlet } from "react-router-dom";
 
-import SidebarRouter from "./sidebars/SidebarRouter";
-import Topbar from "./Topbar";
+import SidebarRouter from "./sidebars/sidebarRouter";
+import Topbar from "./topbar";
 
 
 const MainLayout = () => {

@@ -35,7 +35,7 @@ import {
   MapPin,
 } from "lucide-react";
 
-import MainLayout from "../../components/layout/mainLayout";
+import MainLayout from "../../components/layout/mainlayout";
 
 import LoadingSpinner from "../../components/common/loadingSpinner";
 

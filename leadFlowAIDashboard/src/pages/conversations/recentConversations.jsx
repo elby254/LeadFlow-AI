@@ -37,7 +37,7 @@ import {
   ArrowRight,
 } from "lucide-react";
 
-import MainLayout from "../../components/layout/mainLayout";
+import MainLayout from "../../components/layout/mainlayout";
 import useConversations from "../../hooks/useConversations";
 
 console.log("RecentConversations page mounted");

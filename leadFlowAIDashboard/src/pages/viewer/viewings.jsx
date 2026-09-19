@@ -31,7 +31,7 @@ import { useViewingContext } from "../../context/viewingContext";
 import ViewingRequestCard from "../../components/dashboard/viewer/viewingRequestCard";
 import ViewingTimeline from "../../components/dashboard/viewer/viewingTimeline";
 import ViewingDetailsCard from "../../components/dashboard/viewer/viewingDetailsCard";
-import UpcomingViewingCard from "../../components/dashboard/viewer/UpcomingViewingCard";
+import UpcomingViewingCard from "../../components/dashboard/viewer/upcomingViewingCard";
 
 // ======================================================
 // COMPONENT
