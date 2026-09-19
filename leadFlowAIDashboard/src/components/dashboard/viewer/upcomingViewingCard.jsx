@@ -12,7 +12,7 @@ import {
 
 } from "lucide-react";
 
-import StatusBadge from "../../common/StatusBadge";
+import StatusBadge from "../../common/statusBadge";
 
 const UpcomingViewingCard = ({
 
