@@ -161,84 +161,207 @@ export const sendWhatsAppMessage = async (
   );
 
 
-  const response =
-    await axios.post(
+  try {
 
-      url,
+    const response =
+      await axios.post(
 
-      {
+        url,
 
-        messaging_product:
-          "whatsapp",
+        {
 
-        recipient_type:
-          "individual",
+          messaging_product:
+            "whatsapp",
 
-        to:
-          normalizedPhone,
+          recipient_type:
+            "individual",
 
-        type:
-          "text",
+          to:
+            normalizedPhone,
 
-        text: {
+          type:
+            "text",
 
-          preview_url:
-            false,
+          text: {
 
-          body:
-            message,
+            preview_url:
+              false,
 
-        },
+            body:
+              message,
 
-      },
-
-      {
-
-        headers: {
-
-          Authorization:
-            `Bearer ${accessToken}`,
-
-          "Content-Type":
-            "application/json",
+          },
 
         },
 
-      }
+        {
 
+          headers: {
+
+            Authorization:
+              `Bearer ${accessToken}`,
+
+            "Content-Type":
+              "application/json",
+
+          },
+
+        }
+
+      );
+
+
+    console.log(
+      "✅ WhatsApp message accepted:",
+      response.data
     );
 
 
-  console.log(
-    "✅ WhatsApp message accepted:",
-    response.data
-  );
+    return {
+
+      success:
+        true,
+
+      provider:
+        "whatsapp",
+
+      channel:
+        "whatsapp",
+
+      transport:
+        "whatsapp",
+
+      recipient:
+        normalizedPhone,
+
+      phoneNumberId:
+        organizationPhoneNumberId,
+
+      providerResponse:
+        response.data,
+
+    };
+
+  } catch (error) {
+
+    /*
+     * ========================================================
+     * SECURITY
+     * ========================================================
+     *
+     * NEVER log the complete Axios error object here.
+     *
+     * Axios errors can contain:
+     *
+     * - Authorization headers
+     * - access tokens
+     * - request configuration
+     * - request body
+     * - internal connection details
+     *
+     * We deliberately extract only safe diagnostic information.
+     */
+
+    const status =
+      error?.response?.status ||
+      null;
 
 
-  return {
+    const statusText =
+      error?.response?.statusText ||
+      null;
 
-    success:
-      true,
 
-    provider:
-      "whatsapp",
+    const providerError =
+      error?.response?.data?.error ||
+      null;
 
-    channel:
-      "whatsapp",
 
-    transport:
-      "whatsapp",
+    const providerMessage =
+      providerError?.message ||
+      null;
 
-    recipient:
-      normalizedPhone,
 
-    phoneNumberId:
-      organizationPhoneNumberId,
+    const providerCode =
+      providerError?.code ||
+      null;
 
-    providerResponse:
-      response.data,
 
-  };
+    const providerType =
+      providerError?.type ||
+      null;
+
+
+    const safeMessage =
+      providerMessage ||
+      error?.message ||
+      "Unknown WhatsApp API error";
+
+
+    console.error(
+      "❌ WhatsApp API request failed",
+      {
+
+        status,
+
+        statusText,
+
+        message:
+          safeMessage,
+
+        providerCode,
+
+        providerType,
+
+        phoneNumberId:
+          organizationPhoneNumberId,
+
+        recipient:
+          normalizedPhone,
+
+      }
+    );
+
+
+    /*
+     * Preserve useful information for the caller without
+     * returning or exposing the access token.
+     */
+
+    const safeError =
+      new Error(
+        safeMessage
+      );
+
+
+    safeError.status =
+      status;
+
+
+    safeError.statusText =
+      statusText;
+
+
+    safeError.providerCode =
+      providerCode;
+
+
+    safeError.providerType =
+      providerType;
+
+
+    safeError.phoneNumberId =
+      organizationPhoneNumberId;
+
+
+    safeError.recipient =
+      normalizedPhone;
+
+
+    throw safeError;
+
+  }
+
 };
 
 
