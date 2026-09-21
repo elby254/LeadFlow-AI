@@ -69,6 +69,8 @@ import ForgotPassword from "./pages/auth/forgotPassword";
 import VerifyOTP from "./pages/auth/verifyOTP";
 import ResetPassword from "./pages/auth/resetPassword";
 
+import PrivacyPolicy from "./pages/privacyPolicy";
+
 
 /* ==========================================================
    ADMIN
@@ -261,6 +263,11 @@ export default function App() {
         <Route
           path="/reset-password"
           element={<ResetPassword />}
+        />
+
+        <Route
+          path="/privacy-policy"
+          element={<PrivacyPolicy />}
         />
 
 
