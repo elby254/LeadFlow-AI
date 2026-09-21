@@ -1584,6 +1584,30 @@ export const mergeExtractedData = (
 // ==========================================================
 // RESOLVE ORGANIZATION ID
 // ==========================================================
+//
+// IMPORTANT:
+//
+// For channel-based ingestion, the organization should
+// normally already be resolved by the channel resolver:
+//
+// WhatsApp webhook
+//       ↓
+// whatsappAdapter
+//       ↓
+// resolveChannelOrganization
+//       ↓
+// req.organizationId
+//       ↓
+// AI ingestion
+//
+// This helper preserves the existing fallback behavior for
+// non-channel/internal callers.
+//
+// WhatsApp outbound transport does NOT use this fallback.
+// messageTransportService resolves the organization's
+// WhatsApp configuration directly from organizationId.
+//
+// ==========================================================
 
 export const resolveOrganizationId = (
   req

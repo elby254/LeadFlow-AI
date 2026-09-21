@@ -184,17 +184,6 @@ const isHttpResponse = (
 // ==========================================================
 // NORMALIZED MESSAGE DETECTION
 // ==========================================================
-//
-// Channel adapters now place the canonical customer
-// conversation payload in:
-//
-//   req.normalizedMessage
-//
-// The controller consumes that contract instead of
-// understanding WhatsApp, SMS, Website, or Facebook
-// provider-specific payload structures.
-//
-// ==========================================================
 
 const hasNormalizedMessage = (
   req
@@ -211,25 +200,6 @@ const hasNormalizedMessage = (
 
 // ==========================================================
 // PREPARE NORMALIZED INGESTION INPUT
-// ==========================================================
-//
-// The adapter is responsible for provider-specific parsing.
-//
-// The AI ingestion controller is responsible for business
-// processing only.
-//
-// We therefore resolve the canonical fields once here.
-//
-// Backward compatibility is preserved for callers that still
-// provide:
-//
-// {
-//   body: {
-//     phone,
-//     message
-//   }
-// }
-//
 // ==========================================================
 
 const prepareIngestionInput = (
@@ -321,18 +291,6 @@ const prepareIngestionInput = (
   // ========================================================
   // LEGACY / INTERNAL CONTRACT
   // ========================================================
-  //
-  // Preserve existing callers that directly invoke:
-  //
-  // ingestMessage({
-  //   body: {
-  //     phone,
-  //     message
-  //   },
-  //   organizationId
-  // })
-  //
-  // ========================================================
 
   const body =
     req?.body ||
@@ -391,14 +349,6 @@ const prepareIngestionInput = (
 // ==========================================================
 // SAFE LEAD STATUS
 // ==========================================================
-//
-// AI qualification stage and Lead status are related but
-// should never blindly receive arbitrary AI text.
-//
-// We preserve the existing LeadFlow AI behaviour while
-// preventing unknown AI stages from poisoning the Lead model.
-//
-// ==========================================================
 
 const normalizeLeadStatus = (
   value,
@@ -442,15 +392,6 @@ const normalizeLeadStatus = (
 
 // ==========================================================
 // CONVERSATION STATUS SAFETY
-// ==========================================================
-//
-// IMPORTANT:
-//
-// Do NOT copy Lead.followUpStatus directly into
-// Conversation.status.
-//
-// The Conversation schema has its own enum.
-//
 // ==========================================================
 
 const isValidConversationStatus = (
@@ -529,23 +470,6 @@ const processIngestion = async (
   // ========================================================
   // 1A. NORMALIZED MESSAGE CONTRACT
   // ========================================================
-  //
-  // Channel adapters are now the provider-specific boundary.
-  //
-  // The controller prefers:
-  //
-  // req.normalizedMessage
-  //
-  // but the adapter also maintains:
-  //
-  // req.body = {
-  //   phone,
-  //   message
-  // }
-  //
-  // for backward compatibility.
-  //
-  // ========================================================
 
   const ingestionInput =
     prepareIngestionInput(
@@ -556,18 +480,6 @@ const processIngestion = async (
 
   // ========================================================
   // 1B. REQUEST BODY CONTRACT
-  // ========================================================
-  //
-  // ONLY:
-  //
-  // {
-  //   phone: "254712345678",
-  //   message: "..."
-  // }
-  //
-  // The provider-specific payload has already been consumed
-  // by the channel adapter before this controller executes.
-  //
   // ========================================================
 
   const allowedBodyFields = [
@@ -604,16 +516,6 @@ const processIngestion = async (
   // ========================================================
   // 2. RESOLVE ORGANIZATION
   // ========================================================
-  //
-  // IMPORTANT:
-  //
-  // When a channel adapter has already resolved the
-  // organization, the normalized contract is authoritative.
-  //
-  // We expose it through req.organizationId so the existing
-  // downstream ingestion services continue to work unchanged.
-  //
-  // ========================================================
 
   if (
     ingestionInput.organizationId &&
@@ -636,13 +538,6 @@ const processIngestion = async (
 
   // ========================================================
   // 3. RESOLVE SOURCE
-  // ========================================================
-  //
-  // The standardized adapter provides channel.
-  //
-  // Preserve the existing resolveSource() helper and make
-  // the normalized channel available to it.
-  //
   // ========================================================
 
   if (
@@ -677,12 +572,6 @@ const processIngestion = async (
 
   // ========================================================
   // 4. EXTRACT INPUT
-  // ========================================================
-  //
-  // Prefer the standardized normalizedMessage contract.
-  //
-  // Legacy body input remains supported.
-  //
   // ========================================================
 
   const rawPhone =
@@ -932,14 +821,6 @@ const processIngestion = async (
   // ========================================================
   // 9A.1 RESOLVE CUSTOMER NAME
   // ========================================================
-  //
-  // Priority:
-  //
-  // 1. Channel/profile metadata
-  // 2. Current message
-  // 3. Existing lead
-  //
-  // ========================================================
 
   let customerName =
     channelCustomerName ||
@@ -960,10 +841,6 @@ const processIngestion = async (
 
   // ========================================================
   // 9B. MERGE EXTRACTION
-  // ========================================================
-  //
-  // CURRENT MESSAGE WINS.
-  //
   // ========================================================
 
   const extractedData =
@@ -1091,11 +968,6 @@ const processIngestion = async (
 
 
 
-  // ========================================================
-  // PRIMARY LOOKUP
-  // ORGANIZATION + PHONE
-  // ========================================================
-
   if (
     phone
   ) {
@@ -1111,11 +983,6 @@ const processIngestion = async (
   }
 
 
-
-  // ========================================================
-  // FALLBACK LOOKUP
-  // ORGANIZATION + NAME
-  // ========================================================
 
   if (
     !lead &&
@@ -1270,19 +1137,6 @@ const processIngestion = async (
 
   // ========================================================
   // 14. PROGRESSIVE CUSTOMER ENRICHMENT
-  // ========================================================
-  //
-  // IMPORTANT:
-  //
-  // Existing memory is NOT allowed to overwrite the
-  // current message.
-  //
-  // Current message values are applied below whenever
-  // they exist.
-  //
-  // Fields not present in the current message remain
-  // untouched, preserving existing lead memory.
-  //
   // ========================================================
 
   if (
@@ -2001,22 +1855,6 @@ const processIngestion = async (
   // ========================================================
   // 31A. CONVERSATION STATUS
   // ========================================================
-  //
-  // IMPORTANT:
-  //
-  // We DO NOT do:
-  //
-  // conversation.status = lead.followUpStatus
-  //
-  // because Lead.followUpStatus and Conversation.status are
-  // different state machines.
-  //
-  // The conversation qualification/state services already
-  // own conversation status.
-  //
-  // We only accept an explicitly valid conversation status.
-  //
-  // ========================================================
 
   const candidateConversationStatus =
     safeString(
@@ -2355,10 +2193,32 @@ const processIngestion = async (
   // ========================================================
   // 39. AUTO REPLY
   // ========================================================
+  //
+  // normalizedSource is trusted because it came from the
+  // channel adapter / normalized message contract.
+  //
+  // We explicitly pass the source forward so the outbound
+  // transport layer knows whether this conversation came from:
+  //
+  //     whatsapp
+  //     sms
+  //     website
+  //     facebook
+  //
+  // The customer's message cannot choose the transport.
+  //
+  // ========================================================
 
   console.log(
     "📤 SENDING AUTO REPLY TO:",
     lead.phone
+  );
+
+
+
+  console.log(
+    "📡 AUTO REPLY CHANNEL:",
+    normalizedSource
   );
 
 
@@ -2373,7 +2233,25 @@ const processIngestion = async (
 
     state,
 
-    extractedData
+    {
+
+      ...extractedData,
+
+      channel:
+        normalizedSource,
+
+      source:
+        normalizedSource,
+
+      organizationId:
+        organizationId,
+
+      channelMetadata:
+        ingestionInput.metadata ||
+        req?.channelMetadata ||
+        {},
+
+    }
 
   );
 
@@ -2425,47 +2303,6 @@ const processIngestion = async (
 
 // ==========================================================
 // PUBLIC INGEST MESSAGE
-// ==========================================================
-//
-// Supports:
-//
-// NEW ADAPTER CONTRACT:
-//
-//   ingestMessage({
-//     body: {
-//       phone,
-//       message
-//     },
-//     normalizedMessage: {
-//       channel,
-//       organizationId,
-//       customer: {
-//         name,
-//         phone,
-//         externalId
-//       },
-//       message: {
-//         text,
-//         type,
-//         externalMessageId
-//       },
-//       metadata
-//     }
-//   })
-//
-//
-// Existing HTTP:
-//
-//   ingestMessage(req, res)
-//
-//
-// Existing internal:
-//
-//   ingestMessage({
-//     body: payload,
-//     organizationId
-//   })
-//
 // ==========================================================
 
 export const ingestMessage = async (

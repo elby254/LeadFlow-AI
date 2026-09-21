@@ -73,6 +73,7 @@ const normalizeMissingFields = (
   missingFields,
   lead
 ) => {
+
   /* --------------------------------------------------------
      ARRAY FORMAT
      -------------------------------------------------------- */
@@ -82,7 +83,9 @@ const normalizeMissingFields = (
       missingFields
     )
   ) {
+
     return {
+
       location:
         missingFields.includes(
           "location"
@@ -110,6 +113,7 @@ const normalizeMissingFields = (
         missingFields.includes(
           "phone"
         ),
+
     };
   }
 
@@ -122,7 +126,9 @@ const normalizeMissingFields = (
     typeof missingFields ===
       "object"
   ) {
+
     return {
+
       location:
         Boolean(
           missingFields.location
@@ -150,6 +156,7 @@ const normalizeMissingFields = (
         Boolean(
           missingFields.phone
         ),
+
     };
   }
 
@@ -167,6 +174,7 @@ const normalizeMissingFields = (
     );
 
   return {
+
     location:
       derivedMissing.includes(
         "location"
@@ -191,6 +199,7 @@ const normalizeMissingFields = (
       derivedMissing.includes(
         "phone"
       ),
+
   };
 };
 
@@ -201,10 +210,12 @@ const normalizeMissingFields = (
 const isMissingFieldsComplete = (
   missingFields
 ) => {
+
   return !Object.values(
     missingFields
   ).some(
-    (value) => value === true
+    (value) =>
+      value === true
   );
 };
 
@@ -218,6 +229,7 @@ export const generateAIResponse = (
   conversationContext = {},
   state = {}
 ) => {
+
   const totalMessages =
     conversationContext?.messages
       ?.length || 0;
@@ -293,6 +305,7 @@ export const generateAIResponse = (
     );
 
   const effectiveState = {
+
     ...state,
 
     stage:
@@ -303,6 +316,7 @@ export const generateAIResponse = (
 
     missingFields:
       normalizedMissingFields,
+
   };
 
   console.log(
@@ -320,6 +334,7 @@ export const generateAIResponse = (
     !state ||
     typeof state !== "object"
   ) {
+
     console.warn(
       "⚠️ No conversation state supplied."
     );
@@ -332,10 +347,13 @@ export const generateAIResponse = (
     if (
       derivedComplete
     ) {
+
       console.log(
         "✅ Lead is already fully qualified despite missing state."
       );
+
     } else {
+
       return `
 Hi 👋
 
@@ -361,6 +379,7 @@ What kind of property are you looking for?
     effectiveState.stage ===
       "qualified"
   ) {
+
     console.log(
       "🎯 QUALIFICATION COMPLETE — qualified response selected."
     );
@@ -374,6 +393,7 @@ What kind of property are you looking for?
         lead?.score || 0
       ) >= 70
     ) {
+
       return `
 🔥 Excellent!
 
@@ -425,6 +445,7 @@ An agent will review suitable properties and contact you shortly.
   if (
     totalMessages <= 1
   ) {
+
     const nextQuestion =
       getNextQuestion(
         lead
@@ -472,6 +493,7 @@ I'll help you find the right property.
   if (
     missing.location
   ) {
+
     console.log(
       "➡️ Asking for LOCATION"
     );
@@ -496,6 +518,7 @@ Examples:
   if (
     missing.budget
   ) {
+
     console.log(
       "➡️ Asking for BUDGET"
     );
@@ -519,6 +542,7 @@ What budget range are you considering?
   if (
     missing.bedrooms
   ) {
+
     console.log(
       "➡️ Asking for BEDROOMS"
     );
@@ -542,6 +566,7 @@ How many bedrooms do you need?
   if (
     missing.moveDate
   ) {
+
     console.log(
       "➡️ Asking for MOVE DATE"
     );
@@ -563,6 +588,7 @@ When would you like to move?
   if (
     missing.phone
   ) {
+
     console.log(
       "➡️ Asking for PHONE NUMBER"
     );
@@ -591,6 +617,7 @@ for viewing arrangements?
   if (
     finalMissing.length === 0
   ) {
+
     console.log(
       "🎯 Final lead check confirms qualification is complete."
     );
@@ -600,6 +627,7 @@ for viewing arrangements?
         lead?.score || 0
       ) >= 70
     ) {
+
       return `
 🔥 Excellent!
 

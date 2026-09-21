@@ -28,8 +28,8 @@
  * ┌───────────────────────────────────────────────┐
  * │                                               │
  * │ sms       → Africa's Talking SMS              │
- * │ whatsapp  → WhatsApp transport               │
- * │ website   → website transport / SMS fallback  │
+ * │ whatsapp  → WhatsApp Cloud API               │
+ * │ website   → Website realtime transport        │
  * │ facebook  → Facebook transport                │
  * │                                               │
  * └───────────────────────────────────────────────┘
@@ -53,51 +53,23 @@
  * ingestion layer.
  *
  * ============================================================
- *
- * SMS PROVIDER
- * ------------------------------------------------------------
- *
- * SMS is STRICTLY handled by:
- *
- *     africastalkingService.js
- *
- * This service does NOT implement SMS itself.
- *
- * It delegates SMS delivery to:
- *
- *     sendSMS()
- *
- * from Africa's Talking service.
- *
- * ============================================================
  */
 
 import {
   sendSMS,
 } from "./africastalkingService.js";
 
+import {
+  sendWhatsAppMessage,
+} from "./whatsappService.js";
+
+import Organization from "../models/organization.js";
+
+
 /* ============================================================
    SUPPORTED SOURCES
 ============================================================ */
 
-/**
- * These are the communication sources currently supported
- * by LeadFlow AI.
- *
- * IMPORTANT:
- *
- * These values represent CHANNELS, not Lead.status values.
- *
- * Lead.status remains:
- *
- *     new
- *     contacted
- *     qualified
- *     viewing
- *     negotiation
- *     won
- *     lost
- */
 const VALID_SOURCES = [
   "sms",
   "whatsapp",
@@ -105,32 +77,20 @@ const VALID_SOURCES = [
   "facebook",
 ];
 
+
 /* ============================================================
    NORMALIZE SOURCE
 ============================================================ */
 
-/**
- * Normalizes a trusted source value.
- *
- * This function does NOT read source from the customer's
- * message body.
- *
- * The caller must supply the trusted source.
- *
- * Supported canonical values:
- *
- *     sms
- *     whatsapp
- *     website
- *     facebook
- */
 const normalizeSource = (
   source
 ) => {
+
   if (
     source === null ||
     source === undefined
   ) {
+
     return "";
   }
 
@@ -140,8 +100,10 @@ const normalizeSource = (
       .toLowerCase();
 
   if (!normalized) {
+
     return "";
   }
+
 
   /* ----------------------------------------------------------
      SMS
@@ -153,10 +115,14 @@ const normalizeSource = (
       "text",
       "text_message",
       "text-message",
-    ].includes(normalized)
+    ].includes(
+      normalized
+    )
   ) {
+
     return "sms";
   }
+
 
   /* ----------------------------------------------------------
      WHATSAPP
@@ -167,10 +133,14 @@ const normalizeSource = (
       "whatsapp",
       "whats_app",
       "whats-app",
-    ].includes(normalized)
+    ].includes(
+      normalized
+    )
   ) {
+
     return "whatsapp";
   }
+
 
   /* ----------------------------------------------------------
      WEBSITE
@@ -183,10 +153,14 @@ const normalizeSource = (
       "site",
       "webchat",
       "web_chat",
-    ].includes(normalized)
+    ].includes(
+      normalized
+    )
   ) {
+
     return "website";
   }
+
 
   /* ----------------------------------------------------------
      FACEBOOK
@@ -197,31 +171,31 @@ const normalizeSource = (
       "facebook",
       "messenger",
       "fb",
-    ].includes(normalized)
+    ].includes(
+      normalized
+    )
   ) {
+
     return "facebook";
   }
 
   return "";
 };
 
+
 /* ============================================================
    VALIDATE PHONE
 ============================================================ */
 
-/**
- * Validates the destination phone number.
- *
- * LeadFlow AI currently uses phone as the primary customer
- * communication identifier for SMS and WhatsApp.
- */
 const validatePhone = (
   phone
 ) => {
+
   if (
     phone === null ||
     phone === undefined
   ) {
+
     return false;
   }
 
@@ -230,20 +204,20 @@ const validatePhone = (
   );
 };
 
+
 /* ============================================================
    VALIDATE MESSAGE
 ============================================================ */
 
-/**
- * Validates the outbound message.
- */
 const validateMessage = (
   message
 ) => {
+
   if (
     message === null ||
     message === undefined
   ) {
+
     return false;
   }
 
@@ -252,539 +226,722 @@ const validateMessage = (
   );
 };
 
+
+/* ============================================================
+   RESOLVE ORGANIZATION WHATSAPP CONFIG
+============================================================ */
+
+/**
+ * WhatsApp Phone Number IDs are organization-scoped.
+ *
+ * IMPORTANT:
+ *
+ * We deliberately DO NOT use:
+ *
+ *     process.env.WHATSAPP_PHONE_NUMBER_ID
+ *
+ * The access token remains server configuration.
+ *
+ * The Phone Number ID comes from the Organization document.
+ */
+
+const getOrganizationWhatsAppConfig =
+  async (
+    organizationId
+  ) => {
+
+    if (
+      !organizationId
+    ) {
+
+      throw new Error(
+        "Organization ID is required for WhatsApp outbound delivery."
+      );
+    }
+
+
+    const organization =
+      await Organization
+        .findById(
+          organizationId
+        )
+        .select(
+          "whatsappPhoneNumberId whatsappBusinessAccountId whatsappBusinessNumber whatsappDisplayName whatsappEnabled"
+        )
+        .lean();
+
+
+    if (
+      !organization
+    ) {
+
+      throw new Error(
+        "Organization could not be found for WhatsApp outbound delivery."
+      );
+    }
+
+
+    if (
+      !organization.whatsappEnabled
+    ) {
+
+      throw new Error(
+        "WhatsApp is not enabled for this organization."
+      );
+    }
+
+
+    if (
+      !organization.whatsappPhoneNumberId
+    ) {
+
+      throw new Error(
+        "Organization WhatsApp Phone Number ID is not configured."
+      );
+    }
+
+
+    return organization;
+  };
+
+
 /* ============================================================
    WHATSAPP TRANSPORT
 ============================================================ */
 
-/**
- * WhatsApp transport placeholder.
- *
- * IMPORTANT:
- *
- * We intentionally do NOT pretend that a WhatsApp provider
- * exists in the current codebase.
- *
- * Once the LeadFlow AI WhatsApp service is connected, this
- * function should delegate to that service.
- *
- * DO NOT route WhatsApp through Africa's Talking SMS unless
- * the actual WhatsApp provider implementation explicitly
- * supports it.
- */
 const sendWhatsApp = async ({
   phone,
   message,
   context = {},
 }) => {
-  console.warn(
-    "⚠️ WhatsApp transport is not configured yet.",
+
+  console.log(
+    "💬 TRANSPORT: WhatsApp Cloud API"
+  );
+
+
+  const organizationId =
+    context?.organizationId;
+
+
+  if (
+    !organizationId
+  ) {
+
+    throw new Error(
+      "Organization ID is required for WhatsApp transport."
+    );
+  }
+
+
+  const organization =
+    await getOrganizationWhatsAppConfig(
+      organizationId
+    );
+
+
+  console.log(
+    "🏢 WHATSAPP ORGANIZATION CONFIG:",
     {
-      phone,
-      source:
-        context?.source ||
-        "whatsapp",
+
+      organizationId,
+
+      phoneNumberId:
+        organization.whatsappPhoneNumberId,
+
+      businessAccountId:
+        organization.whatsappBusinessAccountId,
+
+      businessNumber:
+        organization.whatsappBusinessNumber,
+
+      displayName:
+        organization.whatsappDisplayName,
+
+      enabled:
+        organization.whatsappEnabled,
+
     }
   );
 
-  /**
-   * Returning a structured result allows the caller to
-   * distinguish an unavailable transport from a successful
-   * delivery.
-   */
-  return {
-    success: false,
-    transport: "whatsapp",
-    provider: null,
-    reason:
-      "WhatsApp transport is not configured.",
-  };
+
+  const result =
+    await sendWhatsAppMessage(
+      phone,
+      message,
+      organization.whatsappPhoneNumberId
+    );
+
+
+  console.log(
+    "✅ WHATSAPP TRANSPORT COMPLETE:",
+    {
+
+      organizationId,
+
+      phoneNumberId:
+        organization.whatsappPhoneNumberId,
+
+      recipient:
+        phone,
+
+    }
+  );
+
+
+  return result;
 };
+
 
 /* ============================================================
    WEBSITE TRANSPORT
 ============================================================ */
 
-/**
- * Website transport.
- *
- * Website conversations are normally expected to receive
- * their response through the application's realtime/web
- * channel rather than an external SMS provider.
- *
- * The actual realtime delivery can later be connected to the
- * existing realtime engine / Socket.io layer.
- *
- * IMPORTANT:
- *
- * We do NOT silently send a website response as SMS here.
- *
- * This prevents the bug where:
- *
- *     source = website
- *
- * accidentally becomes:
- *
- *     Africa's Talking SMS
- *
- * ============================================================
- */
 const sendWebsiteMessage = async ({
   phone,
   message,
   context = {},
 }) => {
+
   console.log(
     "🌐 WEBSITE OUTBOUND MESSAGE:",
     {
+
       phone,
+
       source:
         context?.source ||
         "website",
+
     }
   );
 
-  /**
-   * The website transport should eventually publish the
-   * message through the existing realtime conversation layer.
-   *
-   * For now we return a controlled result instead of
-   * incorrectly using SMS.
-   */
+
   return {
-    success: false,
-    transport: "website",
-    provider: "realtime",
+
+    success:
+      false,
+
+    transport:
+      "website",
+
+    provider:
+      "realtime",
+
     reason:
       "Website realtime transport is not configured in this service yet.",
+
   };
 };
+
 
 /* ============================================================
    FACEBOOK TRANSPORT
 ============================================================ */
 
-/**
- * Facebook / Messenger transport placeholder.
- *
- * This should eventually delegate to the Facebook Messenger
- * integration when configured.
- */
 const sendFacebookMessage = async ({
   phone,
   message,
   context = {},
 }) => {
+
   console.warn(
     "⚠️ Facebook transport is not configured yet.",
     {
+
       phone,
+
       source:
         context?.source ||
         "facebook",
+
     }
   );
 
+
   return {
-    success: false,
-    transport: "facebook",
-    provider: null,
+
+    success:
+      false,
+
+    transport:
+      "facebook",
+
+    provider:
+      null,
+
     reason:
       "Facebook transport is not configured.",
+
   };
 };
+
 
 /* ============================================================
    AFRICA'S TALKING SMS
 ============================================================ */
 
-/**
- * Send SMS strictly through Africa's Talking.
- *
- * IMPORTANT:
- *
- * This is the ONLY SMS provider used by LeadFlow AI.
- *
- * We deliberately keep this wrapper separate so the transport
- * router remains provider-aware without duplicating provider
- * logic.
- */
 const sendAfricaTalkingSMS = async ({
   phone,
   message,
 }) => {
+
   console.log(
     "📱 TRANSPORT: Africa's Talking SMS"
   );
+
 
   console.log(
     "📤 AFRICA'S TALKING SMS TO:",
     phone
   );
 
-  /**
-   * Existing Africa's Talking implementation.
-   *
-   * africastalkingService.js
-   *        ↓
-   * sendSMS()
-   */
+
   const result =
     await sendSMS(
       phone,
       message
     );
 
+
   console.log(
     "✅ AFRICA'S TALKING SMS TRANSPORT COMPLETE:",
     phone
   );
 
+
   return {
-    success: true,
-    transport: "sms",
-    provider: "africastalking",
+
+    success:
+      true,
+
+    transport:
+      "sms",
+
+    provider:
+      "africastalking",
+
     result,
+
   };
 };
+
 
 /* ============================================================
    MAIN TRANSPORT ROUTER
 ============================================================ */
 
-/**
- * ============================================================
- *
- * sendOutboundMessage()
- *
- * ============================================================
- *
- * Central outbound message function.
- *
- * Usage:
- *
- * await sendOutboundMessage({
- *   source,
- *   phone,
- *   message,
- *   context,
- * });
- *
- * ============================================================
- *
- * Source determines transport:
- *
- * sms
- *     ↓
- * Africa's Talking SMS
- *
- * whatsapp
- *     ↓
- * WhatsApp transport
- *
- * website
- *     ↓
- * Website realtime transport
- *
- * facebook
- *     ↓
- * Facebook transport
- *
- * ============================================================
- */
-export const sendOutboundMessage = async ({
-  source,
-  phone,
-  message,
-  context = {},
-}) => {
-  try {
-    /* --------------------------------------------------------
-       Validate phone
-    -------------------------------------------------------- */
+export const sendOutboundMessage =
+  async ({
+    source,
+    phone,
+    message,
+    context = {},
+  }) => {
 
-    if (
-      !validatePhone(
-        phone
-      )
-    ) {
-      console.warn(
-        "⚠️ Outbound message skipped: phone number is missing."
-      );
+    try {
 
-      return {
-        success: false,
-        transport: null,
-        provider: null,
-        reason:
-          "Phone number is required.",
-      };
-    }
+      /* ------------------------------------------------------
+         Validate phone
+      ------------------------------------------------------ */
 
-    /* --------------------------------------------------------
-       Validate message
-    -------------------------------------------------------- */
+      if (
+        !validatePhone(
+          phone
+        )
+      ) {
 
-    if (
-      !validateMessage(
-        message
-      )
-    ) {
-      console.warn(
-        "⚠️ Outbound message skipped: message is empty."
-      );
+        console.warn(
+          "⚠️ Outbound message skipped: phone number is missing."
+        );
 
-      return {
-        success: false,
-        transport: null,
-        provider: null,
-        reason:
-          "Message is required.",
-      };
-    }
 
-    /* --------------------------------------------------------
-       Normalize source
-    -------------------------------------------------------- */
+        return {
 
-    const normalizedSource =
-      normalizeSource(
-        source
-      );
+          success:
+            false,
 
-    console.log(
-      "🚚 OUTBOUND TRANSPORT SOURCE:",
-      normalizedSource ||
-        "(missing)"
-    );
+          transport:
+            null,
 
-    /* --------------------------------------------------------
-       Validate source
-    -------------------------------------------------------- */
+          provider:
+            null,
 
-    if (
-      !VALID_SOURCES.includes(
-        normalizedSource
-      )
-    ) {
-      console.error(
-        "❌ Unsupported outbound message source:",
-        source
-      );
+          reason:
+            "Phone number is required.",
 
-      return {
-        success: false,
-        transport: null,
-        provider: null,
-        reason:
-          "Unsupported outbound message source.",
-        source:
-          normalizedSource ||
-          null,
-      };
-    }
-
-    /* --------------------------------------------------------
-       Normalize message
-    -------------------------------------------------------- */
-
-    const finalMessage =
-      String(
-        message
-      ).trim();
-
-    /* --------------------------------------------------------
-       Transport debug
-    -------------------------------------------------------- */
-
-    console.log(
-      "🚚 OUTBOUND MESSAGE TRANSPORT:",
-      {
-        source:
-          normalizedSource,
-        phone,
-        messageLength:
-          finalMessage.length,
+        };
       }
-    );
 
-    /* ========================================================
-       SMS
-    ======================================================== */
 
-    if (
-      normalizedSource === "sms"
-    ) {
-      return await sendAfricaTalkingSMS({
-        phone,
-        message:
-          finalMessage,
-      });
-    }
+      /* ------------------------------------------------------
+         Validate message
+      ------------------------------------------------------ */
 
-    /* ========================================================
-       WHATSAPP
-    ======================================================== */
+      if (
+        !validateMessage(
+          message
+        )
+      ) {
 
-    if (
-      normalizedSource === "whatsapp"
-    ) {
+        console.warn(
+          "⚠️ Outbound message skipped: message is empty."
+        );
+
+
+        return {
+
+          success:
+            false,
+
+          transport:
+            null,
+
+          provider:
+            null,
+
+          reason:
+            "Message is required.",
+
+        };
+      }
+
+
+      /* ------------------------------------------------------
+         Normalize source
+      ------------------------------------------------------ */
+
+      const normalizedSource =
+        normalizeSource(
+          source
+        );
+
+
       console.log(
-        "💬 TRANSPORT: WhatsApp"
+        "🚚 OUTBOUND TRANSPORT SOURCE:",
+        normalizedSource ||
+          "(missing)"
       );
 
-      return await sendWhatsApp({
-        phone,
-        message:
-          finalMessage,
-        context: {
-          ...context,
+
+      /* ------------------------------------------------------
+         Validate source
+      ------------------------------------------------------ */
+
+      if (
+        !VALID_SOURCES.includes(
+          normalizedSource
+        )
+      ) {
+
+        console.error(
+          "❌ Unsupported outbound message source:",
+          source
+        );
+
+
+        return {
+
+          success:
+            false,
+
+          transport:
+            null,
+
+          provider:
+            null,
+
+          reason:
+            "Unsupported outbound message source.",
+
+          source:
+            normalizedSource ||
+            null,
+
+        };
+      }
+
+
+      const finalMessage =
+        String(
+          message
+        ).trim();
+
+
+      console.log(
+        "🚚 OUTBOUND MESSAGE TRANSPORT:",
+        {
+
           source:
             normalizedSource,
-        },
-      });
-    }
 
-    /* ========================================================
-       WEBSITE
-    ======================================================== */
+          phone,
 
-    if (
-      normalizedSource === "website"
-    ) {
-      return await sendWebsiteMessage({
-        phone,
-        message:
-          finalMessage,
-        context: {
-          ...context,
-          source:
-            normalizedSource,
-        },
-      });
-    }
+          organizationId:
+            context?.organizationId ||
+            null,
 
-    /* ========================================================
-       FACEBOOK
-    ======================================================== */
+          messageLength:
+            finalMessage.length,
 
-    if (
-      normalizedSource === "facebook"
-    ) {
-      return await sendFacebookMessage({
-        phone,
-        message:
-          finalMessage,
-        context: {
-          ...context,
-          source:
-            normalizedSource,
-        },
-      });
-    }
+        }
+      );
 
-    /* --------------------------------------------------------
-       Defensive fallback
-    -------------------------------------------------------- */
 
-    console.error(
-      "❌ No outbound transport matched source:",
-      normalizedSource
-    );
+      /* ======================================================
+         SMS
+      ====================================================== */
 
-    return {
-      success: false,
-      transport: null,
-      provider: null,
-      reason:
-        "No outbound transport matched the source.",
-    };
+      if (
+        normalizedSource ===
+        "sms"
+      ) {
 
-  } catch (error) {
-    console.error(
-      "❌ Outbound message transport failed:",
+        return await sendAfricaTalkingSMS({
+
+          phone,
+
+          message:
+            finalMessage,
+
+        });
+      }
+
+
+      /* ======================================================
+         WHATSAPP
+      ====================================================== */
+
+      if (
+        normalizedSource ===
+        "whatsapp"
+      ) {
+
+        return await sendWhatsApp({
+
+          phone,
+
+          message:
+            finalMessage,
+
+          context: {
+
+            ...context,
+
+            source:
+              normalizedSource,
+
+          },
+
+        });
+      }
+
+
+      /* ======================================================
+         WEBSITE
+      ====================================================== */
+
+      if (
+        normalizedSource ===
+        "website"
+      ) {
+
+        return await sendWebsiteMessage({
+
+          phone,
+
+          message:
+            finalMessage,
+
+          context: {
+
+            ...context,
+
+            source:
+              normalizedSource,
+
+          },
+
+        });
+      }
+
+
+      /* ======================================================
+         FACEBOOK
+      ====================================================== */
+
+      if (
+        normalizedSource ===
+        "facebook"
+      ) {
+
+        return await sendFacebookMessage({
+
+          phone,
+
+          message:
+            finalMessage,
+
+          context: {
+
+            ...context,
+
+            source:
+              normalizedSource,
+
+          },
+
+        });
+      }
+
+
+      /* ------------------------------------------------------
+         Defensive fallback
+      ------------------------------------------------------ */
+
+      console.error(
+        "❌ No outbound transport matched source:",
+        normalizedSource
+      );
+
+
+      return {
+
+        success:
+          false,
+
+        transport:
+          null,
+
+        provider:
+          null,
+
+        reason:
+          "No outbound transport matched the source.",
+
+      };
+
+    } catch (
       error
-    );
+    ) {
 
-    return {
-      success: false,
-      transport: null,
-      provider: null,
-      reason:
-        error?.message ||
-        "Outbound transport failed.",
-      error,
-    };
-  }
-};
+      console.error(
+        "❌ Outbound message transport failed:",
+        error
+      );
+
+
+      return {
+
+        success:
+          false,
+
+        transport:
+          null,
+
+        provider:
+          null,
+
+        reason:
+          error?.message ||
+          "Outbound transport failed.",
+
+        error,
+
+      };
+    }
+  };
+
 
 /* ============================================================
    CONVENIENCE SMS FUNCTION
 ============================================================ */
 
-/**
- * Explicit SMS helper.
- *
- * This is useful when another internal service intentionally
- * needs to send an SMS and already knows the channel is SMS.
- *
- * IMPORTANT:
- *
- * It STILL goes strictly through Africa's Talking.
- */
-export const sendOutboundSMS = async (
-  phone,
-  message,
-  context = {}
-) => {
-  return await sendOutboundMessage({
-    source: "sms",
+export const sendOutboundSMS =
+  async (
     phone,
     message,
-    context,
-  });
-};
+    context = {}
+  ) => {
+
+    return await sendOutboundMessage({
+
+      source:
+        "sms",
+
+      phone,
+
+      message,
+
+      context,
+
+    });
+  };
+
 
 /* ============================================================
    TRANSPORT AVAILABILITY
 ============================================================ */
 
-/**
- * Returns the currently configured transport providers.
- *
- * This is useful for diagnostics and health checks.
- */
-export const getTransportAvailability = () => {
-  return {
-    sms: {
-      available: true,
-      provider:
-        "africastalking",
-    },
+export const getTransportAvailability =
+  () => {
 
-    whatsapp: {
-      available: false,
-      provider: null,
-    },
+    return {
 
-    website: {
-      available: false,
-      provider:
-        "realtime",
-    },
+      sms: {
 
-    facebook: {
-      available: false,
-      provider: null,
-    },
+        available:
+          true,
+
+        provider:
+          "africastalking",
+
+      },
+
+      whatsapp: {
+
+        available:
+          true,
+
+        provider:
+          "meta_whatsapp_cloud_api",
+
+      },
+
+      website: {
+
+        available:
+          false,
+
+        provider:
+          "realtime",
+
+      },
+
+      facebook: {
+
+        available:
+          false,
+
+        provider:
+          null,
+
+      },
+
+    };
   };
-};
+
 
 /* ============================================================
    DEFAULT EXPORT
 ============================================================ */
 
 export default {
+
   sendOutboundMessage,
+
   sendOutboundSMS,
+
   getTransportAvailability,
+
 };

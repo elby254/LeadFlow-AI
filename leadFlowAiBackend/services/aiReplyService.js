@@ -1337,6 +1337,127 @@ their thoughts or ask questions.
 
 
 /* ============================================================
+   DETECT CONVERSATION SENTIMENT
+============================================================ */
+
+export const detectConversationSentiment =
+  async (
+    conversation = {}
+  ) => {
+
+    const transcript =
+      conversation.messages
+        ?.map(
+          (message) =>
+            `${message.senderRole}: ${message.text}`
+        )
+        .join("\n") || "";
+
+    const prompt = `
+Determine the overall customer sentiment.
+
+Return ONLY one value:
+
+Positive
+Neutral
+Negative
+
+Do not explain.
+Do not add punctuation.
+Do not add any other text.
+
+Conversation:
+
+${transcript}
+`;
+
+    const result =
+      await callOpenAI({
+        systemPrompt:
+          AGENT_SYSTEM_PROMPT,
+
+        messages:
+          buildSinglePrompt(
+            prompt
+          ),
+
+        temperature: 0.1,
+
+        maxTokens: 20,
+      });
+
+    if (
+      !result.success
+    ) {
+
+      return {
+        success: false,
+
+        sentiment: null,
+
+        error:
+          result.error,
+      };
+    }
+
+    const rawSentiment =
+      String(
+        result.content || ""
+      )
+        .trim()
+        .toLowerCase();
+
+    let sentiment = null;
+
+    if (
+      rawSentiment.includes(
+        "positive"
+      )
+    ) {
+
+      sentiment = "Positive";
+
+    } else if (
+      rawSentiment.includes(
+        "negative"
+      )
+    ) {
+
+      sentiment = "Negative";
+
+    } else if (
+      rawSentiment.includes(
+        "neutral"
+      )
+    ) {
+
+      sentiment = "Neutral";
+    }
+
+    console.log(
+      "🤖 AI CONVERSATION SENTIMENT:",
+      {
+        raw:
+          result.content,
+
+        normalized:
+          sentiment,
+      }
+    );
+
+    return {
+      success:
+        result.success,
+
+      sentiment,
+
+      error:
+        result.error,
+    };
+  };
+
+
+/* ============================================================
    DETECT CUSTOMER URGENCY
 ============================================================ */
 
