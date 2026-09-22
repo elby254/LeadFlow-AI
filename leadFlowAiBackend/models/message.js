@@ -25,11 +25,15 @@
  * ✓ Multi-tenancy
  * ✓ Lead Association
  * ✓ Conversation Association
+ * ✓ External Provider Message IDs
+ * ✓ Channel / Source Tracking
+ * ✓ Webhook Idempotency
  *
  * ==========================================================
  */
 
 import mongoose from "mongoose";
+
 
 
 // ==========================================================
@@ -107,6 +111,7 @@ const attachmentSchema =
   );
 
 
+
 // ==========================================================
 // VOICE NOTE
 // ==========================================================
@@ -158,6 +163,7 @@ const voiceNoteSchema =
   );
 
 
+
 // ==========================================================
 // READ RECEIPTS
 // ==========================================================
@@ -193,6 +199,7 @@ const readReceiptSchema =
     }
 
   );
+
 
 
 // ==========================================================
@@ -242,6 +249,7 @@ const reactionSchema =
   );
 
 
+
 // ==========================================================
 // MAIN MESSAGE SCHEMA
 // ==========================================================
@@ -273,6 +281,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // CONVERSATION
       // ======================================================
@@ -292,6 +301,7 @@ const messageSchema =
         index: true,
 
       },
+
 
 
       // ======================================================
@@ -319,6 +329,88 @@ const messageSchema =
       },
 
 
+
+      // ======================================================
+      // MESSAGE SOURCE / CHANNEL
+      // ======================================================
+      //
+      // Identifies the communication channel that produced
+      // this message.
+      //
+      // Examples:
+      //
+      // whatsapp
+      // sms
+      // website
+      // facebook
+      //
+      // This is important for webhook idempotency because the
+      // same external message ID should be scoped to its
+      // organization and communication channel.
+      //
+      // ======================================================
+
+      source: {
+
+        type: String,
+
+        enum: [
+
+          "sms",
+
+          "whatsapp",
+
+          "website",
+
+          "facebook",
+
+        ],
+
+        default: null,
+
+        index: true,
+
+      },
+
+
+
+      // ======================================================
+      // EXTERNAL PROVIDER MESSAGE ID
+      // ======================================================
+      //
+      // Stores the original message identifier supplied by
+      // the communication provider.
+      //
+      // WhatsApp example:
+      //
+      //   wamid.HBgMMjU0NzI3NDI3MDc4FQIAERg...
+      //
+      // Africa's Talking / other providers may supply their
+      // own external message identifiers.
+      //
+      // This field is intentionally separate from MongoDB's
+      // internal _id.
+      //
+      // IMPORTANT:
+      //
+      // This value is used for webhook idempotency.
+      //
+      // ======================================================
+
+      externalMessageId: {
+
+        type: String,
+
+        default: null,
+
+        trim: true,
+
+        index: true,
+
+      },
+
+
+
       // ======================================================
       // SENDER
       // ======================================================
@@ -332,6 +424,7 @@ const messageSchema =
         default: null,
 
       },
+
 
 
       // ======================================================
@@ -361,6 +454,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // SENDER NAME
       // ======================================================
@@ -374,6 +468,7 @@ const messageSchema =
         trim: true,
 
       },
+
 
 
       // ======================================================
@@ -391,6 +486,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // ATTACHMENTS
       // ======================================================
@@ -400,6 +496,7 @@ const messageSchema =
         attachmentSchema,
 
       ],
+
 
 
       // ======================================================
@@ -415,6 +512,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // REPLY
       // ======================================================
@@ -428,6 +526,7 @@ const messageSchema =
         default: null,
 
       },
+
 
 
       // ======================================================
@@ -459,6 +558,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // DELIVERY TIMESTAMP
       // ======================================================
@@ -472,6 +572,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // READ RECEIPTS
       // ======================================================
@@ -481,6 +582,7 @@ const messageSchema =
         readReceiptSchema,
 
       ],
+
 
 
       // ======================================================
@@ -496,6 +598,7 @@ const messageSchema =
       },
 
 
+
       editedAt: {
 
         type: Date,
@@ -503,6 +606,7 @@ const messageSchema =
         default: null,
 
       },
+
 
 
       // ======================================================
@@ -516,6 +620,7 @@ const messageSchema =
       ],
 
 
+
       // ======================================================
       // AI MESSAGE
       // ======================================================
@@ -527,6 +632,7 @@ const messageSchema =
         default: false,
 
       },
+
 
 
       // ======================================================
@@ -546,6 +652,7 @@ const messageSchema =
       },
 
 
+
       // ======================================================
       // AI SUGGESTED REPLIES
       // ======================================================
@@ -561,6 +668,7 @@ const messageSchema =
       ],
 
 
+
       // ======================================================
       // SOFT DELETE
       // ======================================================
@@ -572,6 +680,7 @@ const messageSchema =
         default: false,
 
       },
+
 
 
       deletedAt: {
@@ -593,6 +702,7 @@ const messageSchema =
   );
 
 
+
 // ==========================================================
 // INDEXES
 // ==========================================================
@@ -607,14 +717,14 @@ const messageSchema =
 // Therefore:
 //
 // senderRole
-//
-// and:
-//
 // leadId
+// source
+// externalMessageId
 //
-// are NOT declared again below.
+// already have their individual indexes.
 //
 // ==========================================================
+
 
 
 // ----------------------------------------------------------
@@ -630,6 +740,7 @@ messageSchema.index({
 });
 
 
+
 // ----------------------------------------------------------
 // Tenant + conversation isolation
 // ----------------------------------------------------------
@@ -641,6 +752,7 @@ messageSchema.index({
   conversationId: 1,
 
 });
+
 
 
 // ----------------------------------------------------------
@@ -656,6 +768,7 @@ messageSchema.index({
 });
 
 
+
 // ----------------------------------------------------------
 // Full-text message search
 // ----------------------------------------------------------
@@ -665,6 +778,61 @@ messageSchema.index({
   text: "text",
 
 });
+
+
+
+// ==========================================================
+// WEBHOOK IDEMPOTENCY INDEX
+// ==========================================================
+//
+// Prevents the same external provider message from being
+// stored more than once for the same organization/channel.
+//
+// Example:
+//
+// organizationId
+//       +
+// source = "whatsapp"
+//       +
+// externalMessageId = "wamid...."
+//
+// must identify exactly one inbound provider message.
+//
+// The partial filter is important because many internal
+// messages will not have an externalMessageId.
+//
+// ==========================================================
+
+messageSchema.index(
+
+  {
+
+    organizationId: 1,
+
+    source: 1,
+
+    externalMessageId: 1,
+
+  },
+
+  {
+
+    unique: true,
+
+    partialFilterExpression: {
+
+      externalMessageId: {
+
+        $type: "string",
+
+      },
+
+    },
+
+  }
+
+);
+
 
 
 // ==========================================================
@@ -687,6 +855,7 @@ const Message =
     messageSchema
 
   );
+
 
 
 export default Message;

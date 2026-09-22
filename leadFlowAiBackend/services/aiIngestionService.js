@@ -307,16 +307,6 @@ export const normalizeIncomingMessage = (
 // ==========================================================
 // VALIDATE NORMALIZED MESSAGE CONTRACT
 // ==========================================================
-//
-// This validation is intentionally lightweight.
-//
-// The adapters remain responsible for deciding whether a
-// provider payload is valid.
-//
-// The service only confirms that the normalized structure
-// contains the fields expected by the ingestion pipeline.
-//
-// ==========================================================
 
 export const isValidNormalizedMessage = (
   normalizedMessage
@@ -561,6 +551,92 @@ export const normalizeLocation = (
 
 
 // ==========================================================
+// MOVE-DATE / TEMPORAL PHRASE DETECTION
+// ==========================================================
+//
+// IMPORTANT
+//
+// This helper prevents temporal answers such as:
+//
+// "next month"
+// "next week"
+// "next year"
+// "this month"
+// "this week"
+// "this year"
+// "tomorrow"
+// "today"
+// "in 2 weeks"
+// "in 3 months"
+//
+// from accidentally becoming locations.
+//
+// This is intentionally separate from
+// extractMoveDateFromMessage() so it can also protect the
+// AI + deterministic merge layer.
+//
+// ==========================================================
+
+export const isMoveDateLikeText = (
+  value
+) => {
+
+  const text =
+    safeString(
+      value
+    )
+      .toLowerCase()
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
+
+  if (!text) {
+    return false;
+  }
+
+
+
+  const temporalPattern =
+    /^(?:next|this)\s+(?:month|week|year)$/i;
+
+
+
+  const immediatePattern =
+    /^(?:today|tomorrow)$/i;
+
+
+
+  const relativeNumericPattern =
+    /^in\s+\d+\s+(?:day|days|week|weeks|month|months|year|years)$/i;
+
+
+
+  const movePrefixPattern =
+    /^(?:move|moving|relocate|relocating)\s+(?:in|by|around|on)?\s*(?:next\s+(?:month|week|year)|this\s+(?:month|week|year)|today|tomorrow|in\s+\d+\s+(?:days?|weeks?|months?|years?))$/i;
+
+
+
+  return (
+    temporalPattern.test(
+      text
+    ) ||
+    immediatePattern.test(
+      text
+    ) ||
+    relativeNumericPattern.test(
+      text
+    ) ||
+    movePrefixPattern.test(
+      text
+    )
+  );
+};
+
+
+
+// ==========================================================
 // NUMBER WORDS
 // ==========================================================
 
@@ -799,6 +875,40 @@ export const extractLocationFromMessage = (
     return null;
   }
 
+
+
+  // ========================================================
+  // CRITICAL PROTECTION
+  // ========================================================
+  //
+  // If the entire customer message is a move-date answer,
+  // NEVER classify it as a location.
+  //
+  // Example:
+  //
+  // "Next month"
+  //
+  // must be:
+  //
+  // moveDate = "next month"
+  //
+  // and NOT:
+  //
+  // location = "Next month"
+  //
+  // ========================================================
+
+  if (
+    isMoveDateLikeText(
+      text
+    )
+  ) {
+
+    return null;
+  }
+
+
+
   const locationPatterns = [
 
     /\b(?:in|around|near|at|from)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which)\b|[,.!?]|$)/i,
@@ -808,6 +918,8 @@ export const extractLocationFromMessage = (
     /\b(?:interested in|looking in|searching in|want in)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which)\b|[,.!?]|$)/i,
 
   ];
+
+
 
   for (
     const pattern of locationPatterns
@@ -823,13 +935,39 @@ export const extractLocationFromMessage = (
       match[1]
     ) {
 
-      const location =
+      const locationCandidate =
         normalizeLocation(
           match[1]
         );
 
-      if (location) {
-        return location;
+
+
+      // ----------------------------------------------------
+      // CRITICAL SECONDARY PROTECTION
+      // ----------------------------------------------------
+      //
+      // Even when a phrase appears after "in", "near",
+      // "around", etc., it must not become a location if
+      // the captured value is actually temporal.
+      //
+      // Example:
+      //
+      // "in next month"
+      //
+      // should never produce:
+      //
+      // location = "next month"
+      //
+      // ----------------------------------------------------
+
+      if (
+        locationCandidate &&
+        !isMoveDateLikeText(
+          locationCandidate
+        )
+      ) {
+
+        return locationCandidate;
       }
     }
   }
@@ -843,6 +981,8 @@ export const extractLocationFromMessage = (
   const locationOnlyPattern =
     /^[A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,2}$/;
 
+
+
   if (
     locationOnlyPattern.test(
       text
@@ -851,6 +991,12 @@ export const extractLocationFromMessage = (
 
     const lower =
       text.toLowerCase();
+
+
+
+    // ------------------------------------------------------
+    // Single-word exclusions
+    // ------------------------------------------------------
 
     const excludedWords = [
 
@@ -885,18 +1031,79 @@ export const extractLocationFromMessage = (
       "beds",
       "budget",
 
+      // Temporal words
+      "next",
+      "this",
+      "month",
+      "week",
+      "year",
+
     ];
 
+
+
+    // ------------------------------------------------------
+    // Multi-word temporal phrases
+    // ------------------------------------------------------
+    //
+    // These are especially important because "next month"
+    // passes the generic location-only regex.
+    //
+    // ------------------------------------------------------
+
+    const excludedTemporalPhrases = [
+
+      "next month",
+      "next week",
+      "next year",
+      "this month",
+      "this week",
+      "this year",
+
+    ];
+
+
+
     if (
-      !excludedWords.includes(
+      excludedTemporalPhrases.includes(
         lower
       )
     ) {
 
-      return normalizeLocation(
-        text
-      );
+      return null;
     }
+
+
+
+    if (
+      excludedWords.includes(
+        lower
+      )
+    ) {
+
+      return null;
+    }
+
+
+
+    // ------------------------------------------------------
+    // Final temporal protection
+    // ------------------------------------------------------
+
+    if (
+      isMoveDateLikeText(
+        text
+      )
+    ) {
+
+      return null;
+    }
+
+
+
+    return normalizeLocation(
+      text
+    );
   }
 
   return null;
@@ -921,6 +1128,8 @@ export const extractMoveDateFromMessage = (
     return null;
   }
 
+
+
   const relativeMatch =
     text.match(
       /\b(?:move|moving|relocate|relocating)\b\s*(?:in|by|around|on)?\s*(next\s+(?:month|week|year)|this\s+(?:month|week|year)|tomorrow|today|in\s+\d+\s+(?:days?|weeks?|months?|years?))\b/i
@@ -932,6 +1141,8 @@ export const extractMoveDateFromMessage = (
       relativeMatch[1]
     );
   }
+
+
 
   const standaloneMatch =
     text.match(
@@ -1447,6 +1658,15 @@ export const mergeExtractedData = (
   // --------------------------------------------------------
   // LOCATION
   // --------------------------------------------------------
+  //
+  // IMPORTANT:
+  //
+  // AI can sometimes interpret a temporal answer such as
+  // "next month" as a location.
+  //
+  // That value must NEVER enter the merged extraction.
+  //
+  // --------------------------------------------------------
 
   const deterministicLocation =
     normalizeLocation(
@@ -1458,19 +1678,55 @@ export const mergeExtractedData = (
       aiData.location
     );
 
+
+
+  const safeDeterministicLocation =
+    deterministicLocation &&
+    !isMoveDateLikeText(
+      deterministicLocation
+    )
+      ? deterministicLocation
+      : null;
+
+
+
+  const safeAILocation =
+    aiLocation &&
+    !isMoveDateLikeText(
+      aiLocation
+    )
+      ? aiLocation
+      : null;
+
+
+
   if (
-    deterministicLocation
+    safeDeterministicLocation
   ) {
 
     merged.location =
-      deterministicLocation;
+      safeDeterministicLocation;
 
   } else if (
-    aiLocation
+    safeAILocation
   ) {
 
     merged.location =
-      aiLocation;
+      safeAILocation;
+
+  } else {
+
+    // ------------------------------------------------------
+    // CRITICAL:
+    //
+    // Remove a bad AI location rather than allowing:
+    //
+    // location: "Next month"
+    //
+    // to reach the lead.
+    // ------------------------------------------------------
+
+    delete merged.location;
   }
 
 
@@ -1583,30 +1839,6 @@ export const mergeExtractedData = (
 
 // ==========================================================
 // RESOLVE ORGANIZATION ID
-// ==========================================================
-//
-// IMPORTANT:
-//
-// For channel-based ingestion, the organization should
-// normally already be resolved by the channel resolver:
-//
-// WhatsApp webhook
-//       ↓
-// whatsappAdapter
-//       ↓
-// resolveChannelOrganization
-//       ↓
-// req.organizationId
-//       ↓
-// AI ingestion
-//
-// This helper preserves the existing fallback behavior for
-// non-channel/internal callers.
-//
-// WhatsApp outbound transport does NOT use this fallback.
-// messageTransportService resolves the organization's
-// WhatsApp configuration directly from organizationId.
-//
 // ==========================================================
 
 export const resolveOrganizationId = (
@@ -1852,10 +2084,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // EXISTING INSIGHTS
-  // ========================================================
-
   const currentInsights =
     lead.aiInsights &&
     typeof lead.aiInsights === "object"
@@ -1875,10 +2103,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // AI CONFIDENCE
-  // ========================================================
-
   const confidence =
     aiResult?.confidence &&
     typeof aiResult.confidence === "object"
@@ -1888,10 +2112,6 @@ export const synchronizeAIInsights = (
       : {};
 
 
-
-  // ========================================================
-  // BUYING INTENT
-  // ========================================================
 
   const aiScore =
     Number(
@@ -1936,10 +2156,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // URGENCY
-  // ========================================================
-
   let urgency =
     normalizeAIUrgency(
       currentInsights.urgency
@@ -1947,10 +2163,6 @@ export const synchronizeAIInsights = (
     "Low";
 
 
-
-  // ========================================================
-  // AI PRIORITY
-  // ========================================================
 
   if (
     aiResult?.priority !== undefined &&
@@ -1983,10 +2195,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // CURRENT MESSAGE URGENCY
-  // ========================================================
-
   if (
     typeof aiResult?.extracted?.urgent ===
       "boolean"
@@ -2002,10 +2210,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // LEAD BOOLEAN URGENCY FALLBACK
-  // ========================================================
 
   if (
     typeof lead.urgent ===
@@ -2023,10 +2227,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // BUDGET CONFIDENCE
-  // ========================================================
 
   let budgetConfidence =
     normalizeConfidence(
@@ -2048,10 +2248,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // LOCATION CONFIDENCE
-  // ========================================================
-
   let locationConfidence =
     normalizeConfidence(
       currentInsights.locationConfidence,
@@ -2071,10 +2267,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // PROPERTY TYPE CONFIDENCE
-  // ========================================================
 
   let propertyTypeConfidence =
     normalizeConfidence(
@@ -2096,10 +2288,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // TIMELINE CONFIDENCE
-  // ========================================================
-
   let timelineConfidence =
     normalizeConfidence(
       currentInsights.timelineConfidence,
@@ -2119,10 +2307,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // MISSING INFORMATION
-  // ========================================================
 
   let missingInformation = [];
 
@@ -2151,10 +2335,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // RECOMMENDED ACTION
-  // ========================================================
-
   let recommendedAction =
     safeString(
       aiResult?.recommendedAction
@@ -2171,10 +2351,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // FINAL AI INSIGHTS
-  // ========================================================
 
   const synchronizedInsights = {
 
@@ -2200,10 +2376,6 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // CURRENT LEAD INTENT
-  // ========================================================
-
   const currentIntent =
     normalizeIntent(
       lead.intent
@@ -2218,10 +2390,6 @@ export const synchronizeAIInsights = (
   }
 
 
-
-  // ========================================================
-  // FINAL SAFETY CHECK
-  // ========================================================
 
   const allowedUrgencies = [
     "Low",
@@ -2246,18 +2414,10 @@ export const synchronizeAIInsights = (
 
 
 
-  // ========================================================
-  // WRITE TO LEAD DOCUMENT
-  // ========================================================
-
   lead.aiInsights =
     synchronizedInsights;
 
 
-
-  // ========================================================
-  // DEBUG
-  // ========================================================
 
   console.log(
     "\n=========================================================="
@@ -2392,10 +2552,6 @@ export const synchronizeConversationMemory = (
 
 
 
-  // ========================================================
-  // SUMMARY
-  // ========================================================
-
   if (
     !conversation.summary
   ) {
@@ -2490,10 +2646,6 @@ export const synchronizeConversationMemory = (
   }
 
 
-
-  // ========================================================
-  // MISSING FIELDS
-  // ========================================================
 
   if (
     !conversation.missingFields
@@ -2749,6 +2901,8 @@ export default {
   normalizeMoveDate,
 
   normalizeLocation,
+
+  isMoveDateLikeText,
 
   extractBedroomsFromMessage,
 

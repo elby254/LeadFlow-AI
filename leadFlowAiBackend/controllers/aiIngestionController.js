@@ -102,6 +102,27 @@
  * existing lead memory fills ONLY genuinely missing fields
  *
  * ==========================================================
+ *
+ * WEBHOOK IDEMPOTENCY
+ * ==========================================================
+ *
+ * Provider message
+ *          ↓
+ * organizationId
+ *          +
+ * source
+ *          +
+ * externalMessageId
+ *          ↓
+ * Message lookup
+ *          ↓
+ * already processed?
+ *      ↙          ↘
+ *    YES           NO
+ *     ↓             ↓
+ * IGNORE         AI PROCESSING
+ *
+ * ==========================================================
  */
 
 import Lead from "../models/lead.js";
@@ -585,6 +606,31 @@ const processIngestion = async (
 
 
   // ========================================================
+  // EXTERNAL PROVIDER MESSAGE ID
+  // ========================================================
+  //
+  // This is the provider's unique message identifier.
+  //
+  // WhatsApp:
+  //
+  //     wamid....
+  //
+  // It is NOT the MongoDB Message _id.
+  //
+  // It is used to prevent webhook retries from triggering
+  // AI processing and automatic replies again.
+  //
+  // ========================================================
+
+  const externalMessageId =
+    safeString(
+      ingestionInput.externalMessageId
+    ) ||
+    null;
+
+
+
+  // ========================================================
   // CUSTOMER NAME
   // ========================================================
 
@@ -631,6 +677,8 @@ const processIngestion = async (
     phone,
 
     message,
+
+    externalMessageId,
 
     normalized:
       hasNormalizedMessage(
@@ -744,6 +792,156 @@ const processIngestion = async (
     error.status = 400;
 
     throw error;
+  }
+
+
+
+  // ========================================================
+  // 7A. WEBHOOK IDEMPOTENCY CHECK
+  // ========================================================
+  //
+  // IMPORTANT:
+  //
+  // This check MUST happen BEFORE:
+  //
+  //     analyzeMessage()
+  //     Lead lookup
+  //     Lead creation
+  //     Conversation updates
+  //     Events
+  //     sendAutoReply()
+  //
+  // The provider's external message ID is scoped by:
+  //
+  //     organizationId
+  //     source
+  //     externalMessageId
+  //
+  // This prevents the same WhatsApp webhook from being
+  // processed more than once.
+  //
+  // For channels that do not provide an external provider
+  // message ID, normal processing continues.
+  //
+  // ========================================================
+
+  if (
+    externalMessageId
+  ) {
+
+    const existingExternalMessage =
+      await Message.findOne({
+
+        organizationId,
+
+        source:
+          normalizedSource,
+
+        externalMessageId,
+
+      })
+        .select({
+
+          _id: 1,
+
+          organizationId: 1,
+
+          conversationId: 1,
+
+          leadId: 1,
+
+          source: 1,
+
+          externalMessageId: 1,
+
+          createdAt: 1,
+
+        })
+        .lean();
+
+
+
+    if (
+      existingExternalMessage
+    ) {
+
+      console.log(
+        "♻️ DUPLICATE WHATSAPP MESSAGE IGNORED"
+      );
+
+      console.log({
+
+        organizationId,
+
+        source:
+          normalizedSource,
+
+        externalMessageId,
+
+        existingMessageId:
+          existingExternalMessage._id,
+
+        conversationId:
+          existingExternalMessage.conversationId ||
+          null,
+
+        leadId:
+          existingExternalMessage.leadId ||
+          null,
+
+        originalCreatedAt:
+          existingExternalMessage.createdAt ||
+          null,
+
+      });
+
+
+
+      return {
+
+        success:
+          true,
+
+        duplicate:
+          true,
+
+        message:
+          "Duplicate external message ignored.",
+
+        data: {
+
+          duplicate:
+            true,
+
+          externalMessageId,
+
+          source:
+            normalizedSource,
+
+          organizationId,
+
+          existingMessageId:
+            existingExternalMessage._id,
+
+          conversationId:
+            existingExternalMessage.conversationId ||
+            null,
+
+          leadId:
+            existingExternalMessage.leadId ||
+            null,
+
+        },
+
+      };
+    }
+
+
+
+    console.log(
+      "🆕 NEW EXTERNAL MESSAGE ID:",
+      externalMessageId
+    );
   }
 
 
@@ -1917,6 +2115,16 @@ const processIngestion = async (
   // ========================================================
   // 32. CREATE CUSTOMER MESSAGE
   // ========================================================
+  //
+  // IMPORTANT:
+  //
+  // source + externalMessageId are now persisted so the
+  // same provider message can be recognized if the webhook
+  // is delivered again.
+  //
+  // For WhatsApp this stores the Meta wamid.
+  //
+  // ========================================================
 
   const customerMessage =
     await Message.create({
@@ -1928,6 +2136,12 @@ const processIngestion = async (
 
       leadId:
         lead._id,
+
+      source:
+        normalizedSource,
+
+      externalMessageId:
+        externalMessageId,
 
       senderId:
         null,
