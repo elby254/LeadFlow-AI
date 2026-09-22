@@ -77,13 +77,6 @@ export const smsAdapter = (
     // ========================================================
     // 2. EXTRACT CUSTOMER PHONE
     // ========================================================
-    //
-    // Africa's Talking commonly provides `from`.
-    //
-    // Additional fallbacks are retained so the adapter can
-    // handle existing/test payload variations.
-    //
-    // ========================================================
 
     const phone =
       payload?.from ||
@@ -200,11 +193,11 @@ export const smsAdapter = (
 
     req.channelCustomer = {
 
-      phone:
-        normalizedPhone,
-
       name:
         null,
+
+      phone:
+        normalizedPhone,
 
       externalId:
         normalizedPhone,
@@ -234,10 +227,21 @@ export const smsAdapter = (
     // 10. NORMALIZED MESSAGE
     // ========================================================
     //
-    // This is the standardized LeadFlow AI representation.
+    // IMPORTANT:
     //
-    // Provider-specific Africa's Talking fields should not
-    // travel further into the application.
+    // This follows the same LeadFlow AI internal contract
+    // used by WhatsApp:
+    //
+    // {
+    //   channel,
+    //   organizationId,
+    //   customer,
+    //   message,
+    //   metadata
+    // }
+    //
+    // Provider-specific Africa's Talking fields remain inside
+    // metadata only.
     //
     // ========================================================
 
@@ -254,11 +258,11 @@ export const smsAdapter = (
 
       customer: {
 
-        phone:
-          normalizedPhone,
-
         name:
           null,
+
+        phone:
+          normalizedPhone,
 
         externalId:
           normalizedPhone,
@@ -308,11 +312,10 @@ export const smsAdapter = (
     //   message
     // }
     //
-    // We preserve that interface while also exposing the new
-    // normalized message through req.normalizedMessage.
+    // We preserve that interface while also exposing the
+    // standardized normalized message through:
     //
-    // Once all adapters are standardized, the ingestion
-    // controller can consume req.normalizedMessage directly.
+    // req.normalizedMessage
     //
     // ========================================================
 

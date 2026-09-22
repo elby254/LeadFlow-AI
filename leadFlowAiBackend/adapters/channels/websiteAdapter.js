@@ -90,7 +90,6 @@ export const websiteAdapter = (
     const phone =
       payload?.phone;
 
-
     const message =
       payload?.message;
 
@@ -130,7 +129,6 @@ export const websiteAdapter = (
       String(
         phone
       ).trim();
-
 
     const normalizedMessage =
       String(
@@ -272,11 +270,20 @@ export const websiteAdapter = (
     // 10. NORMALIZED MESSAGE
     // ========================================================
     //
-    // This is the standardized internal LeadFlow AI
-    // representation.
+    // IMPORTANT:
     //
-    // Everything downstream can use this structure without
-    // knowing how the website request was originally shaped.
+    // This follows the same LeadFlow AI internal contract
+    // used by WhatsApp:
+    //
+    // {
+    //   channel,
+    //   organizationId,
+    //   customer,
+    //   message,
+    //   metadata
+    // }
+    //
+    // Website-specific information remains inside metadata.
     //
     // ========================================================
 
@@ -314,7 +321,8 @@ export const websiteAdapter = (
           "text",
 
         externalMessageId:
-          messageId,
+          messageId ||
+          null,
 
       },
 
@@ -324,7 +332,8 @@ export const websiteAdapter = (
           "website",
 
         messageId:
-          messageId,
+          messageId ||
+          null,
 
         sessionId:
           payload?.sessionId ||

@@ -239,10 +239,20 @@ export const facebookAdapter = (
     // 11. NORMALIZED MESSAGE
     // ========================================================
     //
-    // This is the internal LeadFlow AI representation.
+    // IMPORTANT:
     //
-    // Provider-specific Facebook structure should NOT continue
-    // further into the application.
+    // This follows the same LeadFlow AI internal contract
+    // used by WhatsApp:
+    //
+    // {
+    //   channel,
+    //   organizationId,
+    //   customer,
+    //   message,
+    //   metadata
+    // }
+    //
+    // Facebook-specific information remains inside metadata.
     //
     // ========================================================
 

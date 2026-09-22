@@ -122,6 +122,22 @@
  *     ↓             ↓
  * IGNORE         AI PROCESSING
  *
+ * IMPORTANT:
+ *
+ * The Message model also contains a unique compound index:
+ *
+ * organizationId + source + externalMessageId
+ *
+ * Therefore the controller uses TWO layers:
+ *
+ * 1. Fast duplicate lookup before processing.
+ *
+ * 2. MongoDB unique-index protection when two identical
+ *    webhooks arrive concurrently.
+ *
+ * The second layer prevents a concurrent duplicate from
+ * reaching sendAutoReply().
+ *
  * ==========================================================
  */
 
@@ -438,6 +454,259 @@ const isValidConversationStatus = (
   return enumValues.includes(
     value
   );
+};
+
+
+
+// ==========================================================
+// WEBHOOK IDEMPOTENCY DUPLICATE ERROR DETECTION
+// ==========================================================
+//
+// MongoDB returns error code 11000 when the unique
+// organizationId + source + externalMessageId index is
+// violated.
+//
+// IMPORTANT:
+//
+// We only treat the error as a webhook duplicate when the
+// duplicate-key information actually refers to the external
+// message identity.
+//
+// Other MongoDB duplicate-key errors must continue to throw
+// normally so that real database problems are not hidden.
+//
+// ==========================================================
+
+const isExternalMessageDuplicateError = (
+  error
+) => {
+
+  if (
+    !error
+  ) {
+
+    return false;
+  }
+
+
+
+  if (
+    error.code !==
+      11000
+  ) {
+
+    return false;
+  }
+
+
+
+  const keyPattern =
+    error?.keyPattern ||
+    {};
+
+
+
+  const keyValue =
+    error?.keyValue ||
+    {};
+
+
+
+  const hasExternalMessageKey =
+    Object.prototype.hasOwnProperty.call(
+      keyPattern,
+      "externalMessageId"
+    ) ||
+    Object.prototype.hasOwnProperty.call(
+      keyValue,
+      "externalMessageId"
+    );
+
+
+
+  const hasOrganizationKey =
+    Object.prototype.hasOwnProperty.call(
+      keyPattern,
+      "organizationId"
+    ) ||
+    Object.prototype.hasOwnProperty.call(
+      keyValue,
+      "organizationId"
+    );
+
+
+
+  const hasSourceKey =
+    Object.prototype.hasOwnProperty.call(
+      keyPattern,
+      "source"
+    ) ||
+    Object.prototype.hasOwnProperty.call(
+      keyValue,
+      "source"
+    );
+
+
+
+  return (
+    hasExternalMessageKey &&
+    hasOrganizationKey &&
+    hasSourceKey
+  );
+};
+
+
+
+// ==========================================================
+// LOAD EXISTING EXTERNAL MESSAGE AFTER DUPLICATE RACE
+// ==========================================================
+//
+// When two identical webhooks arrive at nearly the same time:
+//
+// Request A:
+//   Message.create() → succeeds
+//
+// Request B:
+//   Message.create() → E11000
+//
+// Request B uses this helper to retrieve the message that
+// won the race.
+//
+// ==========================================================
+
+const findExistingExternalMessage = async (
+  organizationId,
+  normalizedSource,
+  externalMessageId
+) => {
+
+  if (
+    !organizationId ||
+    !normalizedSource ||
+    !externalMessageId
+  ) {
+
+    return null;
+  }
+
+
+
+  return Message.findOne({
+
+    organizationId,
+
+    source:
+      normalizedSource,
+
+    externalMessageId,
+
+  })
+    .select({
+
+      _id: 1,
+
+      organizationId: 1,
+
+      conversationId: 1,
+
+      leadId: 1,
+
+      source: 1,
+
+      externalMessageId: 1,
+
+      createdAt: 1,
+
+    })
+    .lean();
+};
+
+
+
+// ==========================================================
+// BUILD DUPLICATE RESPONSE
+// ==========================================================
+
+const buildDuplicateResponse = (
+  organizationId,
+  normalizedSource,
+  externalMessageId,
+  existingExternalMessage
+) => {
+
+  console.log(
+    "♻️ DUPLICATE WHATSAPP MESSAGE IGNORED"
+  );
+
+
+
+  console.log({
+
+    organizationId,
+
+    source:
+      normalizedSource,
+
+    externalMessageId,
+
+    existingMessageId:
+      existingExternalMessage?._id ||
+      null,
+
+    conversationId:
+      existingExternalMessage?.conversationId ||
+      null,
+
+    leadId:
+      existingExternalMessage?.leadId ||
+      null,
+
+    originalCreatedAt:
+      existingExternalMessage?.createdAt ||
+      null,
+
+  });
+
+
+
+  return {
+
+    success:
+      true,
+
+    duplicate:
+      true,
+
+    message:
+      "Duplicate external message ignored.",
+
+    data: {
+
+      duplicate:
+        true,
+
+      externalMessageId,
+
+      source:
+        normalizedSource,
+
+      organizationId,
+
+      existingMessageId:
+        existingExternalMessage?._id ||
+        null,
+
+      conversationId:
+        existingExternalMessage?.conversationId ||
+        null,
+
+      leadId:
+        existingExternalMessage?.leadId ||
+        null,
+
+    },
+
+  };
 };
 
 
@@ -817,11 +1086,11 @@ const processIngestion = async (
   //     source
   //     externalMessageId
   //
-  // This prevents the same WhatsApp webhook from being
+  // This prevents normal webhook retries from being
   // processed more than once.
   //
-  // For channels that do not provide an external provider
-  // message ID, normal processing continues.
+  // MongoDB's unique compound index provides the second,
+  // race-safe protection for simultaneous webhook deliveries.
   //
   // ========================================================
 
@@ -830,34 +1099,15 @@ const processIngestion = async (
   ) {
 
     const existingExternalMessage =
-      await Message.findOne({
+      await findExistingExternalMessage(
 
         organizationId,
 
-        source:
-          normalizedSource,
+        normalizedSource,
 
-        externalMessageId,
+        externalMessageId
 
-      })
-        .select({
-
-          _id: 1,
-
-          organizationId: 1,
-
-          conversationId: 1,
-
-          leadId: 1,
-
-          source: 1,
-
-          externalMessageId: 1,
-
-          createdAt: 1,
-
-        })
-        .lean();
+      );
 
 
 
@@ -865,75 +1115,17 @@ const processIngestion = async (
       existingExternalMessage
     ) {
 
-      console.log(
-        "♻️ DUPLICATE WHATSAPP MESSAGE IGNORED"
-      );
-
-      console.log({
+      return buildDuplicateResponse(
 
         organizationId,
 
-        source:
-          normalizedSource,
+        normalizedSource,
 
         externalMessageId,
 
-        existingMessageId:
-          existingExternalMessage._id,
+        existingExternalMessage
 
-        conversationId:
-          existingExternalMessage.conversationId ||
-          null,
-
-        leadId:
-          existingExternalMessage.leadId ||
-          null,
-
-        originalCreatedAt:
-          existingExternalMessage.createdAt ||
-          null,
-
-      });
-
-
-
-      return {
-
-        success:
-          true,
-
-        duplicate:
-          true,
-
-        message:
-          "Duplicate external message ignored.",
-
-        data: {
-
-          duplicate:
-            true,
-
-          externalMessageId,
-
-          source:
-            normalizedSource,
-
-          organizationId,
-
-          existingMessageId:
-            existingExternalMessage._id,
-
-          conversationId:
-            existingExternalMessage.conversationId ||
-            null,
-
-          leadId:
-            existingExternalMessage.leadId ||
-            null,
-
-        },
-
-      };
+      );
     }
 
 
@@ -2124,46 +2316,198 @@ const processIngestion = async (
   //
   // For WhatsApp this stores the Meta wamid.
   //
+  // RACE-SAFE IDEMPOTENCY:
+  //
+  // The earlier findOne() protects normal webhook retries.
+  //
+  // The unique MongoDB index protects the case where two
+  // identical webhooks pass findOne() simultaneously.
+  //
+  // If this create receives the external-message duplicate
+  // key error, this request loses the race and MUST stop
+  // before:
+  //
+  //     conversation counters
+  //     events
+  //     sendAutoReply()
+  //
   // ========================================================
 
-  const customerMessage =
-    await Message.create({
+  let customerMessage;
 
-      organizationId,
 
-      conversationId:
-        conversation._id,
 
-      leadId:
-        lead._id,
+  try {
 
-      source:
-        normalizedSource,
+    customerMessage =
+      await Message.create({
 
-      externalMessageId:
+        organizationId,
+
+        conversationId:
+          conversation._id,
+
+        leadId:
+          lead._id,
+
+        source:
+          normalizedSource,
+
+        externalMessageId:
+          externalMessageId,
+
+        senderId:
+          null,
+
+        senderRole:
+          "customer",
+
+        senderName:
+          customerName ||
+          lead.name ||
+          "",
+
+        text:
+          cleanMessage,
+
+        status:
+          "sent",
+
+        aiGenerated:
+          false,
+
+      });
+
+  } catch (
+    messageCreateError
+  ) {
+
+    // ======================================================
+    // CONCURRENT WEBHOOK RACE
+    // ======================================================
+
+    if (
+      externalMessageId &&
+      isExternalMessageDuplicateError(
+        messageCreateError
+      )
+    ) {
+
+      console.log(
+        "♻️ CONCURRENT DUPLICATE WEBHOOK DETECTED"
+      );
+
+
+
+      console.log({
+
+        organizationId,
+
+        source:
+          normalizedSource,
+
         externalMessageId,
 
-      senderId:
-        null,
+        message:
+          "Another webhook request already stored this external message.",
 
-      senderRole:
-        "customer",
+      });
 
-      senderName:
-        customerName ||
-        lead.name ||
-        "",
 
-      text:
-        cleanMessage,
 
-      status:
-        "sent",
+      const existingExternalMessage =
+        await findExistingExternalMessage(
 
-      aiGenerated:
-        false,
+          organizationId,
 
-    });
+          normalizedSource,
+
+          externalMessageId
+
+        );
+
+
+
+      if (
+        existingExternalMessage
+      ) {
+
+        return buildDuplicateResponse(
+
+          organizationId,
+
+          normalizedSource,
+
+          externalMessageId,
+
+          existingExternalMessage
+
+        );
+      }
+
+
+
+      /*
+       * Extremely defensive fallback.
+       *
+       * MongoDB reported the unique-key conflict, but the
+       * winning document is not immediately visible to this
+       * read. Do not continue to send an automatic reply.
+       */
+
+      console.warn(
+        "⚠️ Duplicate external message was detected, but the existing Message could not be loaded immediately."
+      );
+
+
+
+      return {
+
+        success:
+          true,
+
+        duplicate:
+          true,
+
+        message:
+          "Duplicate external message ignored.",
+
+        data: {
+
+          duplicate:
+            true,
+
+          externalMessageId,
+
+          source:
+            normalizedSource,
+
+          organizationId,
+
+          existingMessageId:
+            null,
+
+          conversationId:
+            conversation?._id ||
+            null,
+
+          leadId:
+            lead?._id ||
+            null,
+
+        },
+
+      };
+    }
+
+
+
+    // ======================================================
+    // NOT AN IDEMPOTENCY ERROR
+    // ======================================================
+
+    throw messageCreateError;
+  }
 
 
 
