@@ -65,9 +65,9 @@ const AIQualification = () => {
 
   if (loading) {
     return (
-      <MainLayout>
+      
         <LoadingSpinner />
-      </MainLayout>
+      
     );
   }
 
@@ -77,12 +77,12 @@ const AIQualification = () => {
 
   if (error) {
     return (
-      <MainLayout>
+      
         <ErrorCard
           message={error}
           onRetry={refreshLead}
         />
-      </MainLayout>
+      
     );
   }
 
@@ -92,7 +92,7 @@ const AIQualification = () => {
 
   if (!lead) {
     return (
-      <MainLayout>
+      
         <div
           className="
             rounded-3xl
@@ -105,7 +105,7 @@ const AIQualification = () => {
         >
           Lead not found.
         </div>
-      </MainLayout>
+      
     );
   }
 
@@ -182,7 +182,7 @@ const AIQualification = () => {
     "";
 
   return (
-    <MainLayout>
+    
       <div className="space-y-8">
 
         {/* =====================================================
@@ -899,7 +899,7 @@ const AIQualification = () => {
         </section>
 
       </div>
-    </MainLayout>
+    
   );
 };
 

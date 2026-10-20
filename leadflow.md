@@ -143,3 +143,8 @@ Property Viewing
 ↓
 
 Deal Closed
+
+
+## organization ID achitecture for leadflowai 
+
+Organization resolution is centralized and channel-specific. The client may provide only an opaque/public tenant routing identifier where required; it may never directly choose organizationId. All resolved organization identities are validated against MongoDB before entering the business workflow.

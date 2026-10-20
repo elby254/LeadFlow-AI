@@ -63,6 +63,7 @@ const notificationSchema = new mongoose.Schema(
 
       enum: [
         // Viewing workflow
+        "VIEWING_REQUESTED",
         "VIEWING_APPROVED",
         "VIEWING_REJECTED",
         "VIEWING_CANCELLED",

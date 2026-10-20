@@ -3,107 +3,145 @@
  *
  * PURPOSE
  * ----------------------------------------------------------
- * Central analytics service for the LeadFlow AI agent workflow.
+ * Central analytics service for the LeadFlow AI CRM workflow.
  *
  * RESPONSIBILITIES
  * ----------------------------------------------------------
  * - Compute organization-level CRM KPIs
  * - Track agent workload and performance
- * - Track lead pipeline stages
+ * - Track canonical lead pipeline stages
  * - Measure hot-lead activity
  * - Measure assignment performance
- * - Measure AI scoring effectiveness
- * - Support multi-tenant organization isolation
+ * - Measure scoring effectiveness
+ * - Measure viewing activity
+ * - Measure follow-up activity
+ * - Preserve multi-tenant organization isolation
  *
  * ==========================================================
  *
- * LEAD STATUS SOURCE OF TRUTH
- * ----------------------------------------------------------
+ * CANONICAL SOURCES OF TRUTH
+ * ==========================================================
  *
- * This service uses the existing Lead.status enum:
+ * Lead lifecycle:
  *
- *   new
- *   contacted
- *   qualified
- *   viewing
- *   negotiation
- *   won
- *   lost
+ *   services/leadLifeCycleService.js
+ *
+ * Lead score:
+ *
+ *   services/leadScoringRulesEngine.js
+ *
+ * Assignment:
+ *
+ *   Lead.assignedTo
+ *   Lead.assignedSource
+ *
+ * Viewing workflow:
+ *
+ *   Viewing.status
+ *
+ * Follow-up workflow:
+ *
+ *   Lead.followUpStatus
  *
  * IMPORTANT
+ * ----------------------------------------------------------
  *
- * Those concepts are derived from the appropriate Lead
- * fields instead.
+ * "hot" is a SCORE CATEGORY.
  *
- * HOT:
- *   score >= 70
+ * It is NOT a Lead.status.
  *
- * VIEWING REQUESTED:
- *   viewingStatus === "requested"
+ * Canonical score categories:
  *
- * VIEWING SCHEDULED:
- *   viewingStatus === "approved"
- *   viewingStatus === "scheduled"
- *   viewingStatus === "rescheduled"
- *
- * FOLLOW-UP:
- *   followUpStatus indicates follow-up is required/pending
- *
- * SUCCESSFUL CONVERSION:
- *   status === "won"
- *
- * LOST CONVERSION:
- *   status === "lost"
+ *   0–49   -> new
+ *   50–79  -> qualified
+ *   80–100 -> hot
  *
  * ==========================================================
  */
 
 import Lead from "../models/lead.js";
+import Viewing from "../models/viewing.js";
 
-// ==========================================================
-// STATUS DEFINITIONS
-// ==========================================================
-//
-// These values MUST match the existing Lead.status enum.
-//
-// ==========================================================
+import {
+  LEAD_STATUS,
+} from "./leadLifeCycleService.js";
 
-const LEAD_STATUSES = {
-  NEW: "new",
-  CONTACTED: "contacted",
-  QUALIFIED: "qualified",
-  VIEWING: "viewing",
-  NEGOTIATION: "negotiation",
-  WON: "won",
-  LOST: "lost",
-};
+import {
+  HOT_SCORE_THRESHOLD,
+  LEAD_SCORE_CATEGORIES,
+  getLeadCategory,
+} from "./leadScoringRulesEngine.js";
 
-// ==========================================================
-// VIEWING STATUS DEFINITIONS
-// ==========================================================
-//
-// These are Lead.viewingStatus values, NOT Lead.status values.
-//
-// ==========================================================
+/* ==========================================================
+   VIEWING STATUS DEFINITIONS
+   SOURCE OF TRUTH: Viewing.status
+========================================================== */
 
-const VIEWING_STATUSES = {
-  NONE: "none",
-  REQUESTED: "requested",
-  APPROVED: "approved",
-  SCHEDULED: "scheduled",
-  RESCHEDULED: "rescheduled",
-  CANCELLED: "cancelled",
-  COMPLETED: "completed",
-};
+const VIEWING_STATUS = Object.freeze({
+  REQUESTED:
+    "Requested",
 
-// ==========================================================
-// HELPER: SAFE PERCENTAGE
-// ==========================================================
-//
-// Prevents division-by-zero and keeps all percentages
-// consistently formatted.
-//
-// ==========================================================
+  PENDING_APPROVAL:
+    "Pending Approval",
+
+  APPROVED:
+    "Approved",
+
+  RESCHEDULED:
+    "Rescheduled",
+
+  REJECTED:
+    "Rejected",
+
+  CANCELLED:
+    "Cancelled",
+
+  COMPLETED:
+    "Completed",
+});
+
+/* ==========================================================
+   ACTIVE / SCHEDULED VIEWING STATUSES
+========================================================== */
+
+const ACTIVE_VIEWING_STATUSES = Object.freeze([
+  VIEWING_STATUS.REQUESTED,
+
+  VIEWING_STATUS.PENDING_APPROVAL,
+
+  VIEWING_STATUS.APPROVED,
+
+  VIEWING_STATUS.RESCHEDULED,
+]);
+
+const SCHEDULED_VIEWING_STATUSES = Object.freeze([
+  VIEWING_STATUS.APPROVED,
+
+  VIEWING_STATUS.RESCHEDULED,
+]);
+
+/* ==========================================================
+   FOLLOW-UP STATUS DEFINITIONS
+   SOURCE OF TRUTH: Lead.followUpStatus
+========================================================== */
+
+const FOLLOW_UP_STATUS = Object.freeze({
+  PENDING:
+    "pending",
+
+  SCHEDULED:
+    "scheduled",
+
+  COMPLETED:
+    "completed",
+
+  CANCELLED:
+    "cancelled",
+});
+
+/* ==========================================================
+   HELPER: SAFE PERCENTAGE
+========================================================== */
 
 const percentage = (
   numerator,
@@ -114,1127 +152,1421 @@ const percentage = (
   }
 
   return Number(
-    ((numerator / denominator) * 100).toFixed(2)
+    (
+      (numerator /
+        denominator) *
+      100
+    ).toFixed(2)
   );
 };
 
-// ==========================================================
-// HELPER: GET HOT LEADS
-// ==========================================================
-//
-// A lead is considered hot when:
-//
-// - score >= 70
-//
-// HOT IS NOT A Lead.status VALUE.
-//
-// ==========================================================
+/* ==========================================================
+   HELPER: SAFE NUMBER
+========================================================== */
 
-const isHotLead = (lead) => {
+const safeNumber = (
+  value
+) => {
+  const number =
+    Number(value);
+
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : 0;
+};
+
+/* ==========================================================
+   HELPER: HOT LEAD
+========================================================== */
+
+/**
+ * Hot is a score category.
+ *
+ * It is NOT a lifecycle state.
+ *
+ * The scoring threshold comes from the canonical
+ * lead scoring rules engine.
+ */
+const isHotLead = (
+  lead
+) => {
+  const score =
+    safeNumber(
+      lead?.score
+    );
+
   return (
-    Number(
-      lead?.score || 0
-    ) >= 70
+    score >=
+    HOT_SCORE_THRESHOLD
   );
 };
 
-// ==========================================================
-// HELPER: VIEWING REQUESTED
-// ==========================================================
-//
-// Viewing lifecycle belongs to Lead.viewingStatus.
-//
-// Lead.status remains "viewing".
-//
-// ==========================================================
+/* ==========================================================
+   HELPER: FOLLOW-UP LEAD
+========================================================== */
 
-const isViewingRequested = (lead) => {
-  return (
-    lead?.viewingStatus ===
-    VIEWING_STATUSES.REQUESTED
-  );
-};
-
-// ==========================================================
-// HELPER: VIEWING SCHEDULED
-// ==========================================================
-//
-// A scheduled viewing may be represented by:
-//
-// - approved
-// - scheduled
-// - rescheduled
-//
-// ==========================================================
-
-const isViewingScheduled = (lead) => {
+/**
+ * Canonical follow-up statuses:
+ *
+ *   pending
+ *   scheduled
+ *   completed
+ *   cancelled
+ *
+ * Only pending/scheduled represent active follow-up work.
+ */
+const isFollowUpLead = (
+  lead
+) => {
   return [
-    VIEWING_STATUSES.APPROVED,
-    VIEWING_STATUSES.SCHEDULED,
-    VIEWING_STATUSES.RESCHEDULED,
+    FOLLOW_UP_STATUS.PENDING,
+
+    FOLLOW_UP_STATUS.SCHEDULED,
   ].includes(
-    lead?.viewingStatus
-  );
-};
-
-// ==========================================================
-// HELPER: VIEWING COMPLETED
-// ==========================================================
-
-const isViewingCompleted = (lead) => {
-  return (
-    lead?.viewingStatus ===
-    VIEWING_STATUSES.COMPLETED
-  );
-};
-
-// ==========================================================
-// HELPER: FOLLOW-UP
-// ==========================================================
-//
-// Follow-up is represented by the Lead follow-up fields,
-// NOT Lead.status.
-//
-// ==========================================================
-
-const isFollowUpLead = (lead) => {
-  const followUpStatus =
     String(
-      lead?.followUpStatus || ""
-    ).toLowerCase();
-
-  return [
-    "pending",
-    "required",
-    "due",
-    "scheduled",
-  ].includes(
-    followUpStatus
+      lead?.followUpStatus ||
+        ""
+    ).toLowerCase()
   );
 };
 
-// ==========================================================
-// HELPER: SUCCESSFULLY CLOSED LEADS
-// ==========================================================
-//
-// Successful conversion = status "won".
-//
-// ==========================================================
+/* ==========================================================
+   HELPER: WON LEAD
+========================================================== */
 
-const isClosedLead = (lead) => {
+const isWonLead = (
+  lead
+) => {
   return (
     lead?.status ===
-    LEAD_STATUSES.WON
+    LEAD_STATUS.WON
   );
 };
 
-// ==========================================================
-// HELPER: LOST LEADS
-// ==========================================================
-//
-// Unsuccessful conversion = status "lost".
-//
-// ==========================================================
+/* ==========================================================
+   HELPER: LOST LEAD
+========================================================== */
 
-const isClosedLostLead = (lead) => {
+const isLostLead = (
+  lead
+) => {
   return (
     lead?.status ===
-    LEAD_STATUSES.LOST
+    LEAD_STATUS.LOST
   );
 };
 
-// ==========================================================
-// HELPER: ACTIVE LEADS
-// ==========================================================
-//
-// Only "won" and "lost" are terminal Lead.status values.
-//
-// Everything else remains active in the CRM pipeline.
-//
-// ==========================================================
+/* ==========================================================
+   HELPER: ACTIVE LEAD
+========================================================== */
 
-const isActiveLead = (lead) => {
+/**
+ * Only won and lost are terminal.
+ *
+ * Therefore:
+ *
+ *   new
+ *   contacted
+ *   qualified
+ *   viewing
+ *   negotiation
+ *
+ * are active CRM lifecycle states.
+ */
+const isActiveLead = (
+  lead
+) => {
   return (
-    !isClosedLead(lead) &&
-    !isClosedLostLead(lead)
+    !isWonLead(lead) &&
+    !isLostLead(lead)
   );
 };
 
-// ==========================================================
-// ORGANIZATION DASHBOARD METRICS
-// ==========================================================
+/* ==========================================================
+   HELPER: VALID ORGANIZATION CONTEXT
+========================================================== */
+
+const hasOrganization =
+  (
+    organizationId
+  ) =>
+    Boolean(
+      organizationId
+    );
+
+/* ==========================================================
+   HELPER:
+   GET VIEWING METRICS
+========================================================== */
+
+/**
+ * Viewing workflow is stored in Viewing.status.
+ *
+ * These metrics therefore count actual Viewing documents,
+ * not Lead.viewingStatus.
+ */
+const getViewingMetrics = (
+  viewings
+) => {
+  const viewingRequested =
+    viewings.filter(
+      (viewing) =>
+        [
+          VIEWING_STATUS.REQUESTED,
+
+          VIEWING_STATUS.PENDING_APPROVAL,
+        ].includes(
+          viewing.status
+        )
+    ).length;
+
+  const viewingScheduled =
+    viewings.filter(
+      (viewing) =>
+        SCHEDULED_VIEWING_STATUSES.includes(
+          viewing.status
+        )
+    ).length;
+
+  const viewingCompleted =
+    viewings.filter(
+      (viewing) =>
+        viewing.status ===
+        VIEWING_STATUS.COMPLETED
+    ).length;
+
+  return {
+    viewingRequested,
+
+    viewingScheduled,
+
+    viewingCompleted,
+  };
+};
+
+/* ==========================================================
+   ORGANIZATION DASHBOARD METRICS
+========================================================== */
 
 /**
  * Get organization-wide CRM metrics.
  *
- * IMPORTANT
- * ----------------------------------------------------------
- * organizationId is mandatory to preserve multi-tenant
- * isolation.
+ * organizationId is mandatory.
  *
  * @param {ObjectId|string} organizationId
  *
  * @returns {Object|null}
  */
+export const getOrganizationMetrics =
+  async (
+    organizationId
+  ) => {
+    try {
+      if (
+        !hasOrganization(
+          organizationId
+        )
+      ) {
+        console.log(
+          "⚠️ Analytics skipped: organizationId is missing."
+        );
 
-export const getOrganizationMetrics = async (
-  organizationId
-) => {
-  try {
-    if (!organizationId) {
-      console.log(
-        "⚠️ Analytics skipped: organizationId is missing."
+        return null;
+      }
+
+      /* ====================================================
+         FETCH ORGANIZATION LEADS
+      ==================================================== */
+
+      const leads =
+        await Lead.find({
+          organizationId,
+        }).lean();
+
+      const totalLeads =
+        leads.length;
+
+      /* ====================================================
+         FETCH ORGANIZATION VIEWINGS
+      ==================================================== */
+
+      const viewings =
+        await Viewing.find({
+          organizationId,
+        }).lean();
+
+      /* ====================================================
+         PIPELINE COUNTS
+      ==================================================== */
+
+      const newLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.NEW
+        ).length;
+
+      const contactedLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.CONTACTED
+        ).length;
+
+      const qualifiedLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.QUALIFIED
+        ).length;
+
+      const viewingLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.VIEWING
+        ).length;
+
+      const negotiationLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.NEGOTIATION
+        ).length;
+
+      const wonLeads =
+        leads.filter(
+          isWonLead
+        ).length;
+
+      const lostLeads =
+        leads.filter(
+          isLostLead
+        ).length;
+
+      /* ====================================================
+         HOT LEADS
+      ==================================================== */
+
+      const hotLeads =
+        leads.filter(
+          isHotLead
+        ).length;
+
+      /* ====================================================
+         VIEWING METRICS
+      ==================================================== */
+
+      const {
+        viewingRequested,
+
+        viewingScheduled,
+
+        viewingCompleted,
+      } =
+        getViewingMetrics(
+          viewings
+        );
+
+      /* ====================================================
+         FOLLOW-UP METRICS
+      ==================================================== */
+
+      const followUpLeads =
+        leads.filter(
+          isFollowUpLead
+        ).length;
+
+      /* ====================================================
+         ASSIGNMENT METRICS
+      ==================================================== */
+
+      const assignedLeads =
+        leads.filter(
+          (lead) =>
+            Boolean(
+              lead.assignedTo
+            )
+        ).length;
+
+      const unassignedLeads =
+        leads.filter(
+          (lead) =>
+            !lead.assignedTo
+        ).length;
+
+      /* ====================================================
+         ASSIGNMENT SOURCES
+      ==================================================== */
+
+      const aiAssignedLeads =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "ai"
+        ).length;
+
+      const manualAssignedLeads =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "manual"
+        ).length;
+
+      const autoAssignedLeads =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "auto"
+        ).length;
+
+      /* ====================================================
+         ACTIVE PIPELINE
+      ==================================================== */
+
+      const activeLeads =
+        leads.filter(
+          isActiveLead
+        ).length;
+
+      /* ====================================================
+         CONVERSION METRICS
+      ==================================================== */
+
+      const conversionRate =
+        percentage(
+          wonLeads,
+
+          totalLeads
+        );
+
+      /**
+       * This measures won leads among leads that are not
+       * already lost.
+       *
+       * It is retained for dashboard compatibility.
+       */
+      const activeToClosedRate =
+        percentage(
+          wonLeads,
+
+          activeLeads +
+            wonLeads
+        );
+
+      const lossRate =
+        percentage(
+          lostLeads,
+
+          totalLeads
+        );
+
+      /* ====================================================
+         HOT LEAD RATIO
+      ==================================================== */
+
+      const hotLeadRatio =
+        percentage(
+          hotLeads,
+
+          totalLeads
+        );
+
+      /* ====================================================
+         ASSIGNMENT RATE
+      ==================================================== */
+
+      const assignmentRate =
+        percentage(
+          assignedLeads,
+
+          totalLeads
+        );
+
+      /* ====================================================
+         RETURN
+      ==================================================== */
+
+      return {
+        /* --------------------------------------------------
+           TOTAL
+        -------------------------------------------------- */
+
+        totalLeads,
+
+        activeLeads,
+
+        /* --------------------------------------------------
+           PIPELINE
+        -------------------------------------------------- */
+
+        newLeads,
+
+        contactedLeads,
+
+        qualifiedLeads,
+
+        viewingLeads,
+
+        negotiationLeads,
+
+        wonLeads,
+
+        lostLeads,
+
+        /* --------------------------------------------------
+           HOT
+        -------------------------------------------------- */
+
+        hotLeads,
+
+        /* --------------------------------------------------
+           VIEWINGS
+        -------------------------------------------------- */
+
+        viewingRequested,
+
+        viewingScheduled,
+
+        viewingCompleted,
+
+        /* --------------------------------------------------
+           FOLLOW-UP
+        -------------------------------------------------- */
+
+        followUpLeads,
+
+        /* --------------------------------------------------
+           ASSIGNMENT
+        -------------------------------------------------- */
+
+        assignedLeads,
+
+        unassignedLeads,
+
+        assignmentRate,
+
+        aiAssignedLeads,
+
+        manualAssignedLeads,
+
+        autoAssignedLeads,
+
+        /* --------------------------------------------------
+           CONVERSION
+        -------------------------------------------------- */
+
+        conversionRate,
+
+        activeToClosedRate,
+
+        lossRate,
+
+        /* --------------------------------------------------
+           SCORE CATEGORY
+        -------------------------------------------------- */
+
+        hotLeadRatio,
+
+        hotScoreThreshold:
+          HOT_SCORE_THRESHOLD,
+      };
+    } catch (error) {
+      console.error(
+        "❌ Organization analytics error:",
+        error
       );
 
       return null;
     }
-
-    // ======================================================
-    // FETCH ORGANIZATION LEADS
-    // ======================================================
-
-    const leads = await Lead.find({
-      organizationId,
-    });
-
-    const totalLeads =
-      leads.length;
-
-    // ======================================================
-    // PIPELINE COUNTS
-    // ======================================================
-
-    const newLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.NEW
-      ).length;
-
-    const contactedLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.CONTACTED
-      ).length;
-
-    const qualifiedLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.QUALIFIED
-      ).length;
-
-    const viewingLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.VIEWING
-      ).length;
-
-    const negotiationLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.NEGOTIATION
-      ).length;
-
-    const wonLeads =
-      leads.filter(
-        isClosedLead
-      ).length;
-
-    const lostLeads =
-      leads.filter(
-        isClosedLostLead
-      ).length;
-
-    // ======================================================
-    // HOT LEADS
-    // ======================================================
-
-    const hotLeads =
-      leads.filter(
-        isHotLead
-      ).length;
-
-    // ======================================================
-    // VIEWING METRICS
-    // ======================================================
-
-    const viewingRequested =
-      leads.filter(
-        isViewingRequested
-      ).length;
-
-    const viewingScheduled =
-      leads.filter(
-        isViewingScheduled
-      ).length;
-
-    const viewingCompleted =
-      leads.filter(
-        isViewingCompleted
-      ).length;
-
-    // ======================================================
-    // FOLLOW-UP METRICS
-    // ======================================================
-
-    const followUpLeads =
-      leads.filter(
-        isFollowUpLead
-      ).length;
-
-    // ======================================================
-    // ASSIGNMENT METRICS
-    // ======================================================
-
-    const assignedLeads =
-      leads.filter(
-        (lead) =>
-          Boolean(
-            lead.assignedTo
-          )
-      ).length;
-
-    const unassignedLeads =
-      leads.filter(
-        (lead) =>
-          !lead.assignedTo
-      ).length;
-
-    // ======================================================
-    // ASSIGNMENT SOURCES
-    // ======================================================
-
-    const aiAssignedLeads =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "ai"
-      ).length;
-
-    const manualAssignedLeads =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "manual"
-      ).length;
-
-    const autoAssignedLeads =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "auto"
-      ).length;
-
-    // ======================================================
-    // ACTIVE PIPELINE
-    // ======================================================
-
-    const activeLeads =
-      leads.filter(
-        isActiveLead
-      ).length;
-
-    // ======================================================
-    // CONVERSION METRICS
-    // ======================================================
-
-    const conversionRate =
-      percentage(
-        wonLeads,
-        totalLeads
-      );
-
-    const activeToClosedRate =
-      percentage(
-        wonLeads,
-        activeLeads + wonLeads
-      );
-
-    const lossRate =
-      percentage(
-        lostLeads,
-        totalLeads
-      );
-
-    // ======================================================
-    // HOT LEAD RATIO
-    // ======================================================
-
-    const hotLeadRatio =
-      percentage(
-        hotLeads,
-        totalLeads
-      );
-
-    // ======================================================
-    // ASSIGNMENT RATE
-    // ======================================================
-
-    const assignmentRate =
-      percentage(
-        assignedLeads,
-        totalLeads
-      );
-
-    // ======================================================
-    // RESPONSE OBJECT
-    // ======================================================
-
-    return {
-      // ----------------------------------------------------
-      // TOTAL
-      // ----------------------------------------------------
-
-      totalLeads,
-
-      activeLeads,
-
-      // ----------------------------------------------------
-      // PIPELINE
-      // ----------------------------------------------------
-
-      newLeads,
-
-      contactedLeads,
-
-      qualifiedLeads,
-
-      viewingLeads,
-
-      negotiationLeads,
-
-      wonLeads,
-
-      lostLeads,
-
-      // ----------------------------------------------------
-      // HOT LEADS
-      // ----------------------------------------------------
-
-      hotLeads,
-
-      // ----------------------------------------------------
-      // VIEWINGS
-      // ----------------------------------------------------
-
-      viewingRequested,
-
-      viewingScheduled,
-
-      viewingCompleted,
-
-      // ----------------------------------------------------
-      // FOLLOW-UP
-      // ----------------------------------------------------
-
-      followUpLeads,
-
-      // ----------------------------------------------------
-      // ASSIGNMENT
-      // ----------------------------------------------------
-
-      assignedLeads,
-
-      unassignedLeads,
-
-      assignmentRate,
-
-      aiAssignedLeads,
-
-      manualAssignedLeads,
-
-      autoAssignedLeads,
-
-      // ----------------------------------------------------
-      // CONVERSION
-      // ----------------------------------------------------
-
-      conversionRate,
-
-      activeToClosedRate,
-
-      lossRate,
-
-      hotLeadRatio,
-    };
-
-  } catch (error) {
-    console.error(
-      "❌ Organization analytics error:",
-      error
-    );
-
-    return null;
-  }
-};
-
-// ==========================================================
-// AGENT PERFORMANCE ANALYTICS
-// ==========================================================
+  };
+
+/* ==========================================================
+   AGENT PERFORMANCE ANALYTICS
+========================================================== */
 
 /**
  * Get CRM performance for one agent.
  *
- * The query intentionally uses assignedTo so agents are
- * measured only against leads actually assigned to them.
+ * organizationId is intentionally required.
+ *
+ * This prevents:
+ *
+ *   Lead.find({ assignedTo: agentId })
+ *
+ * from becoming a cross-tenant analytics query.
  *
  * @param {ObjectId|string} agentId
+ * @param {ObjectId|string} organizationId
  *
  * @returns {Object|null}
  */
+export const getAgentPerformance =
+  async (
+    agentId,
 
-export const getAgentPerformance = async (
-  agentId
-) => {
-  try {
-    if (!agentId) {
-      console.log(
-        "⚠️ Agent analytics skipped: agentId is missing."
+    organizationId
+  ) => {
+    try {
+      if (!agentId) {
+        console.log(
+          "⚠️ Agent analytics skipped: agentId is missing."
+        );
+
+        return null;
+      }
+
+      if (
+        !hasOrganization(
+          organizationId
+        )
+      ) {
+        console.log(
+          "⚠️ Agent analytics skipped: organizationId is missing."
+        );
+
+        return null;
+      }
+
+      /* ====================================================
+         GET ASSIGNED LEADS
+      ==================================================== */
+
+      const leads =
+        await Lead.find({
+          organizationId,
+
+          assignedTo:
+            agentId,
+        }).lean();
+
+      const totalAssigned =
+        leads.length;
+
+      /* ====================================================
+         GET AGENT VIEWINGS
+      ==================================================== */
+
+      const viewings =
+        await Viewing.find({
+          organizationId,
+
+          agent:
+            agentId,
+        }).lean();
+
+      /* ====================================================
+         PIPELINE COUNTS
+      ==================================================== */
+
+      const activeLeads =
+        leads.filter(
+          isActiveLead
+        ).length;
+
+      const newLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.NEW
+        ).length;
+
+      const contactedLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.CONTACTED
+        ).length;
+
+      const qualifiedLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.QUALIFIED
+        ).length;
+
+      const viewingLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.VIEWING
+        ).length;
+
+      const negotiationLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.NEGOTIATION
+        ).length;
+
+      const wonLeads =
+        leads.filter(
+          isWonLead
+        ).length;
+
+      const lostLeads =
+        leads.filter(
+          isLostLead
+        ).length;
+
+      /* ====================================================
+         HOT LEADS
+      ==================================================== */
+
+      const hotLeads =
+        leads.filter(
+          isHotLead
+        ).length;
+
+      /* ====================================================
+         VIEWING METRICS
+      ==================================================== */
+
+      const {
+        viewingRequested,
+
+        viewingScheduled,
+
+        viewingCompleted,
+      } =
+        getViewingMetrics(
+          viewings
+        );
+
+      /* ====================================================
+         FOLLOW-UP
+      ==================================================== */
+
+      const followUpLeads =
+        leads.filter(
+          isFollowUpLead
+        ).length;
+
+      /* ====================================================
+         PERFORMANCE
+      ==================================================== */
+
+      const successRate =
+        percentage(
+          wonLeads,
+
+          totalAssigned
+        );
+
+      const activeConversionRate =
+        percentage(
+          wonLeads,
+
+          activeLeads +
+            wonLeads
+        );
+
+      const hotLeadRatio =
+        percentage(
+          hotLeads,
+
+          totalAssigned
+        );
+
+      /* ====================================================
+         ASSIGNMENT SOURCE BREAKDOWN
+      ==================================================== */
+
+      const aiAssigned =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "ai"
+        ).length;
+
+      const manualAssigned =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "manual"
+        ).length;
+
+      const autoAssigned =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "auto"
+        ).length;
+
+      /* ====================================================
+         RETURN
+      ==================================================== */
+
+      return {
+        agentId,
+
+        organizationId,
+
+        totalAssigned,
+
+        activeLeads,
+
+        /* --------------------------------------------------
+           PIPELINE
+        -------------------------------------------------- */
+
+        newLeads,
+
+        contactedLeads,
+
+        qualifiedLeads,
+
+        viewingLeads,
+
+        negotiationLeads,
+
+        wonLeads,
+
+        lostLeads,
+
+        /* --------------------------------------------------
+           HOT
+        -------------------------------------------------- */
+
+        hotLeads,
+
+        /* --------------------------------------------------
+           VIEWINGS
+        -------------------------------------------------- */
+
+        viewingRequested,
+
+        viewingScheduled,
+
+        viewingCompleted,
+
+        /* --------------------------------------------------
+           FOLLOW-UP
+        -------------------------------------------------- */
+
+        followUpLeads,
+
+        /* --------------------------------------------------
+           PERFORMANCE
+        -------------------------------------------------- */
+
+        successRate,
+
+        activeConversionRate,
+
+        hotLeadRatio,
+
+        /* --------------------------------------------------
+           ASSIGNMENT SOURCE
+        -------------------------------------------------- */
+
+        aiAssigned,
+
+        manualAssigned,
+
+        autoAssigned,
+
+        /* --------------------------------------------------
+           SCORE CONFIGURATION
+        -------------------------------------------------- */
+
+        hotScoreThreshold:
+          HOT_SCORE_THRESHOLD,
+      };
+    } catch (error) {
+      console.error(
+        "❌ Agent analytics error:",
+        error
       );
 
       return null;
     }
+  };
 
-    // ======================================================
-    // GET ASSIGNED LEADS
-    // ======================================================
-
-    const leads = await Lead.find({
-      assignedTo: agentId,
-    });
-
-    const totalAssigned =
-      leads.length;
-
-    // ======================================================
-    // PIPELINE COUNTS
-    // ======================================================
-
-    const activeLeads =
-      leads.filter(
-        isActiveLead
-      ).length;
-
-    const newLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.NEW
-      ).length;
-
-    const contactedLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.CONTACTED
-      ).length;
-
-    const qualifiedLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.QUALIFIED
-      ).length;
-
-    const viewingLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.VIEWING
-      ).length;
-
-    const negotiationLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.NEGOTIATION
-      ).length;
-
-    const wonLeads =
-      leads.filter(
-        isClosedLead
-      ).length;
-
-    const lostLeads =
-      leads.filter(
-        isClosedLostLead
-      ).length;
-
-    // ======================================================
-    // HOT LEADS
-    // ======================================================
-
-    const hotLeads =
-      leads.filter(
-        isHotLead
-      ).length;
-
-    // ======================================================
-    // VIEWING METRICS
-    // ======================================================
-
-    const viewingRequested =
-      leads.filter(
-        isViewingRequested
-      ).length;
-
-    const viewingScheduled =
-      leads.filter(
-        isViewingScheduled
-      ).length;
-
-    const viewingCompleted =
-      leads.filter(
-        isViewingCompleted
-      ).length;
-
-    // ======================================================
-    // FOLLOW-UP
-    // ======================================================
-
-    const followUpLeads =
-      leads.filter(
-        isFollowUpLead
-      ).length;
-
-    // ======================================================
-    // PERFORMANCE
-    // ======================================================
-
-    const successRate =
-      percentage(
-        wonLeads,
-        totalAssigned
-      );
-
-    const activeConversionRate =
-      percentage(
-        wonLeads,
-        activeLeads + wonLeads
-      );
-
-    const hotLeadRatio =
-      percentage(
-        hotLeads,
-        totalAssigned
-      );
-
-    // ======================================================
-    // ASSIGNMENT SOURCE BREAKDOWN
-    // ======================================================
-
-    const aiAssigned =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "ai"
-      ).length;
-
-    const manualAssigned =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "manual"
-      ).length;
-
-    const autoAssigned =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "auto"
-      ).length;
-
-    // ======================================================
-    // RETURN
-    // ======================================================
-
-    return {
-      agentId,
-
-      totalAssigned,
-
-      activeLeads,
-
-      // ----------------------------------------------------
-      // PIPELINE
-      // ----------------------------------------------------
-
-      newLeads,
-
-      contactedLeads,
-
-      qualifiedLeads,
-
-      viewingLeads,
-
-      negotiationLeads,
-
-      wonLeads,
-
-      lostLeads,
-
-      // ----------------------------------------------------
-      // HOT
-      // ----------------------------------------------------
-
-      hotLeads,
-
-      // ----------------------------------------------------
-      // VIEWINGS
-      // ----------------------------------------------------
-
-      viewingRequested,
-
-      viewingScheduled,
-
-      viewingCompleted,
-
-      // ----------------------------------------------------
-      // FOLLOW-UP
-      // ----------------------------------------------------
-
-      followUpLeads,
-
-      // ----------------------------------------------------
-      // PERFORMANCE
-      // ----------------------------------------------------
-
-      successRate,
-
-      activeConversionRate,
-
-      hotLeadRatio,
-
-      // ----------------------------------------------------
-      // ASSIGNMENT SOURCE
-      // ----------------------------------------------------
-
-      aiAssigned,
-
-      manualAssigned,
-
-      autoAssigned,
-    };
-
-  } catch (error) {
-    console.error(
-      "❌ Agent analytics error:",
-      error
-    );
-
-    return null;
-  }
-};
-
-// ==========================================================
-// AI EFFECTIVENESS SCORE
-// ==========================================================
+/* ==========================================================
+   AI / SCORING EFFECTIVENESS
+========================================================== */
 
 /**
- * Measure how effectively AI is contributing to lead
- * qualification and routing.
+ * Measure scoring-system coverage and outcome.
  *
- * Metrics:
+ * NOTE:
  * ----------------------------------------------------------
- * - leads with an AI score
- * - leads without an AI score
- * - scoring coverage
- * - hot leads generated from scored leads
- * - AI assignment count
+ * Lead.score is the canonical persisted score.
+ *
+ * This service does not claim that every score was generated
+ * by an external AI model. The scoring engine is the authority
+ * for score calculation.
  *
  * @param {ObjectId|string} organizationId
  *
  * @returns {Object|null}
  */
+export const getAIEffectiveness =
+  async (
+    organizationId
+  ) => {
+    try {
+      if (
+        !hasOrganization(
+          organizationId
+        )
+      ) {
+        console.log(
+          "⚠️ AI analytics skipped: organizationId is missing."
+        );
 
-export const getAIEffectiveness = async (
-  organizationId
-) => {
-  try {
-    if (!organizationId) {
-      console.log(
-        "⚠️ AI analytics skipped: organizationId is missing."
+        return null;
+      }
+
+      /* ====================================================
+         GET ORGANIZATION LEADS
+      ==================================================== */
+
+      const leads =
+        await Lead.find({
+          organizationId,
+        }).lean();
+
+      const totalLeads =
+        leads.length;
+
+      /* ====================================================
+         SCORED LEADS
+      ==================================================== */
+
+      const scoredLeadDocuments =
+        leads.filter(
+          (lead) =>
+            safeNumber(
+              lead.score
+            ) > 0
+        );
+
+      const scoredLeads =
+        scoredLeadDocuments.length;
+
+      const unscoredLeads =
+        totalLeads -
+        scoredLeads;
+
+      /* ====================================================
+         SCORE COVERAGE
+      ==================================================== */
+
+      const scoringCoverage =
+        percentage(
+          scoredLeads,
+
+          totalLeads
+        );
+
+      /* ====================================================
+         AI-ASSIGNED LEADS
+      ==================================================== */
+
+      const aiAssignedLeads =
+        leads.filter(
+          (lead) =>
+            lead.assignedSource ===
+            "ai"
+        ).length;
+
+      /* ====================================================
+         SCORE CATEGORY BREAKDOWN
+      ==================================================== */
+
+      const hotScoredLeads =
+        scoredLeadDocuments.filter(
+          (lead) =>
+            getLeadCategory(
+              safeNumber(
+                lead.score
+              )
+            ) ===
+            LEAD_SCORE_CATEGORIES.HOT
+        ).length;
+
+      const qualifiedScoredLeads =
+        scoredLeadDocuments.filter(
+          (lead) =>
+            getLeadCategory(
+              safeNumber(
+                lead.score
+              )
+            ) ===
+            LEAD_SCORE_CATEGORIES.QUALIFIED
+        ).length;
+
+      const newScoredLeads =
+        scoredLeadDocuments.filter(
+          (lead) =>
+            getLeadCategory(
+              safeNumber(
+                lead.score
+              )
+            ) ===
+            LEAD_SCORE_CATEGORIES.NEW
+        ).length;
+
+      /* ====================================================
+         AVERAGE SCORE
+      ==================================================== */
+
+      const totalScore =
+        scoredLeadDocuments.reduce(
+          (
+            sum,
+            lead
+          ) =>
+            sum +
+            safeNumber(
+              lead.score
+            ),
+          0
+        );
+
+      const averageScore =
+        scoredLeads
+          ? Number(
+              (
+                totalScore /
+                scoredLeads
+              ).toFixed(2)
+            )
+          : 0;
+
+      /* ====================================================
+         SCORED CONVERSIONS
+      ==================================================== */
+
+      const scoredAndWon =
+        scoredLeadDocuments.filter(
+          isWonLead
+        ).length;
+
+      const scoredAndLost =
+        scoredLeadDocuments.filter(
+          isLostLead
+        ).length;
+
+      const aiScoredConversionRate =
+        percentage(
+          scoredAndWon,
+
+          scoredLeads
+        );
+
+      /* ====================================================
+         RETURN
+      ==================================================== */
+
+      return {
+        totalLeads,
+
+        scoredLeads,
+
+        unscoredLeads,
+
+        scoringCoverage,
+
+        aiAssignedLeads,
+
+        /* --------------------------------------------------
+           SCORE CATEGORIES
+        -------------------------------------------------- */
+
+        hotScoredLeads,
+
+        qualifiedScoredLeads,
+
+        newScoredLeads,
+
+        /* --------------------------------------------------
+           SCORE
+        -------------------------------------------------- */
+
+        averageScore,
+
+        hotScoreThreshold:
+          HOT_SCORE_THRESHOLD,
+
+        /* --------------------------------------------------
+           OUTCOMES
+        -------------------------------------------------- */
+
+        scoredAndWon,
+
+        scoredAndLost,
+
+        aiScoredConversionRate,
+
+        /* --------------------------------------------------
+           Canonical category labels
+        -------------------------------------------------- */
+
+        scoreCategories:
+          LEAD_SCORE_CATEGORIES,
+      };
+    } catch (error) {
+      console.error(
+        "❌ AI analytics error:",
+        error
       );
 
       return null;
     }
+  };
 
-    // ======================================================
-    // GET ORGANIZATION LEADS
-    // ======================================================
-
-    const leads = await Lead.find({
-      organizationId,
-    });
-
-    const totalLeads =
-      leads.length;
-
-    // ======================================================
-    // SCORED LEADS
-    // ======================================================
-
-    const scoredLeads =
-      leads.filter(
-        (lead) =>
-          Number(
-            lead.score || 0
-          ) > 0
-      ).length;
-
-    const unscoredLeads =
-      totalLeads -
-      scoredLeads;
-
-    // ======================================================
-    // SCORE COVERAGE
-    // ======================================================
-
-    const scoringCoverage =
-      percentage(
-        scoredLeads,
-        totalLeads
-      );
-
-    // ======================================================
-    // AI-ASSIGNED LEADS
-    // ======================================================
-
-    const aiAssignedLeads =
-      leads.filter(
-        (lead) =>
-          lead.assignedSource ===
-          "ai"
-      ).length;
-
-    // ======================================================
-    // AI HOT LEADS
-    // ======================================================
-
-    const aiHotLeads =
-      leads.filter(
-        (lead) =>
-          Number(
-            lead.score || 0
-          ) >= 70
-      ).length;
-
-    // ======================================================
-    // HIGH-VALUE LEADS
-    // ======================================================
-
-    const highValueLeads =
-      leads.filter(
-        (lead) =>
-          Number(
-            lead.score || 0
-          ) >= 80
-      ).length;
-
-    // ======================================================
-    // AVERAGE AI SCORE
-    // ======================================================
-
-    const totalScore =
-      leads.reduce(
-        (sum, lead) =>
-          sum +
-          Number(
-            lead.score || 0
-          ),
-        0
-      );
-
-    const averageScore =
-      scoredLeads
-        ? Number(
-            (
-              totalScore /
-              scoredLeads
-            ).toFixed(2)
-          )
-        : 0;
-
-    // ======================================================
-    // AI CONVERSION
-    // ======================================================
-
-    const scoredLeadDocuments =
-      leads.filter(
-        (lead) =>
-          Number(
-            lead.score || 0
-          ) > 0
-      );
-
-    const scoredAndClosed =
-      scoredLeadDocuments.filter(
-        isClosedLead
-      ).length;
-
-    const aiScoredConversionRate =
-      percentage(
-        scoredAndClosed,
-        scoredLeads
-      );
-
-    // ======================================================
-    // RETURN
-    // ======================================================
-
-    return {
-      totalLeads,
-
-      scoredLeads,
-
-      unscoredLeads,
-
-      scoringCoverage,
-
-      aiAssignedLeads,
-
-      aiHotLeads,
-
-      highValueLeads,
-
-      averageScore,
-
-      scoredAndClosed,
-
-      aiScoredConversionRate,
-    };
-
-  } catch (error) {
-    console.error(
-      "❌ AI analytics error:",
-      error
-    );
-
-    return null;
-  }
-};
-
-// ==========================================================
-// ORGANIZATION PIPELINE BREAKDOWN
-// ==========================================================
+/* ==========================================================
+   ORGANIZATION PIPELINE BREAKDOWN
+========================================================== */
 
 /**
  * Returns a clean pipeline object for dashboard charts.
  *
  * IMPORTANT
  * ----------------------------------------------------------
- * Keys such as "viewing_requested", "viewing_scheduled",
- * and "follow_up" are ANALYTICS CATEGORIES.
  *
- * They are NOT written into Lead.status.
+ * Only these keys represent actual Lead.status values:
  *
- * This allows the dashboard to preserve a useful sales
- * workflow without violating the Lead schema enum.
+ *   new
+ *   contacted
+ *   qualified
+ *   viewing
+ *   negotiation
+ *   won
+ *   lost
+ *
+ * The following are DERIVED dashboard categories:
+ *
+ *   hot
+ *   viewing_requested
+ *   viewing_scheduled
+ *   viewing_completed
+ *   follow_up
+ *
+ * They MUST NOT be persisted into Lead.status.
  */
+export const getOrganizationPipeline =
+  async (
+    organizationId
+  ) => {
+    try {
+      if (
+        !hasOrganization(
+          organizationId
+        )
+      ) {
+        return null;
+      }
 
-export const getOrganizationPipeline = async (
-  organizationId
-) => {
-  try {
-    if (!organizationId) {
+      /* ====================================================
+         LEADS
+      ==================================================== */
+
+      const leads =
+        await Lead.find({
+          organizationId,
+        }).lean();
+
+      /* ====================================================
+         VIEWINGS
+      ==================================================== */
+
+      const viewings =
+        await Viewing.find({
+          organizationId,
+        }).lean();
+
+      /* ====================================================
+         VIEWING DERIVED METRICS
+      ==================================================== */
+
+      const {
+        viewingRequested,
+
+        viewingScheduled,
+
+        viewingCompleted,
+      } =
+        getViewingMetrics(
+          viewings
+        );
+
+      /* ====================================================
+         PIPELINE
+      ==================================================== */
+
+      return {
+        /* --------------------------------------------------
+           REAL Lead.status VALUES
+        -------------------------------------------------- */
+
+        new:
+          leads.filter(
+            (lead) =>
+              lead.status ===
+              LEAD_STATUS.NEW
+          ).length,
+
+        contacted:
+          leads.filter(
+            (lead) =>
+              lead.status ===
+              LEAD_STATUS.CONTACTED
+          ).length,
+
+        qualified:
+          leads.filter(
+            (lead) =>
+              lead.status ===
+              LEAD_STATUS.QUALIFIED
+          ).length,
+
+        viewing:
+          leads.filter(
+            (lead) =>
+              lead.status ===
+              LEAD_STATUS.VIEWING
+          ).length,
+
+        negotiation:
+          leads.filter(
+            (lead) =>
+              lead.status ===
+              LEAD_STATUS.NEGOTIATION
+          ).length,
+
+        won:
+          leads.filter(
+            isWonLead
+          ).length,
+
+        lost:
+          leads.filter(
+            isLostLead
+          ).length,
+
+        /* --------------------------------------------------
+           DERIVED SCORE CATEGORY
+        -------------------------------------------------- */
+
+        hot:
+          leads.filter(
+            isHotLead
+          ).length,
+
+        /* --------------------------------------------------
+           DERIVED VIEWING WORKFLOW
+        -------------------------------------------------- */
+
+        viewing_requested:
+          viewingRequested,
+
+        viewing_scheduled:
+          viewingScheduled,
+
+        viewing_completed:
+          viewingCompleted,
+
+        /* --------------------------------------------------
+           DERIVED FOLLOW-UP WORKFLOW
+        -------------------------------------------------- */
+
+        follow_up:
+          leads.filter(
+            isFollowUpLead
+          ).length,
+      };
+    } catch (error) {
+      console.error(
+        "❌ Pipeline analytics error:",
+        error
+      );
+
       return null;
     }
+  };
 
-    const leads = await Lead.find({
-      organizationId,
-    });
-
-    return {
-      // ----------------------------------------------------
-      // REAL Lead.status VALUES
-      // ----------------------------------------------------
-
-      new:
-        leads.filter(
-          (lead) =>
-            lead.status ===
-            LEAD_STATUSES.NEW
-        ).length,
-
-      contacted:
-        leads.filter(
-          (lead) =>
-            lead.status ===
-            LEAD_STATUSES.CONTACTED
-        ).length,
-
-      qualified:
-        leads.filter(
-          (lead) =>
-            lead.status ===
-            LEAD_STATUSES.QUALIFIED
-        ).length,
-
-      viewing:
-        leads.filter(
-          (lead) =>
-            lead.status ===
-            LEAD_STATUSES.VIEWING
-        ).length,
-
-      negotiation:
-        leads.filter(
-          (lead) =>
-            lead.status ===
-            LEAD_STATUSES.NEGOTIATION
-        ).length,
-
-      won:
-        leads.filter(
-          isClosedLead
-        ).length,
-
-      lost:
-        leads.filter(
-          isClosedLostLead
-        ).length,
-
-      // ----------------------------------------------------
-      // DERIVED WORKFLOW CATEGORIES
-      // ----------------------------------------------------
-
-      hot:
-        leads.filter(
-          isHotLead
-        ).length,
-
-      viewing_requested:
-        leads.filter(
-          isViewingRequested
-        ).length,
-
-      viewing_scheduled:
-        leads.filter(
-          isViewingScheduled
-        ).length,
-
-      viewing_completed:
-        leads.filter(
-          isViewingCompleted
-        ).length,
-
-      follow_up:
-        leads.filter(
-          isFollowUpLead
-        ).length,
-    };
-
-  } catch (error) {
-    console.error(
-      "❌ Pipeline analytics error:",
-      error
-    );
-
-    return null;
-  }
-};
-
-// ==========================================================
-// AGENT WORKLOAD ANALYTICS
-// ==========================================================
+/* ==========================================================
+   AGENT WORKLOAD ANALYTICS
+========================================================== */
 
 /**
- * Returns the current workload of an agent.
+ * Returns current workload for an agent.
  *
- * This works from actual Lead documents rather than trusting
- * only User.assignedLeadCount, making it useful for validating
- * the assignment engine.
+ * organizationId is mandatory for tenant isolation.
+ *
+ * @param {ObjectId|string} agentId
+ * @param {ObjectId|string} organizationId
+ *
+ * @returns {Object|null}
  */
+export const getAgentWorkload =
+  async (
+    agentId,
 
-export const getAgentWorkload = async (
-  agentId
-) => {
-  try {
-    if (!agentId) {
+    organizationId
+  ) => {
+    try {
+      if (!agentId) {
+        return null;
+      }
+
+      if (
+        !hasOrganization(
+          organizationId
+        )
+      ) {
+        console.log(
+          "⚠️ Agent workload skipped: organizationId is missing."
+        );
+
+        return null;
+      }
+
+      /* ====================================================
+         LEADS
+      ==================================================== */
+
+      const leads =
+        await Lead.find({
+          organizationId,
+
+          assignedTo:
+            agentId,
+        }).lean();
+
+      /* ====================================================
+         VIEWINGS
+      ==================================================== */
+
+      const viewings =
+        await Viewing.find({
+          organizationId,
+
+          agent:
+            agentId,
+
+          status: {
+            $in:
+              ACTIVE_VIEWING_STATUSES,
+          },
+        }).lean();
+
+      /* ====================================================
+         LEAD COUNTS
+      ==================================================== */
+
+      const activeLeads =
+        leads.filter(
+          isActiveLead
+        ).length;
+
+      const wonLeads =
+        leads.filter(
+          isWonLead
+        ).length;
+
+      const lostLeads =
+        leads.filter(
+          isLostLead
+        ).length;
+
+      const hotLeads =
+        leads.filter(
+          isHotLead
+        ).length;
+
+      const viewingLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.VIEWING
+        ).length;
+
+      const negotiationLeads =
+        leads.filter(
+          (lead) =>
+            lead.status ===
+            LEAD_STATUS.NEGOTIATION
+        ).length;
+
+      const followUpLeads =
+        leads.filter(
+          isFollowUpLead
+        ).length;
+
+      /* ====================================================
+         VIEWING WORKLOAD
+      ==================================================== */
+
+      const scheduledViewings =
+        viewings.filter(
+          (viewing) =>
+            SCHEDULED_VIEWING_STATUSES.includes(
+              viewing.status
+            )
+        ).length;
+
+      const requestedViewings =
+        viewings.filter(
+          (viewing) =>
+            [
+              VIEWING_STATUS.REQUESTED,
+
+              VIEWING_STATUS.PENDING_APPROVAL,
+            ].includes(
+              viewing.status
+            )
+        ).length;
+
+      /* ====================================================
+         RETURN
+      ==================================================== */
+
+      return {
+        agentId,
+
+        organizationId,
+
+        totalAssigned:
+          leads.length,
+
+        activeLeads,
+
+        hotLeads,
+
+        viewingLeads,
+
+        negotiationLeads,
+
+        followUpLeads,
+
+        wonLeads,
+
+        lostLeads,
+
+        requestedViewings,
+
+        scheduledViewings,
+      };
+    } catch (error) {
+      console.error(
+        "❌ Agent workload analytics error:",
+        error
+      );
+
       return null;
     }
+  };
 
-    const leads = await Lead.find({
-      assignedTo: agentId,
-    });
-
-    const activeLeads =
-      leads.filter(
-        isActiveLead
-      ).length;
-
-    const wonLeads =
-      leads.filter(
-        isClosedLead
-      ).length;
-
-    const lostLeads =
-      leads.filter(
-        isClosedLostLead
-      ).length;
-
-    const hotLeads =
-      leads.filter(
-        isHotLead
-      ).length;
-
-    const viewingLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.VIEWING
-      ).length;
-
-    const negotiationLeads =
-      leads.filter(
-        (lead) =>
-          lead.status ===
-          LEAD_STATUSES.NEGOTIATION
-      ).length;
-
-    const followUpLeads =
-      leads.filter(
-        isFollowUpLead
-      ).length;
-
-    return {
-      agentId,
-
-      totalAssigned:
-        leads.length,
-
-      activeLeads,
-
-      hotLeads,
-
-      viewingLeads,
-
-      negotiationLeads,
-
-      followUpLeads,
-
-      wonLeads,
-
-      lostLeads,
-    };
-
-  } catch (error) {
-    console.error(
-      "❌ Agent workload analytics error:",
-      error
-    );
-
-    return null;
-  }
-};
-
-// ==========================================================
-// DEFAULT EXPORT
-// ==========================================================
+/* ==========================================================
+   DEFAULT EXPORT
+========================================================== */
 
 export default {
   getOrganizationMetrics,

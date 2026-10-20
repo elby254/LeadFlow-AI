@@ -82,6 +82,10 @@ import AdminSettings from "./pages/admin/adminSettings";
 import AdminAnalytics from "./pages/admin/adminAnalytics";
 import AdminViewings from "./pages/admin/adminViewings";
 import AdminAgents from "./pages/admin/adminAgents";
+import Leads from "./pages/leads/leads";
+import LeadDetails from "./pages/leads/leadDetails";
+import AIQualification from "./pages/leads/aiQualification";
+import ContactLead from "./pages/conversations/contactLead";
 
 
 /* ==========================================================
@@ -319,6 +323,52 @@ export default function App() {
             index
             element={<AdminLanding />}
           />
+
+          {/* =================================================
+              ADMIN LEADS
+
+              /admin/leads
+            ================================================= */}
+
+          <Route
+            path="leads"
+            element={<Leads />}
+          />
+
+          {/* =================================================
+    ADMIN LEAD DETAILS
+
+    /admin/leads/:id
+
+    Displays the complete lead profile inside MainLayout.
+================================================= */}
+
+<Route
+  path="leads/:id"
+  element={<LeadDetails />}
+/>
+
+{/* =================================================
+    ADMIN AI QUALIFICATION
+
+    /admin/leads/:id/qualification
+================================================= */}
+
+<Route
+  path="leads/:id/qualification"
+  element={<AIQualification />}
+/>
+
+{/* =================================================
+    ADMIN CONTACT WORKSPACE
+
+    /admin/leads/:id/contact
+================================================= */}
+
+<Route
+  path="leads/:id/contact"
+  element={<ContactLead />}
+/>
 
 
           {/* =================================================

@@ -33,6 +33,8 @@ import {
   useState,
 } from "react";
 
+import { syncSocketAuthentication } from "../services/socketClient";
+
 // ======================================================
 // CONTEXT
 // ======================================================
@@ -98,6 +100,8 @@ export const AuthProvider = ({ children }) => {
       setUser(auth.user);
 
       setToken(auth.token);
+
+      syncSocketAuthentication(auth.token);
 
       console.log(
         "LeadFlow AI auth session restored."
@@ -172,6 +176,8 @@ export const AuthProvider = ({ children }) => {
       })
     );
 
+    syncSocketAuthentication(authenticatedToken);
+
     // --------------------------------------------------
     // Debug confirmation
     // --------------------------------------------------
@@ -218,6 +224,8 @@ export const AuthProvider = ({ children }) => {
     localStorage.removeItem("user");
 
     localStorage.removeItem("token");
+    
+    syncSocketAuthentication(null);
 
     console.log(
       "LeadFlow AI session cleared."

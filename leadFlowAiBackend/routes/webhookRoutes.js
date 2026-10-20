@@ -60,6 +60,21 @@ import resolveChannelOrganization
 
 
 /* ==========================================================
+   SHARED META WEBHOOK SIGNATURE VERIFICATION
+========================================================== */
+
+import verifyMetaWebhookSignature
+  from "../middleware/verifyMetaWebhookSignature.js";
+
+
+/* ==========================================================
+   WHATSAPP STATUS HANDLING
+========================================================== */
+import handleWhatsAppStatusWebhook
+  from "../middleware/handleWhatsAppStatusWebhook.js";
+
+
+/* ==========================================================
    AI INGESTION
 ========================================================== */
 
@@ -126,30 +141,18 @@ const router =
 router.post(
   "/whatsapp",
 
-  /* --------------------------------------------------------
-     1. WHATSAPP CHANNEL ADAPTER
-  -------------------------------------------------------- */
+  // 1. Verify the original Meta request signature.
+  verifyMetaWebhookSignature,
 
+  // 2. Handle delivery callbacks before inbound ingestion.
+  handleWhatsAppStatusWebhook,
+
+  // 3. Preserve the existing inbound message pipeline.
   whatsappAdapter,
-
-
-  /* --------------------------------------------------------
-     2. TRUSTED SOURCE VALIDATION
-  -------------------------------------------------------- */
 
   requireChannelSource,
 
-
-  /* --------------------------------------------------------
-     3. ORGANIZATION RESOLUTION
-  -------------------------------------------------------- */
-
   resolveChannelOrganization,
-
-
-  /* --------------------------------------------------------
-     4. SHARED AI INGESTION ENGINE
-  -------------------------------------------------------- */
 
   ingestMessage
 );

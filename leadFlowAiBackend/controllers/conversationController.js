@@ -1,7 +1,9 @@
 /**
  * ==========================================================
  *
- * LeadFlow AI - Conversation Controller
+ * CONVERSATION CONTROLLER
+ *
+ * ==========================================================
  *
  * Handles
  * ----------------------------------------------------------
@@ -23,49 +25,99 @@
  * Every conversation query is scoped to the authenticated
  * user's organization.
  *
- * Supported organization sources:
+ * Organization resolution is centralized through:
  *
- * req.user.organizationId
- * req.organizationId
+ *   resolveFromRequest()
+ *
+ * from:
+ *
+ *   services/organizationResolverService.js
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Conversation identifiers are NEVER trusted by themselves.
+ *
+ * Every Conversation read/update must include:
+ *
+ * {
+ *   _id: conversationId,
+ *   organizationId,
+ * }
+ *
+ * Related Message, Lead, Property and Viewing lookups are
+ * also scoped to the same organization.
+ *
+ * ==========================================================
+ *
+ * CANONICAL WORKFLOW ARCHITECTURE
+ * ==========================================================
+ *
+ * Lead lifecycle:
+ *
+ *   services/leadLifeCycleService.js
+ *
+ * Lead scoring:
+ *
+ *   services/leadScoringRulesEngine.js
+ *
+ * Viewing workflow:
+ *
+ *   services/viewingService.js
+ *
+ * Assignment:
+ *
+ *   assignmentConflictResolver.js
+ *
+ * Business events:
+ *
+ *   events/leadEvents.js
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ *
+ * This controller MUST NOT directly mutate:
+ *
+ *   lead.status
+ *
+ * when the operation belongs to the viewing workflow.
+ *
+ * Viewing requests are delegated to viewingService.js.
  *
  * ==========================================================
  */
+
+import { randomUUID } from "node:crypto";
 
 import Conversation from "../models/conversation.js";
 import Message from "../models/message.js";
 import Lead from "../models/lead.js";
 import Property from "../models/property.js";
-import Viewing from "../models/viewing.js";
 
 import {
   generateAIResponse,
 } from "../services/aiResponseEngine.js";
 
-/**
- * ==========================================================
- * ORGANIZATION HELPER
- * ==========================================================
- *
- * Resolve organization ID from the authenticated request.
- *
- * Priority:
- *
- * 1. req.user.organizationId
- * 2. req.organizationId
- *
- * Returns:
- * organizationId | null
- *
- * ==========================================================
- */
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
 
-const getOrganizationId = (req) => {
-  return (
-    req.user?.organizationId ||
-    req.organizationId ||
-    null
-  );
-};
+import {
+  executeIdempotentRequest,
+} from "../services/httpIdempotencyService.js";
+
+import {
+  requestViewing as requestViewingService,
+} from "../services/viewingService.js";
+
+import leadEventBus, {
+  LEAD_EVENTS,
+} from "../events/leadEvents.js";
+
+import {
+  withReliableTransaction,
+  addLeadStatusChangedEvent,
+  addViewingRequestedEvent,
+} from "../services/outboxIntegrationService.js";
 
 /**
  * ==========================================================
@@ -73,26 +125,200 @@ const getOrganizationId = (req) => {
  * ==========================================================
  */
 
-const requireOrganization = (
+const requireOrganization = async (
   req,
   res
 ) => {
-  const organizationId =
-    getOrganizationId(req);
+  const organization =
+    await resolveFromRequest(
+      req
+    );
 
-  if (!organizationId) {
+  if (!organization) {
     console.error(
       "❌ CONVERSATION CONTROLLER - ORGANIZATION NOT ASSIGNED"
     );
 
-    return res.status(403).json({
+    res.status(403).json({
       success: false,
       message:
         "Organization not assigned.",
     });
+
+    return null;
   }
 
-  return organizationId;
+  return organization._id;
+};
+
+/**
+ * ==========================================================
+ * CANONICAL VIEWING READ-MODEL EVENTS
+ * ==========================================================
+ *
+ * Critical business events are persisted into the Outbox
+ * inside the same MongoDB transaction as the database
+ * mutations.
+ *
+ * Only non-critical read-model synchronization events are
+ * emitted directly after the transaction commits.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Do NOT directly emit:
+ *
+ *   LEAD_VIEWING_REQUESTED
+ *   LEAD_STATUS_CHANGED
+ *
+ * Those events are queued through outboxIntegrationService.
+ *
+ * ==========================================================
+ */
+
+const emitViewingReadModelEvents = ({
+  organizationId,
+  viewing,
+  lead,
+  previousStatus,
+  property,
+}) => {
+  try {
+    const currentStatus =
+      lead?.status ||
+      null;
+
+    const viewingId =
+      viewing?._id ||
+      null;
+
+    const leadId =
+      lead?._id ||
+      viewing?.leadId ||
+      viewing?.lead ||
+      null;
+
+    const occurredAt =
+      new Date();
+
+    leadEventBus.emit(
+      LEAD_EVENTS.LEAD_UPDATED,
+      {
+        leadId,
+        organizationId,
+        lead,
+        viewing,
+        property,
+        status:
+          currentStatus,
+        score:
+          Number(
+            lead?.score ||
+            0
+          ),
+        assignedTo:
+          lead?.assignedTo ||
+          null,
+        currentViewingId:
+          lead?.currentViewing ||
+          viewingId ||
+          null,
+        followUpStatus:
+          lead?.followUpStatus ||
+          null,
+        occurredAt,
+      }
+    );
+
+    leadEventBus.emit(
+      LEAD_EVENTS.PIPELINE_UPDATED,
+      {
+        leadId,
+        organizationId,
+        lead,
+        viewing,
+        property,
+        previousStatus,
+        status:
+          currentStatus,
+        score:
+          Number(
+            lead?.score ||
+            0
+          ),
+        assignedTo:
+          lead?.assignedTo ||
+          null,
+        currentViewingId:
+          lead?.currentViewing ||
+          viewingId ||
+          null,
+        followUpStatus:
+          lead?.followUpStatus ||
+          null,
+        occurredAt,
+      }
+    );
+
+    console.log(
+      "📡 CONVERSATION CONTROLLER - VIEWING READ-MODEL EVENTS EMITTED:",
+      {
+        leadId:
+          leadId
+            ? String(leadId)
+            : null,
+
+        viewingId:
+          viewingId
+            ? String(viewingId)
+            : null,
+
+        previousStatus,
+
+        status:
+          currentStatus,
+      }
+    );
+  } catch (error) {
+    console.error(
+      "⚠️ CONVERSATION CONTROLLER - VIEWING READ-MODEL EVENT ERROR:",
+      error
+    );
+  }
+};
+
+/**
+ * ==========================================================
+ * VIEWING TRANSACTION OPERATION ID
+ * ==========================================================
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * The request ID is generated outside the transaction.
+ *
+ * This matters because MongoDB may retry a transaction
+ * callback. The same operationId must therefore be reused
+ * across retries so the Outbox deduplication key remains
+ * deterministic.
+ *
+ * ==========================================================
+ */
+
+const buildViewingOperationId = ({
+  conversationId,
+  requestId,
+}) => {
+  if (!conversationId) {
+    return null;
+  }
+
+  return [
+    "conversation-viewing-request",
+    String(conversationId),
+    String(
+      requestId ||
+      randomUUID()
+    ),
+  ].join(":");
 };
 
 /**
@@ -100,19 +326,21 @@ const requireOrganization = (
  * GET RECENT CONVERSATIONS
  *
  * GET /api/conversations/recent
- *
  * ==========================================================
  */
 
 export const getRecentConversations =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       console.log(
         "📥 GET RECENT CONVERSATIONS"
       );
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -131,11 +359,18 @@ export const getRecentConversations =
           organizationId,
         })
           .sort({
-            lastUpdated: -1,
-            updatedAt: -1,
-            createdAt: -1,
+            lastUpdated:
+              -1,
+
+            updatedAt:
+              -1,
+
+            createdAt:
+              -1,
           })
-          .limit(20)
+          .limit(
+            20
+          )
           .lean();
 
       console.log(
@@ -144,9 +379,15 @@ export const getRecentConversations =
       );
 
       return res.status(200).json({
-        success: true,
-        data: conversations,
-      });
+  success:
+    true,
+
+  count:
+    conversations.length,
+
+  data:
+    conversations,
+});
     } catch (error) {
       console.error(
         "GET RECENT CONVERSATIONS ERROR:",
@@ -154,9 +395,12 @@ export const getRecentConversations =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to fetch recent conversations.",
+
         error:
           error.message,
       });
@@ -168,22 +412,14 @@ export const getRecentConversations =
  * GET CONVERSATIONS
  *
  * GET /api/conversations
- *
- * Supported query parameters:
- *
- * ?page=1
- * ?limit=20
- * ?search=john
- * ?status=active
- * ?archived=true
- * ?archived=false
- * ?pinned=true
- *
  * ==========================================================
  */
 
 export const getConversations =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       console.log(
         "📥 GET CONVERSATIONS"
@@ -198,14 +434,8 @@ export const getConversations =
         pinned,
       } = req.query;
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION
-       * ------------------------------------------------------
-       */
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -219,64 +449,37 @@ export const getConversations =
         organizationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * PAGINATION
-       * ------------------------------------------------------
-       */
-
       const pageNumber =
         Math.max(
-          Number(page) || 1,
+          Number(page) ||
+            1,
           1
         );
 
       const limitNumber =
         Math.min(
           Math.max(
-            Number(limit) || 20,
+            Number(limit) ||
+              20,
             1
           ),
           100
         );
 
       const skip =
-        (pageNumber - 1) *
+        (
+          pageNumber -
+          1
+        ) *
         limitNumber;
-
-      /**
-       * ------------------------------------------------------
-       * BASE QUERY
-       * ------------------------------------------------------
-       *
-       * IMPORTANT:
-       *
-       * Organization filtering MUST exist here.
-       *
-       * This prevents:
-       *
-       * Organization A
-       *       ↓
-       * GET /api/conversations
-       *       ↓
-       * receiving
-       * Organization B conversations.
-       *
-       * ------------------------------------------------------
-       */
 
       const query = {
         organizationId,
       };
 
-      /**
-       * ------------------------------------------------------
-       * SEARCH
-       * ------------------------------------------------------
-       */
-
       if (
-        typeof search === "string" &&
+        typeof search ===
+          "string" &&
         search.trim()
       ) {
         const searchTerm =
@@ -287,76 +490,74 @@ export const getConversations =
             customerName: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             phoneNumber: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             propertyName: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             location: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
         ];
       }
 
-      /**
-       * ------------------------------------------------------
-       * STATUS FILTER
-       * ------------------------------------------------------
-       */
-
       if (
         status &&
-        status !== "all"
+        status !==
+          "all"
       ) {
         query.status =
           status;
       }
 
-      /**
-       * ------------------------------------------------------
-       * ARCHIVED FILTER
-       * ------------------------------------------------------
-       */
-
       if (
-        archived === "true"
+        archived ===
+        "true"
       ) {
         query.archived =
           true;
       }
 
       if (
-        archived === "false"
+        archived ===
+        "false"
       ) {
         query.archived = {
-          $ne: true,
+          $ne:
+            true,
         };
       }
 
-      /**
-       * ------------------------------------------------------
-       * PINNED FILTER
-       * ------------------------------------------------------
-       */
-
       if (
-        pinned === "true"
+        pinned ===
+        "true"
       ) {
         query.pinned =
           true;
@@ -367,35 +568,34 @@ export const getConversations =
         query
       );
 
-      /**
-       * ------------------------------------------------------
-       * TOTAL
-       * ------------------------------------------------------
-       */
-
       const total =
         await Conversation.countDocuments(
           query
         );
-
-      /**
-       * ------------------------------------------------------
-       * FETCH
-       * ------------------------------------------------------
-       */
 
       const conversations =
         await Conversation.find(
           query
         )
           .sort({
-            pinned: -1,
-            lastUpdated: -1,
-            updatedAt: -1,
-            createdAt: -1,
+            pinned:
+              -1,
+
+            lastUpdated:
+              -1,
+
+            updatedAt:
+              -1,
+
+            createdAt:
+              -1,
           })
-          .skip(skip)
-          .limit(limitNumber)
+          .skip(
+            skip
+          )
+          .limit(
+            limitNumber
+          )
           .lean();
 
       console.log(
@@ -408,16 +608,27 @@ export const getConversations =
         total
       );
 
+      const totalPages =
+        Math.ceil(
+          total /
+          limitNumber
+        );
+
       return res.status(200).json({
-        success: true,
+  success:
+    true,
 
-        data: conversations,
+  count:
+    total,
 
-        conversations,
+  data:
+    conversations,
 
-        total,
+  conversations,
 
-        pagination: {
+  total,
+
+  pagination: {
           page:
             pageNumber,
 
@@ -426,18 +637,11 @@ export const getConversations =
 
           total,
 
-          totalPages:
-            Math.ceil(
-              total /
-                limitNumber
-            ),
+          totalPages,
 
           hasNextPage:
             pageNumber <
-            Math.ceil(
-              total /
-                limitNumber
-            ),
+            totalPages,
 
           hasPreviousPage:
             pageNumber >
@@ -451,9 +655,12 @@ export const getConversations =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to fetch conversations.",
+
         error:
           error.message,
       });
@@ -465,25 +672,22 @@ export const getConversations =
  * SEARCH CONVERSATIONS
  *
  * GET /api/conversations/search
- *
  * ==========================================================
  */
 
 export const searchConversations =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         query = "",
-      } = req.query;
-
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION
-       * ------------------------------------------------------
-       */
+      } =
+        req.query;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -497,18 +701,15 @@ export const searchConversations =
         organizationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * VALIDATE SEARCH
-       * ------------------------------------------------------
-       */
-
       if (
-        typeof query !== "string" ||
+        typeof query !==
+          "string" ||
         !query.trim()
       ) {
         return res.status(400).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Search query is required.",
         });
@@ -516,12 +717,6 @@ export const searchConversations =
 
       const searchTerm =
         query.trim();
-
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION-SCOPED SEARCH
-       * ------------------------------------------------------
-       */
 
       const searchQuery = {
         organizationId,
@@ -531,28 +726,39 @@ export const searchConversations =
             customerName: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             phoneNumber: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             propertyName: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
+
           {
             location: {
               $regex:
                 searchTerm,
-              $options: "i",
+
+              $options:
+                "i",
             },
           },
         ],
@@ -568,11 +774,18 @@ export const searchConversations =
           searchQuery
         )
           .sort({
-            lastUpdated: -1,
-            updatedAt: -1,
-            createdAt: -1,
+            lastUpdated:
+              -1,
+
+            updatedAt:
+              -1,
+
+            createdAt:
+              -1,
           })
-          .limit(50)
+          .limit(
+            50
+          )
           .lean();
 
       console.log(
@@ -581,15 +794,20 @@ export const searchConversations =
       );
 
       return res.status(200).json({
-        success: true,
+  success:
+    true,
 
-        data: conversations,
+  count:
+    conversations.length,
 
-        conversations,
+  data:
+    conversations,
 
-        total:
-          conversations.length,
-      });
+  conversations,
+
+  total:
+    conversations.length,
+});
     } catch (error) {
       console.error(
         "SEARCH CONVERSATIONS ERROR:",
@@ -597,9 +815,12 @@ export const searchConversations =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to search conversations.",
+
         error:
           error.message,
       });
@@ -611,30 +832,27 @@ export const searchConversations =
  * GET SINGLE CONVERSATION
  *
  * GET /api/conversations/:id
- *
  * ==========================================================
  */
 
 export const getConversationById =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       console.log(
         "📥 GET CONVERSATION:",
         id
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION
-       * ------------------------------------------------------
-       */
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -648,31 +866,20 @@ export const getConversationById =
         organizationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION-SCOPED LOOKUP
-       * ------------------------------------------------------
-       *
-       * DO NOT use:
-       *
-       * Conversation.findById(id)
-       *
-       * because that allows an authenticated user to retrieve
-       * another organization's conversation if they somehow
-       * obtain its ID.
-       *
-       * ------------------------------------------------------
-       */
-
       const conversation =
         await Conversation.findOne({
-          _id: id,
+          _id:
+            id,
+
           organizationId,
-        }).lean();
+        })
+          .lean();
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
@@ -683,28 +890,20 @@ export const getConversationById =
         conversation.leadId
       );
 
-      /**
-       * ------------------------------------------------------
-       * LOAD ASSOCIATED LEAD
-       * ------------------------------------------------------
-       *
-       * Support:
-       *
-       * conversation.leadId
-       * conversation.lead
-       *
-       * ------------------------------------------------------
-       */
-
-      let lead = null;
+      let lead =
+        null;
 
       if (
         conversation.leadId
       ) {
         lead =
-          await Lead.findById(
-            conversation.leadId
-          ).lean();
+          await Lead.findOne({
+            _id:
+              conversation.leadId,
+
+            organizationId,
+          })
+            .lean();
       }
 
       if (
@@ -712,9 +911,13 @@ export const getConversationById =
         conversation.lead
       ) {
         lead =
-          await Lead.findById(
-            conversation.lead
-          ).lean();
+          await Lead.findOne({
+            _id:
+              conversation.lead,
+
+            organizationId,
+          })
+            .lean();
       }
 
       console.log(
@@ -723,10 +926,12 @@ export const getConversationById =
       );
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         data: {
           conversation,
+
           lead,
         },
 
@@ -741,9 +946,12 @@ export const getConversationById =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to fetch conversation.",
+
         error:
           error.message,
       });
@@ -755,19 +963,22 @@ export const getConversationById =
  * MARK CONVERSATION READ
  *
  * PATCH /api/conversations/:id/read
- *
  * ==========================================================
  */
 
 export const markConversationRead =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -784,14 +995,20 @@ export const markConversationRead =
       const conversation =
         await Conversation.findOneAndUpdate(
           {
-            _id: id,
+            _id:
+              id,
+
             organizationId,
           },
+
           {
-            unreadCount: 0,
+            unreadCount:
+              0,
+
             lastReadAt:
               new Date(),
           },
+
           {
             returnDocument:
               "after",
@@ -800,14 +1017,17 @@ export const markConversationRead =
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         message:
           "Conversation marked as read.",
@@ -821,9 +1041,12 @@ export const markConversationRead =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to mark conversation as read.",
+
         error:
           error.message,
       });
@@ -835,19 +1058,22 @@ export const markConversationRead =
  * ARCHIVE CONVERSATION
  *
  * PATCH /api/conversations/:id/archive
- *
  * ==========================================================
  */
 
 export const archiveConversation =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -864,14 +1090,20 @@ export const archiveConversation =
       const conversation =
         await Conversation.findOneAndUpdate(
           {
-            _id: id,
+            _id:
+              id,
+
             organizationId,
           },
+
           {
-            archived: true,
+            archived:
+              true,
+
             archivedAt:
               new Date(),
           },
+
           {
             returnDocument:
               "after",
@@ -880,14 +1112,17 @@ export const archiveConversation =
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         message:
           "Conversation archived successfully.",
@@ -901,9 +1136,12 @@ export const archiveConversation =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to archive conversation.",
+
         error:
           error.message,
       });
@@ -915,19 +1153,22 @@ export const archiveConversation =
  * PIN CONVERSATION
  *
  * PATCH /api/conversations/:id/pin
- *
  * ==========================================================
  */
 
 export const pinConversation =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -943,13 +1184,17 @@ export const pinConversation =
 
       const conversation =
         await Conversation.findOne({
-          _id: id,
+          _id:
+            id,
+
           organizationId,
         });
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
@@ -966,7 +1211,8 @@ export const pinConversation =
       );
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         message:
           conversation.pinned
@@ -982,9 +1228,12 @@ export const pinConversation =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to update conversation pin.",
+
         error:
           error.message,
       });
@@ -996,34 +1245,35 @@ export const pinConversation =
  * GENERATE AI REPLY
  *
  * POST /api/conversations/:id/ai/reply
- *
  * ==========================================================
  */
 
 export const generateAIReply =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
-        id: conversationId,
-      } = req.params;
+        id:
+          conversationId,
+      } =
+        req.params;
 
       const {
-        instruction = "",
-      } = req.body || {};
+        instruction =
+          "",
+      } =
+        req.body ||
+        {};
 
       console.log(
         "🤖 GENERATE AI REPLY - CONVERSATION:",
         conversationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION
-       * ------------------------------------------------------
-       */
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1037,43 +1287,42 @@ export const generateAIReply =
         organizationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * LOAD CONVERSATION
-       * ------------------------------------------------------
-       */
-
       const conversation =
         await Conversation.findOne({
-          _id: conversationId,
+          _id:
+            conversationId,
+
           organizationId,
         });
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
-      /**
-       * ------------------------------------------------------
-       * LOAD RECENT MESSAGES
-       * ------------------------------------------------------
-       */
-
       const recentMessages =
         await Message.find({
           conversationId,
+
+          organizationId,
+
           deleted: {
-            $ne: true,
+            $ne:
+              true,
           },
         })
           .sort({
-            createdAt: -1,
+            createdAt:
+              -1,
           })
-          .limit(20)
+          .limit(
+            20
+          )
           .lean();
 
       const messages =
@@ -1084,21 +1333,20 @@ export const generateAIReply =
         messages.length
       );
 
-      /**
-       * ------------------------------------------------------
-       * LOAD LEAD
-       * ------------------------------------------------------
-       */
-
-      let lead = null;
+      let lead =
+        null;
 
       if (
         conversation.leadId
       ) {
         lead =
-          await Lead.findById(
-            conversation.leadId
-          ).lean();
+          await Lead.findOne({
+            _id:
+              conversation.leadId,
+
+            organizationId,
+          })
+            .lean();
       }
 
       if (
@@ -1106,21 +1354,19 @@ export const generateAIReply =
         conversation.lead
       ) {
         lead =
-          await Lead.findById(
-            conversation.lead
-          ).lean();
+          await Lead.findOne({
+            _id:
+              conversation.lead,
+
+            organizationId,
+          })
+            .lean();
       }
 
       console.log(
         "👤 GENERATE AI REPLY - LEAD:",
         lead
       );
-
-      /**
-       * ------------------------------------------------------
-       * RESOLVE STATE
-       * ------------------------------------------------------
-       */
 
       const effectiveState =
         conversation?.effectiveState ||
@@ -1137,12 +1383,6 @@ export const generateAIReply =
         effectiveState
       );
 
-      /**
-       * ------------------------------------------------------
-       * AI RESULT
-       * ------------------------------------------------------
-       */
-
       const aiResult =
         conversation?.aiResult ||
         conversation?.lastAIResult ||
@@ -1154,15 +1394,11 @@ export const generateAIReply =
         aiResult
       );
 
-      /**
-       * ------------------------------------------------------
-       * BUILD CONVERSATION CONTEXT
-       * ------------------------------------------------------
-       */
-
       const conversationContext = {
         messages,
+
         conversation,
+
         lead,
       };
 
@@ -1171,17 +1407,14 @@ export const generateAIReply =
         conversationContext
       );
 
-      /**
-       * ------------------------------------------------------
-       * GENERATE RESPONSE
-       * ------------------------------------------------------
-       */
-
       let generatedReply =
         generateAIResponse(
           lead || {},
+
           aiResult,
+
           conversationContext,
+
           effectiveState
         );
 
@@ -1189,12 +1422,6 @@ export const generateAIReply =
         "🤖 GENERATE AI REPLY - GENERATED RESPONSE:",
         generatedReply
       );
-
-      /**
-       * ------------------------------------------------------
-       * OPTIONAL INSTRUCTION
-       * ------------------------------------------------------
-       */
 
       if (
         instruction &&
@@ -1209,36 +1436,39 @@ export const generateAIReply =
         );
       }
 
-      /**
-       * ------------------------------------------------------
-       * CREATE AI MESSAGE
-       * ------------------------------------------------------
-       */
-
       const aiMessage =
         await Message.create({
+          organizationId,
+
           conversationId,
 
           senderId:
-            req.user?.id || null,
+            req.user?.id ||
+            null,
 
-          senderRole: "ai",
+          senderRole:
+            "ai",
 
           text:
             generatedReply,
 
-          attachments: [],
+          attachments:
+            [],
 
-          voiceNote: null,
+          voiceNote:
+            null,
 
-          status: "sent",
+          status:
+            "sent",
 
-          delivered: true,
+          delivered:
+            true,
 
           deliveredAt:
             new Date(),
 
-          read: false,
+          read:
+            false,
         });
 
       console.log(
@@ -1246,20 +1476,16 @@ export const generateAIReply =
         aiMessage._id
       );
 
-      /**
-       * ------------------------------------------------------
-       * UPDATE CONVERSATION
-       * ------------------------------------------------------
-       */
-
       conversation.lastMessage = {
         text:
           generatedReply,
 
         senderId:
-          req.user?.id || null,
+          req.user?.id ||
+          null,
 
-        senderRole: "ai",
+        senderRole:
+          "ai",
 
         createdAt:
           aiMessage.createdAt,
@@ -1272,7 +1498,10 @@ export const generateAIReply =
         new Date();
 
       conversation.unreadCount =
-        (conversation.unreadCount || 0) +
+        (
+          conversation.unreadCount ||
+          0
+        ) +
         1;
 
       await conversation.save();
@@ -1280,12 +1509,6 @@ export const generateAIReply =
       console.log(
         "✅ GENERATE AI REPLY - CONVERSATION UPDATED"
       );
-
-      /**
-       * ------------------------------------------------------
-       * SOCKET EVENT
-       * ------------------------------------------------------
-       */
 
       req.io
         ?.to(
@@ -1300,14 +1523,9 @@ export const generateAIReply =
         "📡 GENERATE AI REPLY - SOCKET EVENT EMITTED"
       );
 
-      /**
-       * ------------------------------------------------------
-       * RESPONSE
-       * ------------------------------------------------------
-       */
-
       return res.status(201).json({
-        success: true,
+        success:
+          true,
 
         message:
           "AI reply generated successfully.",
@@ -1331,9 +1549,12 @@ export const generateAIReply =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to generate AI reply.",
+
         error:
           error.message,
       });
@@ -1345,23 +1566,30 @@ export const generateAIReply =
  * GENERATE REPLY SUGGESTIONS
  *
  * POST /api/conversations/:id/ai/suggestions
- *
  * ==========================================================
  */
 
 export const generateReplySuggestions =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
-        id: conversationId,
-      } = req.params;
+        id:
+          conversationId,
+      } =
+        req.params;
 
       const {
-        tone = "professional",
-      } = req.body || {};
+        tone =
+          "professional",
+      } =
+        req.body ||
+        {};
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1375,56 +1603,51 @@ export const generateReplySuggestions =
         conversationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION-SCOPED CONVERSATION
-       * ------------------------------------------------------
-       */
-
       const conversation =
         await Conversation.findOne({
-          _id: conversationId,
+          _id:
+            conversationId,
+
           organizationId,
         });
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
-      /**
-       * ------------------------------------------------------
-       * LOAD MESSAGES
-       * ------------------------------------------------------
-       */
-
       const recentMessages =
         await Message.find({
           conversationId,
+
+          organizationId,
+
           deleted: {
-            $ne: true,
+            $ne:
+              true,
           },
         })
           .sort({
-            createdAt: -1,
+            createdAt:
+              -1,
           })
-          .limit(20)
+          .limit(
+            20
+          )
           .lean();
 
       const messages =
         recentMessages.reverse();
 
-      /**
-       * ------------------------------------------------------
-       * FIND LATEST CUSTOMER MESSAGE
-       * ------------------------------------------------------
-       */
-
       const latestCustomerMessage =
-        [...messages]
+        [
+          ...messages,
+        ]
           .reverse()
           .find(
             (message) =>
@@ -1442,7 +1665,9 @@ export const generateReplySuggestions =
 
       if (!latestText) {
         return res.status(400).json({
-          success: false,
+          success:
+            false,
+
           message:
             "There is no customer message to generate suggestions for.",
         });
@@ -1451,13 +1676,8 @@ export const generateReplySuggestions =
       const lowerText =
         latestText.toLowerCase();
 
-      let suggestions = [];
-
-      /**
-       * ------------------------------------------------------
-       * PRICING
-       * ------------------------------------------------------
-       */
+      let suggestions =
+        [];
 
       if (
         lowerText.includes(
@@ -1479,12 +1699,6 @@ export const generateReplySuggestions =
         ];
       }
 
-      /**
-       * ------------------------------------------------------
-       * VIEWING
-       * ------------------------------------------------------
-       */
-
       else if (
         lowerText.includes(
           "viewing"
@@ -1505,12 +1719,6 @@ export const generateReplySuggestions =
         ];
       }
 
-      /**
-       * ------------------------------------------------------
-       * AVAILABILITY
-       * ------------------------------------------------------
-       */
-
       else if (
         lowerText.includes(
           "available"
@@ -1527,12 +1735,6 @@ export const generateReplySuggestions =
           "Please share the property listing and I'll help you check availability.",
         ];
       }
-
-      /**
-       * ------------------------------------------------------
-       * LOCATION
-       * ------------------------------------------------------
-       */
 
       else if (
         lowerText.includes(
@@ -1551,12 +1753,6 @@ export const generateReplySuggestions =
         ];
       }
 
-      /**
-       * ------------------------------------------------------
-       * BEDROOMS
-       * ------------------------------------------------------
-       */
-
       else if (
         lowerText.includes(
           "bedroom"
@@ -1574,12 +1770,6 @@ export const generateReplySuggestions =
         ];
       }
 
-      /**
-       * ------------------------------------------------------
-       * GENERAL
-       * ------------------------------------------------------
-       */
-
       else {
         suggestions = [
           "Thanks for reaching out. Could you tell me a little more about what you're looking for?",
@@ -1591,7 +1781,8 @@ export const generateReplySuggestions =
       }
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         data: {
           conversationId,
@@ -1627,9 +1818,12 @@ export const generateReplySuggestions =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
+
         message:
           "Failed to generate reply suggestions.",
+
         error:
           error.message,
       });
@@ -1641,19 +1835,22 @@ export const generateReplySuggestions =
  * GET CONVERSATION SUMMARY
  *
  * GET /api/conversations/:id/summary
- *
  * ==========================================================
  */
 
 export const getConversationSummary =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1667,42 +1864,40 @@ export const getConversationSummary =
         id
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION-SCOPED CONVERSATION
-       * ------------------------------------------------------
-       */
-
       const conversation =
         await Conversation.findOne({
-          _id: id,
+          _id:
+            id,
+
           organizationId,
-        }).lean();
+        })
+          .lean();
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
-      /**
-       * ------------------------------------------------------
-       * LOAD MESSAGES
-       * ------------------------------------------------------
-       */
-
       const messages =
         await Message.find({
-          conversationId: id,
+          conversationId:
+            id,
+
+          organizationId,
 
           deleted: {
-            $ne: true,
+            $ne:
+              true,
           },
         })
           .sort({
-            createdAt: 1,
+            createdAt:
+              1,
           })
           .lean();
 
@@ -1773,7 +1968,8 @@ export const getConversationSummary =
             (
               latestMessage.voiceNote
                 ? "🎤 Voice Note"
-                : latestMessage.attachments
+                : latestMessage
+                    .attachments
                     ?.length
                 ? "📎 Attachment"
                 : ""
@@ -1784,10 +1980,12 @@ export const getConversationSummary =
         "empty";
 
       if (
-        totalMessages > 0
+        totalMessages >
+        0
       ) {
         conversationStatus =
-          unreadMessages > 0
+          unreadMessages >
+          0
             ? "needs_attention"
             : "active";
       }
@@ -1839,7 +2037,8 @@ export const getConversationSummary =
       };
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
         data: {
           conversation,
@@ -1854,7 +2053,8 @@ export const getConversationSummary =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
 
         message:
           "Failed to generate conversation summary.",
@@ -1870,19 +2070,22 @@ export const getConversationSummary =
  * GET CONVERSATION INSIGHTS
  *
  * GET /api/conversations/:id/insights
- *
  * ==========================================================
  */
 
 export const getConversationInsights =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1896,42 +2099,40 @@ export const getConversationInsights =
         id
       );
 
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION-SCOPED CONVERSATION
-       * ------------------------------------------------------
-       */
-
       const conversation =
         await Conversation.findOne({
-          _id: id,
+          _id:
+            id,
+
           organizationId,
-        }).lean();
+        })
+          .lean();
 
       if (!conversation) {
         return res.status(404).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Conversation not found.",
         });
       }
 
-      /**
-       * ------------------------------------------------------
-       * LOAD MESSAGES
-       * ------------------------------------------------------
-       */
-
       const messages =
         await Message.find({
-          conversationId: id,
+          conversationId:
+            id,
+
+          organizationId,
 
           deleted: {
-            $ne: true,
+            $ne:
+              true,
           },
         })
           .sort({
-            createdAt: 1,
+            createdAt:
+              1,
           })
           .lean();
 
@@ -1946,7 +2147,8 @@ export const getConversationInsights =
 
       const latestCustomerMessage =
         customerMessages[
-          customerMessages.length - 1
+          customerMessages.length -
+            1
         ];
 
       const text =
@@ -1955,6 +2157,18 @@ export const getConversationInsights =
 
       const lowerText =
         text.toLowerCase();
+
+      /**
+       * This is a conversational insight category.
+       *
+       * It is NOT persisted as Lead.intent.
+       *
+       * Canonical Lead.intent remains:
+       *
+       *   property_search
+       *   rent
+       *   buy
+       */
 
       let intent =
         "general_inquiry";
@@ -2014,21 +2228,23 @@ export const getConversationInsights =
           "property_requirements";
       }
 
-      /**
-       * ------------------------------------------------------
-       * LOAD LEAD
-       * ------------------------------------------------------
-       */
-
       const lead =
         conversation.leadId
-          ? await Lead.findById(
-              conversation.leadId
-            ).lean()
+          ? await Lead.findOne({
+              _id:
+                conversation.leadId,
+
+              organizationId,
+            })
+              .lean()
           : conversation.lead
-          ? await Lead.findById(
-              conversation.lead
-            ).lean()
+          ? await Lead.findOne({
+              _id:
+                conversation.lead,
+
+              organizationId,
+            })
+              .lean()
           : null;
 
       const insights = {
@@ -2089,9 +2305,11 @@ export const getConversationInsights =
       };
 
       return res.status(200).json({
-        success: true,
+        success:
+          true,
 
-        data: insights,
+        data:
+          insights,
       });
     } catch (error) {
       console.error(
@@ -2100,7 +2318,8 @@ export const getConversationInsights =
       );
 
       return res.status(500).json({
-        success: false,
+        success:
+          false,
 
         message:
           "Failed to generate conversation insights.",
@@ -2116,16 +2335,42 @@ export const getConversationInsights =
  * REQUEST VIEWING
  *
  * POST /api/conversations/:id/request-viewing
+ * ==========================================================
+ *
+ * ATOMIC TRANSACTION BOUNDARY
+ * ----------------------------------------------------------
+ *
+ * The viewing request is one MongoDB transaction:
+ *
+ *   Viewing mutation
+ *        +
+ *   Lead lifecycle mutation
+ *        +
+ *   Property mutation
+ *        +
+ *   Conversation mutation
+ *        +
+ *   Outbox business events
+ *
+ * Either all commit or all roll back.
+ *
+ * The viewing service receives the same session so it never
+ * opens a separate transaction for its own database writes.
  *
  * ==========================================================
  */
 
 export const requestViewing =
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     try {
       const {
-        id: conversationId,
-      } = req.params;
+        id:
+          conversationId,
+      } =
+        req.params;
 
       const {
         propertyId,
@@ -2133,16 +2378,11 @@ export const requestViewing =
         startTime,
         endTime,
         customerNotes,
-      } = req.body;
-
-      /**
-       * ------------------------------------------------------
-       * ORGANIZATION
-       * ------------------------------------------------------
-       */
+      } =
+        req.body || {};
 
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -2150,6 +2390,21 @@ export const requestViewing =
       if (!organizationId) {
         return;
       }
+
+      /* ----------------------------------------------------
+   AUTHENTICATED ACTOR
+---------------------------------------------------- */
+
+const actorId =
+  req.user?._id ||
+  req.user?.id;
+
+if (!actorId) {
+  return res.status(401).json({
+    success: false,
+    message: "Authenticated user is required.",
+  });
+}
 
       console.log(
         "👁️ REQUEST VIEWING - CONVERSATION:",
@@ -2161,215 +2416,516 @@ export const requestViewing =
         organizationId
       );
 
-      /**
-       * ------------------------------------------------------
-       * LOAD ORGANIZATION-SCOPED CONVERSATION
-       * ------------------------------------------------------
-       */
+      /* ----------------------------------------------------
+         BASIC INPUT VALIDATION
+      ---------------------------------------------------- */
 
-      const conversation =
-        await Conversation.findOne({
-          _id: conversationId,
-          organizationId,
-        });
+      if (!conversationId) {
+        return res.status(400).json({
+          success:
+            false,
 
-      if (!conversation) {
-        return res.status(404).json({
-          success: false,
           message:
-            "Conversation not found.",
+            "Conversation ID is required.",
         });
       }
 
-      /**
-       * ------------------------------------------------------
-       * VALIDATE PROPERTY
-       * ------------------------------------------------------
-       */
-
       if (!propertyId) {
         return res.status(400).json({
-          success: false,
+          success:
+            false,
+
           message:
             "Property ID is required.",
         });
       }
 
-      const property =
-        await Property.findById(
-          propertyId
+      if (
+        !viewingDate ||
+        !startTime ||
+        !endTime
+      ) {
+        return res.status(400).json({
+          success:
+            false,
+
+          message:
+            "Viewing date, start time and end time are required.",
+        });
+      }
+
+      /* ----------------------------------------------------
+   IDEMPOTENT ATOMIC WORKFLOW
+---------------------------------------------------- */
+
+const idempotentResult =
+  await executeIdempotentRequest({
+    req,
+
+    organizationId,
+
+    actorId,
+
+    execute: async ({
+  session,
+  operationId,
+}) => {
+      /*
+       * Keep the existing viewing transaction body here.
+       * It must use this supplied session for every
+       * business mutation and outbox write.
+       */
+            /* ----------------------------------------------
+               LOAD CONVERSATION
+            ---------------------------------------------- */
+
+            const conversation =
+              await Conversation.findOne({
+                _id:
+                  conversationId,
+
+                organizationId,
+              })
+                .session(
+                  session
+                );
+
+            if (!conversation) {
+              const error =
+                new Error(
+                  "Conversation not found."
+                );
+
+              error.statusCode =
+                404;
+
+              throw error;
+            }
+
+            /* ----------------------------------------------
+               LOAD LEAD
+            ---------------------------------------------- */
+
+            let lead =
+              null;
+
+            if (
+              conversation.leadId
+            ) {
+              lead =
+                await Lead.findOne({
+                  _id:
+                    conversation.leadId,
+
+                  organizationId,
+                })
+                  .session(
+                    session
+                  );
+            }
+
+            if (
+              !lead &&
+              conversation.lead
+            ) {
+              lead =
+                await Lead.findOne({
+                  _id:
+                    conversation.lead,
+
+                  organizationId,
+                })
+                  .session(
+                    session
+                  );
+            }
+
+            if (!lead) {
+              const error =
+                new Error(
+                  "No lead is associated with this conversation."
+                );
+
+              error.statusCode =
+                400;
+
+              throw error;
+            }
+
+            /* ----------------------------------------------
+               LOAD PROPERTY
+            ---------------------------------------------- */
+
+            const property =
+              await Property.findOne({
+                _id:
+                  propertyId,
+
+                organizationId,
+              })
+                .session(
+                  session
+                );
+
+            if (!property) {
+              const error =
+                new Error(
+                  "Property not found."
+                );
+
+              error.statusCode =
+                404;
+
+              throw error;
+            }
+
+            /* ----------------------------------------------
+               DETERMINE AGENT
+            ---------------------------------------------- */
+
+            const agentId =
+              property.assignedAgent ||
+              lead.assignedTo ||
+              null;
+
+            if (!agentId) {
+              const error =
+                new Error(
+                  "No agent is assigned to handle this viewing."
+                );
+
+              error.statusCode =
+                400;
+
+              throw error;
+            }
+
+            /* ----------------------------------------------
+               PRESERVE PREVIOUS LEAD STATUS
+            ---------------------------------------------- */
+
+            const previousStatus =
+              lead.status;
+
+            /* ----------------------------------------------
+               VIEWING SERVICE
+            *
+            * IMPORTANT:
+            * Same MongoDB session is passed into the
+            * canonical viewing service.
+            * ---------------------------------------------- */
+
+            const viewing =
+              await requestViewingService({
+                organizationId,
+
+                requestedBy:
+                  req.user?._id ||
+                  req.user?.id ||
+                  null,
+
+                leadId:
+                  lead._id,
+
+                conversationId: conversation._id,
+
+                propertyId:
+                  property._id,
+
+                agentId,
+
+                viewingDate,
+
+                startTime,
+
+                endTime,
+
+                customerNotes,
+
+                session,
+              });
+
+            /* ----------------------------------------------
+               FINAL LEAD STATE
+            ---------------------------------------------- */
+
+            const updatedLead =
+              await Lead.findOne({
+                _id:
+                  lead._id,
+
+                organizationId,
+              })
+                .session(
+                  session
+                );
+
+            if (!updatedLead) {
+              throw new Error(
+                "Lead disappeared during viewing transaction."
+              );
+            }
+
+            /* ----------------------------------------------
+               FINAL PROPERTY STATE
+            ---------------------------------------------- */
+
+            const updatedProperty =
+              await Property.findOne({
+                _id:
+                  property._id,
+
+                organizationId,
+              })
+                .session(
+                  session
+                );
+
+            if (!updatedProperty) {
+              throw new Error(
+                "Property disappeared during viewing transaction."
+              );
+            }
+
+            /* ----------------------------------------------
+   UPDATE CONVERSATION VIEWING STATE
+---------------------------------------------- */
+
+const now = new Date();
+
+conversation.currentViewing = viewing._id;
+conversation.viewingStatus = "requested";
+conversation.nextViewingDate = viewing.viewingDate;
+conversation.lastViewingRequested = now;
+conversation.viewingRequestCount =
+  Number(conversation.viewingRequestCount || 0) + 1;
+
+conversation.updatedAt = now;
+conversation.lastUpdated = now;
+
+await conversation.save({ session });
+
+            /* ----------------------------------------------
+               OUTBOX: VIEWING REQUESTED
+            ---------------------------------------------- */
+
+            await addViewingRequestedEvent({
+              session,
+
+              organizationId,
+
+              viewing,
+
+              lead:
+                updatedLead,
+
+              property:
+                updatedProperty,
+
+              previousStatus,
+
+              operationId,
+            });
+
+            console.log(
+              "📦 OUTBOX QUEUED: LEAD_VIEWING_REQUESTED"
+            );
+
+            /* ----------------------------------------------
+               OUTBOX: LEAD STATUS CHANGED
+            ---------------------------------------------- */
+
+            if (
+              previousStatus &&
+              updatedLead.status &&
+              previousStatus !==
+                updatedLead.status
+            ) {
+              await addLeadStatusChangedEvent({
+                session,
+
+                lead:
+                  updatedLead,
+
+                organizationId,
+
+                previousStatus,
+
+                status:
+                  updatedLead.status,
+
+                operationId,
+              });
+
+              console.log(
+                "📦 OUTBOX QUEUED: LEAD_STATUS_CHANGED",
+                {
+                  leadId:
+                    String(
+                      updatedLead._id
+                    ),
+
+                  previousStatus,
+
+                  status:
+                    updatedLead.status,
+                }
+              );
+            }
+
+            const transactionResult = {
+  conversation,
+
+  viewing,
+
+  lead: updatedLead,
+
+  property: updatedProperty,
+
+  previousStatus,
+
+  operationId,
+};
+
+      /*
+       * Persist the successful HTTP response in the same
+       * transaction as the viewing mutation and outbox events.
+       */
+      return {
+        status: 201,
+
+        body: {
+          success: true,
+
+          message:
+            "Viewing requested successfully.",
+
+          data: {
+            viewing:
+              transactionResult.viewing,
+
+            lead:
+              transactionResult.lead,
+
+            property:
+              transactionResult.property,
+
+            conversation:
+              transactionResult.conversation,
+          },
+        },
+
+        /*
+         * Used only after a newly committed operation.
+         * This data is not included in the HTTP response.
+         */
+        postCommitData: {
+          previousStatus:
+            transactionResult.previousStatus,
+        },
+      };
+    },
+
+    postCommit: async (result) => {
+      const data =
+        result.body.data;
+
+      const previousStatus =
+        result.postCommitData?.previousStatus;
+
+      /* ----------------------------------------------
+         POST-COMMIT NON-CRITICAL READ-MODEL EVENTS
+      ---------------------------------------------- */
+
+      emitViewingReadModelEvents({
+        organizationId,
+
+        viewing:
+          data.viewing,
+
+        lead:
+          data.lead,
+
+        previousStatus,
+
+        property:
+          data.property,
+      });
+
+      /* ----------------------------------------------
+         OPTIONAL SOCKET TRANSPORT
+      ---------------------------------------------- */
+
+      req.io
+        ?.to(
+          String(
+            conversationId
+          )
+        )
+        .emit(
+          "viewing_requested",
+          {
+            viewing:
+              data.viewing,
+
+            lead:
+              data.lead,
+
+            property:
+              data.property,
+          }
         );
 
-      if (!property) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Property not found.",
-        });
-      }
-
-      /**
-       * ------------------------------------------------------
-       * LOAD LEAD
-       * ------------------------------------------------------
-       */
-
-      let lead = null;
-
-      if (
-        conversation.leadId
-      ) {
-        lead =
-          await Lead.findById(
-            conversation.leadId
-          );
-      }
-
-      if (
-        !lead &&
-        conversation.lead
-      ) {
-        lead =
-          await Lead.findById(
-            conversation.lead
-          );
-      }
-
-      if (!lead) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "No lead is associated with this conversation.",
-        });
-      }
-
       console.log(
-        "👤 REQUEST VIEWING - LEAD:",
-        lead._id
+        "REQUEST VIEWING - ATOMIC TRANSACTION COMMITTED:",
+        {
+          operationId:
+            result.operationId,
+
+          viewingId:
+            data.viewing?._id || null,
+
+          leadId:
+            data.lead?._id || null,
+        }
       );
+    },
+  });
 
-      console.log(
-        "🏠 REQUEST VIEWING - PROPERTY:",
-        property._id
-      );
-
-      /**
-       * ------------------------------------------------------
-       * CREATE VIEWING
-       * ------------------------------------------------------
-       */
-
-      const viewing =
-        await Viewing.create({
-          lead:
-            lead._id,
-
-          property:
-            property._id,
-
-          agent:
-            property.assignedAgent,
-
-          requestedBy:
-            req.user?.id ||
-            null,
-
-          viewingDate,
-
-          startTime,
-
-          endTime,
-
-          customerNotes,
-
-          location: {
-            address:
-              property.location,
-
-            city:
-              property.city,
-
-            county:
-              property.county,
-          },
-
-          status:
-            "Requested",
-        });
-
-      /**
-       * ------------------------------------------------------
-       * UPDATE LEAD
-       * ------------------------------------------------------
-       */
-
-      lead.status =
-        "viewing";
-
-      await lead.save();
-
-      /**
-       * ------------------------------------------------------
-       * UPDATE PROPERTY
-       * ------------------------------------------------------
-       */
-
-      property.availability =
-        "viewing_booked";
-
-      await property.save();
-
-      /**
-       * ------------------------------------------------------
-       * UPDATE CONVERSATION
-       * ------------------------------------------------------
-       */
-
-      conversation.updatedAt =
-        new Date();
-
-      conversation.lastUpdated =
-        new Date();
-
-      await conversation.save();
-
-      console.log(
-        "✅ REQUEST VIEWING - VIEWING CREATED:",
-        viewing._id
-      );
-
-      console.log(
-        "✅ REQUEST VIEWING - CONVERSATION UPDATED"
-      );
-
-      return res.status(201).json({
-        success: true,
-
-        message:
-          "Viewing requested successfully.",
-
-        data: {
-          viewing,
-
-          lead,
-
-          property,
-        },
-      });
+return res
+  .status(
+    idempotentResult.status
+  )
+  .json(
+    idempotentResult.body
+  );
     } catch (error) {
       console.error(
         "REQUEST VIEWING ERROR:",
         error
       );
 
-      return res.status(500).json({
-        success: false,
+      const statusCode =
+        Number(
+          error?.statusCode
+        ) ||
+        500;
+
+      return res.status(
+        statusCode
+      ).json({
+        success:
+          false,
 
         message:
+          error?.message ||
           "Failed to request viewing.",
 
         error:
-          error.message,
+          process.env.NODE_ENV ===
+          "development"
+            ? error?.message
+            : undefined,
       });
     }
   };

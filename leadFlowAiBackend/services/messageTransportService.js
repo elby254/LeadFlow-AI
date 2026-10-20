@@ -28,7 +28,7 @@
  * ┌───────────────────────────────────────────────┐
  * │                                               │
  * │ sms       → Africa's Talking SMS              │
- * │ whatsapp  → WhatsApp Cloud API               │
+ * │ whatsapp  → WhatsApp Cloud API                │
  * │ website   → Website realtime transport        │
  * │ facebook  → Facebook transport                │
  * │                                               │
@@ -41,16 +41,24 @@
  *
  * CUSTOMER REQUESTS MUST NOT CONTROL THE TRANSPORT.
  *
- * The customer should only provide:
- *
- * {
- *   phone,
- *   message
- * }
- *
  * Source must be established by the trusted channel adapter,
  * webhook, authenticated application request, or upstream
  * ingestion layer.
+ *
+ * ============================================================
+ *
+ * IDEMPOTENCY
+ * ------------------------------------------------------------
+ *
+ * The trusted caller may provide an idempotencyKey through
+ * context. This service preserves the context when routing
+ * to WhatsApp, website, and Facebook transports.
+ *
+ * IMPORTANT:
+ *
+ * Passing an idempotency key to a transport does not, by itself,
+ * guarantee duplicate prevention. The downstream provider
+ * adapter must support and enforce the required behavior.
  *
  * ============================================================
  */
@@ -365,11 +373,44 @@ const sendWhatsApp = async ({
   );
 
 
+  /*
+   * IMPORTANT:
+   *
+   * Preserve the complete trusted context.
+   *
+   * This includes:
+   *
+   * - organizationId
+   * - leadId
+   * - conversationId
+   * - messageId
+   * - deliveryJobId
+   * - idempotencyKey
+   * - channelMetadata
+   * - metadata
+   *
+   * The WhatsApp adapter can then use the idempotency identity
+   * when preparing its provider request, where supported.
+   *
+   * The organization ID and source are explicitly normalized
+   * before being passed downstream.
+   */
+
+  const whatsappContext = {
+    ...context,
+
+    organizationId,
+
+    source: "whatsapp",
+  };
+
+
   const result =
     await sendWhatsAppMessage(
       phone,
       message,
-      organization.whatsappPhoneNumberId
+      organization.whatsappPhoneNumberId,
+      whatsappContext
     );
 
 
@@ -417,6 +458,18 @@ const sendWebsiteMessage = async ({
   );
 
 
+  /*
+   * The website realtime transport is not implemented yet.
+   *
+   * IMPORTANT:
+   *
+   * Do not report delivery as successful until the actual
+   * website realtime transport has been configured.
+   *
+   * The full context is available here for the future
+   * realtime implementation, including idempotencyKey.
+   */
+
   return {
 
     success:
@@ -458,6 +511,14 @@ const sendFacebookMessage = async ({
     }
   );
 
+
+  /*
+   * Facebook transport is not implemented yet.
+   *
+   * The context remains available for a future implementation.
+   * Do not claim successful delivery until the actual provider
+   * integration is configured and verified.
+   */
 
   return {
 

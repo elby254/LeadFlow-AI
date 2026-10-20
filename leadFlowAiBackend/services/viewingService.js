@@ -1,10 +1,29 @@
 /**
  * ==========================================================
  *
- * Business logic for LeadFlow AI viewing workflow.
+ * BUSINESS LOGIC
+ * LEADFLOW AI VIEWING WORKFLOW
  *
- * Controllers call this service.
- * Database rules live here.
+ * Controllers own transactions and outbox events.
+ * This service owns viewing business rules and mutations.
+ *
+ * ==========================================================
+ *
+ * CANONICAL ARCHITECTURE
+ * ==========================================================
+ *
+ * Lead.status is controlled by:
+ *   services/leadLifeCycleService.js
+ *
+ * Viewing.status is controlled independently.
+ *
+ * All transaction-aware mutations accept an optional
+ * MongoDB session supplied by the calling controller.
+ *
+ * This service does NOT:
+ * - Start nested transactions.
+ * - Create outbox events.
+ * - Publish critical business events.
  *
  * ==========================================================
  */
@@ -14,70 +33,455 @@ import Lead from "../models/lead.js";
 import Property from "../models/property.js";
 import Notification from "../models/notification.js";
 
+import {
+  LEAD_STATUS,
+  canTransitionLeadStatus,
+  transitionLeadStatus,
+} from "./leadLifeCycleService.js";
+
 /* ==========================================================
-   LEAD STATUS SOURCE OF TRUTH
+   VIEWING STATUS CONSTANTS
 ========================================================== */
 
-/**
- * Existing Lead model status enum:
- *
- *   new
- *   contacted
- *   qualified
- *   viewing
- *   negotiation
- *   won
- *   lost
- *
- * IMPORTANT:
- * These are Lead.status values only.
- *
- * Viewing workflow states such as:
- *
- *   Requested
- *   Pending Approval
- *   Approved
- *   Rescheduled
- *   Rejected
- *   Cancelled
- *   Completed
- *
- * belong to Viewing.status and must NOT be written
- * into Lead.status.
- */
+export const VIEWING_STATUS = Object.freeze({
+  REQUESTED: "Requested",
+  PENDING_APPROVAL: "Pending Approval",
+  APPROVED: "Approved",
+  RESCHEDULED: "Rescheduled",
+  REJECTED: "Rejected",
+  CANCELLED: "Cancelled",
+  COMPLETED: "Completed",
+});
 
-const LEAD_STATUS = {
-  NEW: "new",
-  CONTACTED: "contacted",
-  QUALIFIED: "qualified",
-  VIEWING: "viewing",
-  NEGOTIATION: "negotiation",
-  WON: "won",
-  LOST: "lost",
+/* ==========================================================
+   ACTIVE VIEWING STATUSES
+========================================================== */
+
+const ACTIVE_VIEWING_STATUSES = Object.freeze([
+  VIEWING_STATUS.REQUESTED,
+  VIEWING_STATUS.PENDING_APPROVAL,
+  VIEWING_STATUS.APPROVED,
+  VIEWING_STATUS.RESCHEDULED,
+]);
+
+/* ==========================================================
+   HELPER: NORMALIZE USER ID
+========================================================== */
+
+const normalizeUserId = (userId) => {
+  if (!userId) {
+    return null;
+  }
+
+  return userId?._id || userId;
 };
 
 /* ==========================================================
-   HELPER
-   CREATE NOTIFICATION
+   HELPER: SAVE DOCUMENT WITH OPTIONAL SESSION
 ========================================================== */
 
+const saveWithSession = async (document, session = null) => {
+  if (!document) {
+    throw new Error(
+      "A document is required for persistence."
+    );
+  }
+
+  if (session) {
+    return document.save({ session });
+  }
+
+  return document.save();
+};
+
+/* ==========================================================
+   HELPER: CREATE NOTIFICATION
+========================================================== */
+
+/**
+ * Notification schema contract:
+ *
+ * - organizationId
+ * - user
+ * - title
+ * - message
+ * - type
+ * - viewing
+ * - lead
+ * - property
+ * - status
+ *
+ * Notifications created during a transaction must use
+ * that same transaction session.
+ */
 const createNotification = async ({
   organizationId,
   userId,
   title,
   message,
-  type = "viewing",
-  metadata = {},
+  type,
+  viewingId = null,
+  leadId = null,
+  propertyId = null,
+  session = null,
 }) => {
-  return Notification.create({
+  const normalizedUserId = normalizeUserId(userId);
+
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
+
+  // A missing recipient should not prevent the business
+  // operation from proceeding.
+  if (!normalizedUserId) {
+    return null;
+  }
+
+  if (!title || !message) {
+    throw new Error(
+      "Notification title and message are required."
+    );
+  }
+
+  if (!type) {
+    throw new Error(
+      "Notification type is required."
+    );
+  }
+
+  const notification = new Notification({
     organizationId,
-    userId,
+    user: normalizedUserId,
     title,
     message,
     type,
-    metadata,
-    isRead: false,
+    viewing: viewingId,
+    lead: leadId,
+    property: propertyId,
+    status: "unread",
   });
+
+  return saveWithSession(notification, session);
+};
+
+/* ==========================================================
+   HELPER: VALIDATE TIME
+========================================================== */
+
+/**
+ * Convert HH:mm into minutes after midnight.
+ */
+const timeToMinutes = (value) => {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const normalized = String(value).trim();
+  const match = /^(\d{1,2}):(\d{2})$/.exec(normalized);
+
+  if (!match) {
+    return null;
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+
+  if (
+    hours < 0 ||
+    hours > 23 ||
+    minutes < 0 ||
+    minutes > 59
+  ) {
+    return null;
+  }
+
+  return hours * 60 + minutes;
+};
+
+/* ==========================================================
+   HELPER: VALIDATE VIEWING TIME RANGE
+========================================================== */
+
+const validateViewingTimeRange = ({
+  startTime,
+  endTime,
+}) => {
+  const start = timeToMinutes(startTime);
+  const end = timeToMinutes(endTime);
+
+  if (start === null || end === null) {
+    throw new Error(
+      "Viewing startTime and endTime must use HH:mm format."
+    );
+  }
+
+  if (start >= end) {
+    throw new Error(
+      "Viewing endTime must be later than startTime."
+    );
+  }
+
+  return { start, end };
+};
+
+/* ==========================================================
+   HELPER: CHECK TIME OVERLAP
+========================================================== */
+
+const hasTimeOverlap = ({
+  existingStartTime,
+  existingEndTime,
+  requestedStartTime,
+  requestedEndTime,
+}) => {
+  const existingStart = timeToMinutes(
+    existingStartTime
+  );
+
+  const existingEnd = timeToMinutes(
+    existingEndTime
+  );
+
+  const requestedStart = timeToMinutes(
+    requestedStartTime
+  );
+
+  const requestedEnd = timeToMinutes(
+    requestedEndTime
+  );
+
+  if (
+    existingStart === null ||
+    existingEnd === null ||
+    requestedStart === null ||
+    requestedEnd === null
+  ) {
+    return false;
+  }
+
+  return (
+    existingStart < requestedEnd &&
+    requestedStart < existingEnd
+  );
+};
+
+/* ==========================================================
+   HELPER: TRANSITION LEAD STATUS
+========================================================== */
+
+/**
+ * All lead lifecycle transitions must pass through the
+ * canonical lifecycle service.
+ *
+ * Returns:
+ *   true  -> transition occurred
+ *   false -> lead already had the requested status
+ */
+const transitionLeadIfNeeded = async ({
+  lead,
+  nextStatus,
+  session = null,
+}) => {
+  if (!lead) {
+    throw new Error(
+      "Lead is required for lifecycle transition."
+    );
+  }
+
+  const currentStatus = lead.status;
+
+  if (currentStatus === nextStatus) {
+    return false;
+  }
+
+  if (
+    !canTransitionLeadStatus(
+      currentStatus,
+      nextStatus
+    )
+  ) {
+    throw new Error(
+      `Invalid lead lifecycle transition: ${currentStatus} -> ${nextStatus}`
+    );
+  }
+
+  transitionLeadStatus(lead, nextStatus);
+
+  await saveWithSession(lead, session);
+
+  return true;
+};
+
+/* ==========================================================
+   HELPER: LOAD TENANT-SCOPED LEAD
+========================================================== */
+
+const getLeadForOrganization = async ({
+  leadId,
+  organizationId,
+  session = null,
+}) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
+
+  let query = Lead.findOne({
+    _id: leadId,
+    organizationId,
+  });
+
+  if (session) {
+    query = query.session(session);
+  }
+
+  const lead = await query;
+
+  if (!lead) {
+    throw new Error("Lead not found.");
+  }
+
+  return lead;
+};
+
+/* ==========================================================
+   HELPER: LOAD TENANT-SCOPED VIEWING
+========================================================== */
+
+const getViewingForOrganization = async ({
+  viewingId,
+  organizationId,
+  populate = false,
+  session = null,
+}) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
+
+  let query = Viewing.findOne({
+    _id: viewingId,
+    organizationId,
+  });
+
+  if (populate) {
+    query = query
+      .populate("lead")
+      .populate("property")
+      .populate("agent");
+  }
+
+  if (session) {
+    query = query.session(session);
+  }
+
+  const viewing = await query;
+
+  if (!viewing) {
+    throw new Error("Viewing not found.");
+  }
+
+  return viewing;
+};
+
+/* ==========================================================
+   HELPER: CHECK ACTIVE PROPERTY VIEWINGS
+========================================================== */
+
+const hasActivePropertyViewing = async ({
+  organizationId,
+  propertyId,
+  excludeViewingId = null,
+  session = null,
+}) => {
+  const query = {
+    organizationId,
+    property: propertyId,
+    status: {
+      $in: ACTIVE_VIEWING_STATUSES,
+    },
+  };
+
+  if (excludeViewingId) {
+    query._id = {
+      $ne: excludeViewingId,
+    };
+  }
+
+  let existingQuery = Viewing.findOne(query)
+    .select("_id");
+
+  if (session) {
+    existingQuery = existingQuery.session(session);
+  }
+
+  const existing = await existingQuery;
+
+  return Boolean(existing);
+};
+
+/* ==========================================================
+   HELPER: RESTORE PROPERTY AVAILABILITY
+========================================================== */
+
+const restorePropertyAvailabilityIfFree = async ({
+  organizationId,
+  propertyId,
+  session = null,
+}) => {
+  let propertyQuery = Property.findOne({
+    _id: propertyId,
+    organizationId,
+  });
+
+  if (session) {
+    propertyQuery = propertyQuery.session(session);
+  }
+
+  const property = await propertyQuery;
+
+  if (!property) {
+    return null;
+  }
+
+  const activeViewing = await hasActivePropertyViewing({
+    organizationId,
+    propertyId,
+    session,
+  });
+
+  if (activeViewing) {
+    if (property.availability !== "viewing_booked") {
+      property.availability = "viewing_booked";
+
+      await saveWithSession(property, session);
+    }
+
+    return property;
+  }
+
+  // Preserve permanent inventory states.
+  const propertyStatus = String(
+    property.status || ""
+  ).toLowerCase();
+
+  if (propertyStatus === "reserved") {
+    property.availability = "reserved";
+  } else if (propertyStatus === "sold") {
+    property.availability = "sold";
+  } else if (propertyStatus === "inactive") {
+    property.availability = "inactive";
+  } else {
+    property.availability = "available";
+  }
+
+  await saveWithSession(property, session);
+
+  return property;
 };
 
 /* ==========================================================
@@ -85,35 +489,57 @@ const createNotification = async ({
 ========================================================== */
 
 export const checkPropertyConflict = async ({
+  organizationId,
   propertyId,
   viewingDate,
   startTime,
   endTime,
+  excludeViewingId = null,
+  session = null,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
-  const conflict =
-    await Viewing.findOne({
+  validateViewingTimeRange({
+    startTime,
+    endTime,
+  });
 
-      property: propertyId,
+  const query = {
+    organizationId,
+    property: propertyId,
+    viewingDate,
+    status: {
+      $in: ACTIVE_VIEWING_STATUSES,
+    },
+  };
 
-      viewingDate,
+  if (excludeViewingId) {
+    query._id = {
+      $ne: excludeViewingId,
+    };
+  }
 
-      status: {
-        $in: [
-          "Requested",
-          "Pending Approval",
-          "Approved",
-          "Rescheduled",
-        ],
-      },
+  let existingQuery = Viewing.find(query)
+    .select("startTime endTime");
 
-      startTime,
+  if (session) {
+    existingQuery = existingQuery.session(session);
+  }
 
-      endTime,
+  const existingViewings = await existingQuery;
 
-    });
-
-  return !!conflict;
+  return existingViewings.some((existing) =>
+    hasTimeOverlap({
+      existingStartTime: existing.startTime,
+      existingEndTime: existing.endTime,
+      requestedStartTime: startTime,
+      requestedEndTime: endTime,
+    })
+  );
 };
 
 /* ==========================================================
@@ -121,35 +547,57 @@ export const checkPropertyConflict = async ({
 ========================================================== */
 
 export const checkAgentConflict = async ({
+  organizationId,
   agentId,
   viewingDate,
   startTime,
   endTime,
+  excludeViewingId = null,
+  session = null,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
-  const conflict =
-    await Viewing.findOne({
+  validateViewingTimeRange({
+    startTime,
+    endTime,
+  });
 
-      agent: agentId,
+  const query = {
+    organizationId,
+    agent: agentId,
+    viewingDate,
+    status: {
+      $in: ACTIVE_VIEWING_STATUSES,
+    },
+  };
 
-      viewingDate,
+  if (excludeViewingId) {
+    query._id = {
+      $ne: excludeViewingId,
+    };
+  }
 
-      status: {
-        $in: [
-          "Requested",
-          "Pending Approval",
-          "Approved",
-          "Rescheduled",
-        ],
-      },
+  let existingQuery = Viewing.find(query)
+    .select("startTime endTime");
 
-      startTime,
+  if (session) {
+    existingQuery = existingQuery.session(session);
+  }
 
-      endTime,
+  const existingViewings = await existingQuery;
 
-    });
-
-  return !!conflict;
+  return existingViewings.some((existing) =>
+    hasTimeOverlap({
+      existingStartTime: existing.startTime,
+      existingEndTime: existing.endTime,
+      requestedStartTime: startTime,
+      requestedEndTime: endTime,
+    })
+  );
 };
 
 /* ==========================================================
@@ -162,22 +610,48 @@ export const requestViewing = async ({
   leadId,
   propertyId,
   agentId,
+  conversationId = null,
   viewingDate,
   startTime,
   endTime,
   customerNotes,
+  session = null,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
+
+  validateViewingTimeRange({
+    startTime,
+    endTime,
+  });
 
   /* ------------------------------------
      Validate Lead
   ------------------------------------ */
 
-  const lead =
-    await Lead.findById(leadId);
+  const lead = await getLeadForOrganization({
+    leadId,
+    organizationId,
+    session,
+  });
 
-  if (!lead) {
+  /*
+   * A viewing request moves the lead into the canonical
+   * viewing stage. Terminal or otherwise incompatible
+   * lifecycle states must not be moved backward.
+   */
+  if (
+    lead.status !== LEAD_STATUS.VIEWING &&
+    !canTransitionLeadStatus(
+      lead.status,
+      LEAD_STATUS.VIEWING
+    )
+  ) {
     throw new Error(
-      "Lead not found."
+      `Lead cannot request a viewing from the current lifecycle stage: ${lead.status}`
     );
   }
 
@@ -185,69 +659,65 @@ export const requestViewing = async ({
      Validate Property
   ------------------------------------ */
 
-  const property =
-    await Property.findById(
-      propertyId
-    );
+  let propertyQuery = Property.findOne({
+    _id: propertyId,
+    organizationId,
+  });
+
+  if (session) {
+    propertyQuery = propertyQuery.session(session);
+  }
+
+  const property = await propertyQuery;
 
   if (!property) {
-    throw new Error(
-      "Property not found."
-    );
+    throw new Error("Property not found.");
   }
-
-  /* ------------------------------------
-     Property Availability
-  ------------------------------------ */
 
   if (
-    property.availability !==
-    "available"
-  ) {
-    throw new Error(
-      "Property is currently unavailable for viewing."
-    );
-  }
+  String(property.status || "").trim().toLowerCase() !== "available" ||
+  property.isArchived === true
+) {
+  throw new Error(
+    "Property is currently unavailable for viewing."
+  );
+}
 
   /* ------------------------------------
-     Conflict Detection
+     Property Conflict
   ------------------------------------ */
 
-  const propertyConflict =
-    await checkPropertyConflict({
-
-      propertyId,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-    });
+  const propertyConflict = await checkPropertyConflict({
+    organizationId,
+    propertyId,
+    viewingDate,
+    startTime,
+    endTime,
+    session,
+  });
 
   if (propertyConflict) {
     throw new Error(
-      "Property already has a viewing scheduled for this time."
+      "Property already has a viewing scheduled during this period."
     );
   }
 
-  const agentConflict =
-    await checkAgentConflict({
+  /* ------------------------------------
+     Agent Conflict
+  ------------------------------------ */
 
-      agentId,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-    });
+  const agentConflict = await checkAgentConflict({
+    organizationId,
+    agentId,
+    viewingDate,
+    startTime,
+    endTime,
+    session,
+  });
 
   if (agentConflict) {
     throw new Error(
-      "Assigned agent already has another viewing."
+      "Assigned agent already has another viewing during this period."
     );
   }
 
@@ -255,109 +725,94 @@ export const requestViewing = async ({
      Create Viewing
   ------------------------------------ */
 
-  const viewing =
-    await Viewing.create({
+  const viewingData = {
+  organizationId,
+  requestedBy,
+  lead: lead._id,
+  property: property._id,
+  agent: agentId,
+  ...(conversationId ? { conversation: conversationId } : {}),
+    viewingDate,
+    startTime,
+    endTime,
+    customerNotes,
 
-      organizationId,
+    location: {
+      address: property.location,
+      city: property.city,
+      county: property.county,
+      latitude: property.coordinates?.latitude,
+      longitude: property.coordinates?.longitude,
+    },
 
-      requestedBy,
+    status: VIEWING_STATUS.REQUESTED,
+  };
 
-      lead: leadId,
-
-      property: propertyId,
-
-      agent: agentId,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-      customerNotes,
-
-      location: {
-
-        address:
-          property.location,
-
-        city:
-          property.city,
-
-        county:
-          property.county,
-
-        latitude:
-          property.coordinates
-            ?.latitude,
-
-        longitude:
-          property.coordinates
-            ?.longitude,
-
-      },
-
-      status:
-        "Requested",
-
-    });
+  const viewing = session
+    ? (await Viewing.create([viewingData], { session }))[0]
+    : await Viewing.create(viewingData);
 
   /* ------------------------------------
-     Update Lead
+     Update Lead Lifecycle
   ------------------------------------ */
 
-  /**
-   * Lead.status uses the existing Lead
-   * schema enum.
-   *
-   * A viewing request means the lead has
-   * entered the viewing stage.
-   *
-   * DO NOT use:
-   *
-   * "viewing_requested"
-   * "viewing_scheduled"
+  await transitionLeadIfNeeded({
+    lead,
+    nextStatus: LEAD_STATUS.VIEWING,
+    session,
+  });
+
+
+  /* ------------------------------------
+   SYNCHRONIZE LEAD VIEWING STATE
+------------------------------------ */
+
+lead.currentViewing = viewing._id;
+lead.viewingStatus = "requested";
+lead.viewingRequestCount =
+  Number(lead.viewingRequestCount || 0) + 1;
+lead.nextViewingDate = viewing.viewingDate;
+lead.viewingCompleted = false; 
+
+
+  /* ------------------------------------
+     Update Lead Contact Timestamp
+  ------------------------------------ */
+
+  lead.lastContact = new Date();
+
+  await saveWithSession(lead, session);
+
+  /* ------------------------------------
+     Update Property Statistics
+  ------------------------------------ */
+
+  if (property.viewingStats) {
+    property.viewingStats.totalRequests =
+      Number(property.viewingStats.totalRequests || 0) + 1;
+  }
+
+  /*
+   * A Requested viewing does not mark the property as
+   * viewing_booked. Approval is the point at which the
+   * property availability changes.
    */
-
-  lead.status =
-    LEAD_STATUS.VIEWING;
-
-  await lead.save();
-
-  /* ------------------------------------
-     Update Property
-  ------------------------------------ */
-
-  property.availability =
-    "viewing_booked";
-
-  property.viewingStats.totalRequests += 1;
-
-  await property.save();
+  await saveWithSession(property, session);
 
   /* ------------------------------------
      Notify Agent
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
     userId: agentId,
-
-    title:
-      "New Viewing Request",
-
-    message:
-      `${lead.name} requested a viewing for "${property.title}".`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-    },
-
+    title: "New Viewing Request",
+    message: `${lead.name} requested a viewing for "${property.title}".`,
+    type: "VIEWING_REQUESTED",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: property._id,
+    session,
   });
 
   return viewing;
@@ -371,101 +826,171 @@ export const approveViewing = async ({
   organizationId,
   viewingId,
   approvedBy,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property")
-      .populate("agent");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
     );
+  }
+
+  /* ------------------------------------
+     Load Viewing
+  ------------------------------------ */
+
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
+
+  /* ------------------------------------
+     Validate Current State
+  ------------------------------------ */
+
+  if (viewing.status === VIEWING_STATUS.APPROVED) {
+    throw new Error("Viewing already approved.");
   }
 
   if (
-    viewing.status ===
-    "Approved"
+    ![
+      VIEWING_STATUS.REQUESTED,
+      VIEWING_STATUS.PENDING_APPROVAL,
+      VIEWING_STATUS.RESCHEDULED,
+    ].includes(viewing.status)
   ) {
     throw new Error(
-      "Viewing already approved."
+      `Viewing cannot be approved from status "${viewing.status}".`
     );
   }
 
-  viewing.status =
-    "Approved";
-
-  viewing.approvedBy =
-    approvedBy;
-
-  viewing.approvedAt =
-    new Date();
-
-  await viewing.save();
+  if (!viewing.property || !viewing.lead || !viewing.agent) {
+    throw new Error(
+      "Viewing must have a valid lead, property, and agent."
+    );
+  }
 
   /* ------------------------------------
-     Update Lead
+     Re-check Property Conflict
   ------------------------------------ */
 
-  /**
-   * The Lead remains in the existing
-   * "viewing" lifecycle stage.
-   *
-   * Scheduling details are represented
-   * by Viewing.status / viewingDate /
-   * startTime rather than inventing a
-   * Lead.status value.
-   */
+  const propertyConflict = await checkPropertyConflict({
+    organizationId,
+    propertyId: viewing.property._id,
+    viewingDate: viewing.viewingDate,
+    startTime: viewing.startTime,
+    endTime: viewing.endTime,
+    excludeViewingId: viewing._id,
+    session,
+  });
 
-  await Lead.findByIdAndUpdate(
-    viewing.lead._id,
-    {
-      status:
-        LEAD_STATUS.VIEWING,
-
-      lastContact:
-        new Date(),
-    }
-  );
+  if (propertyConflict) {
+    throw new Error(
+      "Property already has another viewing during this period."
+    );
+  }
 
   /* ------------------------------------
-     Update Property
+     Re-check Agent Conflict
   ------------------------------------ */
 
-  await Property.findByIdAndUpdate(
-    viewing.property._id,
-    {
-      availability:
-        "viewing_booked",
+  const agentConflict = await checkAgentConflict({
+    organizationId,
+    agentId: viewing.agent._id,
+    viewingDate: viewing.viewingDate,
+    startTime: viewing.startTime,
+    endTime: viewing.endTime,
+    excludeViewingId: viewing._id,
+    session,
+  });
+
+  if (agentConflict) {
+    throw new Error(
+      "Assigned agent already has another viewing during this period."
+    );
+  }
+
+  /* ------------------------------------
+     Update Viewing
+  ------------------------------------ */
+
+  viewing.status = VIEWING_STATUS.APPROVED;
+  viewing.approvedBy = approvedBy;
+  viewing.approvedAt = new Date();
+
+  await saveWithSession(viewing, session);
+
+  /* ------------------------------------
+     Keep Lead in Viewing Stage
+  ------------------------------------ */
+
+  const lead = await getLeadForOrganization({
+    leadId: viewing.lead._id,
+    organizationId,
+    session,
+  });
+
+  if (lead.status !== LEAD_STATUS.VIEWING) {
+    if (
+      canTransitionLeadStatus(
+        lead.status,
+        LEAD_STATUS.VIEWING
+      )
+    ) {
+      await transitionLeadIfNeeded({
+        lead,
+        nextStatus: LEAD_STATUS.VIEWING,
+        session,
+      });
+    } else {
+      throw new Error(
+        `Lead cannot enter viewing stage from lifecycle status "${lead.status}".`
+      );
     }
-  );
+  }
+
+  lead.lastContact = new Date();
+
+  await saveWithSession(lead, session);
+
+  /* ------------------------------------
+     Update Property Availability
+  ------------------------------------ */
+
+  let propertyQuery = Property.findOne({
+    _id: viewing.property._id,
+    organizationId,
+  });
+
+  if (session) {
+    propertyQuery = propertyQuery.session(session);
+  }
+
+  const property = await propertyQuery;
+
+  if (!property) {
+    throw new Error("Property not found.");
+  }
+
+  property.availability = "viewing_booked";
+
+  await saveWithSession(property, session);
 
   /* ------------------------------------
      Notify Customer
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.requestedBy,
-
-    title:
-      "Viewing Approved",
-
-    message:
-      `Your viewing for "${viewing.property.title}" has been approved.`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-    },
-
+    userId: viewing.requestedBy,
+    title: "Viewing Approved",
+    message: `Your viewing for "${property.title}" has been approved.`,
+    type: "VIEWING_APPROVED",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: property._id,
+    session,
   });
 
   return viewing;
@@ -480,103 +1005,107 @@ export const rejectViewing = async ({
   viewingId,
   rejectedBy,
   rejectionReason,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
     );
   }
 
-  viewing.status =
-    "Rejected";
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
 
-  viewing.approvedBy =
-    rejectedBy;
+  /* ------------------------------------
+     Validate Current State
+  ------------------------------------ */
 
+  if (
+    ![
+      VIEWING_STATUS.REQUESTED,
+      VIEWING_STATUS.PENDING_APPROVAL,
+      VIEWING_STATUS.RESCHEDULED,
+    ].includes(viewing.status)
+  ) {
+    throw new Error(
+      `Viewing cannot be rejected from status "${viewing.status}".`
+    );
+  }
+
+  if (!viewing.property || !viewing.lead) {
+    throw new Error(
+      "Viewing must have a valid lead and property."
+    );
+  }
+
+  /* ------------------------------------
+     Update Viewing
+  ------------------------------------ */
+
+  viewing.status = VIEWING_STATUS.REJECTED;
   viewing.rejectionReason =
-    rejectionReason ||
-    "No reason provided.";
+    rejectionReason || "No reason provided.";
 
-  viewing.approvedAt =
-    new Date();
-
-  await viewing.save();
+  await saveWithSession(viewing, session);
 
   /* ------------------------------------
-     Lead returns to qualified stage
+     Update Lead Lifecycle and Follow-up
   ------------------------------------ */
 
-  /**
-   * "follow_up" is NOT a valid Lead.status.
+  const lead = await getLeadForOrganization({
+    leadId: viewing.lead._id,
+    organizationId,
+    session,
+  });
+
+  /*
+   * Only move viewing -> qualified when the lead is
+   * actually in the viewing stage.
    *
-   * Follow-up state is represented using:
-   *
-   *   followUpStatus
-   *   nextAction
-   *
-   * The Lead.status therefore remains
-   * "qualified".
+   * Never downgrade a lead that has advanced elsewhere.
    */
+  if (lead.status === LEAD_STATUS.VIEWING) {
+    await transitionLeadIfNeeded({
+      lead,
+      nextStatus: LEAD_STATUS.QUALIFIED,
+      session,
+    });
+  }
 
-  await Lead.findByIdAndUpdate(
-    viewing.lead._id,
-    {
-      status:
-        LEAD_STATUS.QUALIFIED,
+  lead.followUpStatus = "pending";
+  lead.lastContact = new Date();
+  lead.nextAction = "Follow up after rejected viewing";
 
-      followUpStatus:
-        "pending",
-
-      lastContact:
-        new Date(),
-    }
-  );
+  await saveWithSession(lead, session);
 
   /* ------------------------------------
-     Property becomes available again
+     Restore Property Availability
   ------------------------------------ */
 
-  await Property.findByIdAndUpdate(
-    viewing.property._id,
-    {
-      availability:
-        "available",
-    }
-  );
+  await restorePropertyAvailabilityIfFree({
+    organizationId,
+    propertyId: viewing.property._id,
+    session,
+  });
 
   /* ------------------------------------
      Notify Customer
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.requestedBy,
-
-    title:
-      "Viewing Rejected",
-
-    message:
-      `Your viewing request for "${viewing.property.title}" was rejected.`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-      reason:
-        rejectionReason,
-
-    },
-
+    userId: viewing.requestedBy,
+    title: "Viewing Rejected",
+    message: `Your viewing request for "${viewing.property.title}" was rejected.`,
+    type: "VIEWING_REJECTED",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: viewing.property._id,
+    session,
   });
 
   return viewing;
@@ -592,50 +1121,61 @@ export const rescheduleViewing = async ({
   viewingDate,
   startTime,
   endTime,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property")
-      .populate("agent");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
+    );
+  }
+
+  validateViewingTimeRange({
+    startTime,
+    endTime,
+  });
+
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
+
+  /* ------------------------------------
+     Validate Current State
+  ------------------------------------ */
+
+  if (
+    [
+      VIEWING_STATUS.REJECTED,
+      VIEWING_STATUS.CANCELLED,
+      VIEWING_STATUS.COMPLETED,
+    ].includes(viewing.status)
+  ) {
+    throw new Error(
+      `Viewing cannot be rescheduled from status "${viewing.status}".`
+    );
+  }
+
+  if (!viewing.property || !viewing.lead || !viewing.agent) {
+    throw new Error(
+      "Viewing must have a valid lead, property, and agent."
     );
   }
 
   /* ------------------------------------
-     Check Property Availability
+     Check Property Conflict
   ------------------------------------ */
 
-  const propertyConflict =
-    await Viewing.findOne({
-
-      _id: {
-        $ne: viewingId,
-      },
-
-      property:
-        viewing.property._id,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-      status: {
-        $in: [
-          "Requested",
-          "Pending Approval",
-          "Approved",
-          "Rescheduled",
-        ],
-      },
-
-    });
+  const propertyConflict = await checkPropertyConflict({
+    organizationId,
+    propertyId: viewing.property._id,
+    viewingDate,
+    startTime,
+    endTime,
+    excludeViewingId: viewing._id,
+    session,
+  });
 
   if (propertyConflict) {
     throw new Error(
@@ -644,127 +1184,124 @@ export const rescheduleViewing = async ({
   }
 
   /* ------------------------------------
-     Check Agent Schedule
+     Check Agent Conflict
   ------------------------------------ */
 
-  const agentConflict =
-    await Viewing.findOne({
-
-      _id: {
-        $ne: viewingId,
-      },
-
-      agent:
-        viewing.agent._id,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-      status: {
-        $in: [
-          "Requested",
-          "Pending Approval",
-          "Approved",
-          "Rescheduled",
-        ],
-      },
-
-    });
+  const agentConflict = await checkAgentConflict({
+    organizationId,
+    agentId: viewing.agent._id,
+    viewingDate,
+    startTime,
+    endTime,
+    excludeViewingId: viewing._id,
+    session,
+  });
 
   if (agentConflict) {
     throw new Error(
-      "Agent already has another scheduled viewing."
+      "Agent already has another scheduled viewing during this period."
     );
   }
 
   /* ------------------------------------
-     Save Previous Schedule
+     Preserve Previous Schedule
   ------------------------------------ */
 
+  if (!Array.isArray(viewing.previousSchedules)) {
+    viewing.previousSchedules = [];
+  }
+
   viewing.previousSchedules.push({
-
-    viewingDate:
-      viewing.viewingDate,
-
-    startTime:
-      viewing.startTime,
-
-    endTime:
-      viewing.endTime,
-
-    changedAt:
-      new Date(),
-
+    viewingDate: viewing.viewingDate,
+    startTime: viewing.startTime,
+    endTime: viewing.endTime,
+    changedAt: new Date(),
   });
 
   /* ------------------------------------
      Apply New Schedule
   ------------------------------------ */
 
-  viewing.viewingDate =
-    viewingDate;
+  viewing.viewingDate = viewingDate;
+  viewing.startTime = startTime;
+  viewing.endTime = endTime;
+  viewing.status = VIEWING_STATUS.RESCHEDULED;
 
-  viewing.startTime =
-    startTime;
+  viewing.rescheduleCount =
+    Number(viewing.rescheduleCount || 0) + 1;
 
-  viewing.endTime =
-    endTime;
-
-  viewing.status =
-    "Rescheduled";
-
-  viewing.rescheduleCount += 1;
-
-  await viewing.save();
+  await saveWithSession(viewing, session);
 
   /* ------------------------------------
-     Lead remains in viewing stage
+     Keep Lead in Viewing Stage
   ------------------------------------ */
 
-  await Lead.findByIdAndUpdate(
-    viewing.lead._id,
-    {
-      status:
-        LEAD_STATUS.VIEWING,
+  const lead = await getLeadForOrganization({
+    leadId: viewing.lead._id,
+    organizationId,
+    session,
+  });
 
-      lastContact:
-        new Date(),
+  if (lead.status !== LEAD_STATUS.VIEWING) {
+    if (
+      canTransitionLeadStatus(
+        lead.status,
+        LEAD_STATUS.VIEWING
+      )
+    ) {
+      await transitionLeadIfNeeded({
+        lead,
+        nextStatus: LEAD_STATUS.VIEWING,
+        session,
+      });
+    } else {
+      throw new Error(
+        `Lead cannot enter viewing stage from lifecycle status "${lead.status}".`
+      );
     }
-  );
+  }
+
+  lead.lastContact = new Date();
+
+  await saveWithSession(lead, session);
+
+  /* ------------------------------------
+     Keep Property Booked
+  ------------------------------------ */
+
+  let propertyQuery = Property.findOne({
+    _id: viewing.property._id,
+    organizationId,
+  });
+
+  if (session) {
+    propertyQuery = propertyQuery.session(session);
+  }
+
+  const property = await propertyQuery;
+
+  if (!property) {
+    throw new Error("Property not found.");
+  }
+
+  property.availability = "viewing_booked";
+
+  await saveWithSession(property, session);
 
   /* ------------------------------------
      Notify Customer
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.requestedBy,
-
-    title:
-      "Viewing Rescheduled",
-
-    message:
-      `Your viewing for "${viewing.property.title}" has been rescheduled.`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-      viewingDate,
-
-      startTime,
-
-      endTime,
-
-    },
-
+    userId: viewing.requestedBy,
+    title: "Viewing Rescheduled",
+    message: `Your viewing for "${property.title}" has been rescheduled.`,
+    type: "VIEWING_RESCHEDULED",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: property._id,
+    session,
   });
 
   return viewing;
@@ -777,102 +1314,115 @@ export const rescheduleViewing = async ({
 export const cancelViewing = async ({
   organizationId,
   viewingId,
+  cancelledBy,
+  cancellationReason,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
     );
   }
 
-  viewing.status =
-    "Cancelled";
-
-  await viewing.save();
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
 
   /* ------------------------------------
-     Lead Back To Qualified
+     Validate Current State
   ------------------------------------ */
 
-  /**
-   * "follow_up" is NOT a valid Lead.status.
-   *
-   * Follow-up remains represented through
-   * Lead.followUpStatus.
+  if (
+    [
+      VIEWING_STATUS.CANCELLED,
+      VIEWING_STATUS.REJECTED,
+      VIEWING_STATUS.COMPLETED,
+    ].includes(viewing.status)
+  ) {
+    throw new Error(
+      `Viewing cannot be cancelled from status "${viewing.status}".`
+    );
+  }
+
+  if (!viewing.property || !viewing.lead) {
+    throw new Error(
+      "Viewing must have a valid lead and property."
+    );
+  }
+
+  /* ------------------------------------
+     Update Viewing
+  ------------------------------------ */
+
+  viewing.status = VIEWING_STATUS.CANCELLED;
+
+  if (cancelledBy) {
+    viewing.cancelledBy = cancelledBy;
+  }
+
+  if (cancellationReason) {
+    viewing.cancellationReason = cancellationReason;
+  }
+
+  viewing.cancelledAt = new Date();
+
+  await saveWithSession(viewing, session);
+
+  /* ------------------------------------
+     Update Lead Lifecycle and Follow-up
+  ------------------------------------ */
+
+  const lead = await getLeadForOrganization({
+    leadId: viewing.lead._id,
+    organizationId,
+    session,
+  });
+
+  /*
+   * Cancellation must not create a fake Lead.status
+   * such as "follow_up".
    */
+  if (lead.status === LEAD_STATUS.VIEWING) {
+    await transitionLeadIfNeeded({
+      lead,
+      nextStatus: LEAD_STATUS.QUALIFIED,
+      session,
+    });
+  }
 
-  await Lead.findByIdAndUpdate(
+  lead.followUpStatus = "pending";
+  lead.lastContact = new Date();
+  lead.nextAction = "Follow up after cancelled viewing";
 
-    viewing.lead._id,
-
-    {
-
-      status:
-        LEAD_STATUS.QUALIFIED,
-
-      followUpStatus:
-        "pending",
-
-      lastContact:
-        new Date(),
-
-    }
-
-  );
+  await saveWithSession(lead, session);
 
   /* ------------------------------------
-     Property Available Again
+     Restore Property Availability
   ------------------------------------ */
 
-  await Property.findByIdAndUpdate(
-
-    viewing.property._id,
-
-    {
-
-      availability:
-        "available",
-
-      $inc: {
-
-        "viewingStats.cancelledViewings":
-          1,
-
-      },
-
-    }
-
-  );
+  await restorePropertyAvailabilityIfFree({
+    organizationId,
+    propertyId: viewing.property._id,
+    session,
+  });
 
   /* ------------------------------------
      Notify Customer
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.requestedBy,
-
-    title:
-      "Viewing Cancelled",
-
-    message:
-      `Your viewing for "${viewing.property.title}" has been cancelled.`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-    },
-
+    userId: viewing.requestedBy,
+    title: "Viewing Cancelled",
+    message: `Your viewing for "${viewing.property.title}" has been cancelled.`,
+    type: "VIEWING_CANCELLED",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: viewing.property._id,
+    session,
   });
 
   return viewing;
@@ -885,107 +1435,117 @@ export const cancelViewing = async ({
 export const completeViewing = async ({
   organizationId,
   viewingId,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
     );
   }
 
-  viewing.status =
-    "Completed";
-
-  await viewing.save();
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
 
   /* ------------------------------------
-     Update Lead
+     Validate Current State
   ------------------------------------ */
 
-  /**
-   * "follow_up" is NOT a valid Lead.status.
+  if (viewing.status === VIEWING_STATUS.COMPLETED) {
+    throw new Error("Viewing is already completed.");
+  }
+
+  if (
+    ![
+      VIEWING_STATUS.APPROVED,
+      VIEWING_STATUS.RESCHEDULED,
+    ].includes(viewing.status)
+  ) {
+    throw new Error(
+      `Viewing cannot be completed from status "${viewing.status}".`
+    );
+  }
+
+  if (!viewing.property || !viewing.lead) {
+    throw new Error(
+      "Viewing must have a valid lead and property."
+    );
+  }
+
+  /* ------------------------------------
+     Complete Viewing
+  ------------------------------------ */
+
+  viewing.status = VIEWING_STATUS.COMPLETED;
+  viewing.completedAt = new Date();
+
+  await saveWithSession(viewing, session);
+
+  /* ------------------------------------
+     Update Lead Follow-up
+  ------------------------------------ */
+
+  const lead = await getLeadForOrganization({
+    leadId: viewing.lead._id,
+    organizationId,
+    session,
+  });
+
+  /*
+   * Completing a viewing does not automatically move
+   * the lead backward to "qualified".
    *
-   * After a completed viewing, the lead
-   * returns to the valid CRM qualification
-   * stage while follow-up is tracked using
-   * the dedicated follow-up fields.
+   * The post-viewing outcome determines the next
+   * canonical lifecycle transition.
    */
+  lead.followUpStatus = "pending";
+  lead.lastContact = new Date();
+  lead.nextAction = "Contact customer after completed viewing";
 
-  await Lead.findByIdAndUpdate(
+  await saveWithSession(lead, session);
 
-    viewing.lead._id,
+  /* ------------------------------------
+     Restore Property Availability
+  ------------------------------------ */
 
-    {
-
-      status:
-        LEAD_STATUS.QUALIFIED,
-
-      followUpStatus:
-        "pending",
-
-      lastContact:
-        new Date(),
-
-      nextAction:
-        "Contact customer after completed viewing",
-
-    }
-
-  );
+  const property = await restorePropertyAvailabilityIfFree({
+    organizationId,
+    propertyId: viewing.property._id,
+    session,
+  });
 
   /* ------------------------------------
      Update Property Statistics
   ------------------------------------ */
 
-  await Property.findByIdAndUpdate(
-
-    viewing.property._id,
-
-    {
-
-      availability:
-        "available",
-
-      $inc: {
-
-        "viewingStats.completedViewings":
-          1,
-
-      },
-
+  if (property) {
+    if (!property.viewingStats) {
+      property.viewingStats = {};
     }
 
-  );
+    property.viewingStats.completedViewings =
+      Number(property.viewingStats.completedViewings || 0) + 1;
+
+    await saveWithSession(property, session);
+  }
 
   /* ------------------------------------
      Notify Customer
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.requestedBy,
-
-    title:
-      "Viewing Completed",
-
-    message:
-      `Thank you for attending the viewing of "${viewing.property.title}".`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-    },
-
+    userId: viewing.requestedBy,
+    title: "Viewing Completed",
+    message: `Thank you for attending the viewing of "${viewing.property.title}".`,
+    type: "VIEWING_REMINDER",
+    viewingId: viewing._id,
+    leadId: lead._id,
+    propertyId: viewing.property._id,
+    session,
   });
 
   return viewing;
@@ -1002,17 +1562,75 @@ export const submitFeedback = async ({
   viewerComment,
   agentOutcome,
   followUpRequired,
+  session = null,
 }) => {
-
-  const viewing =
-    await Viewing.findById(viewingId)
-      .populate("lead")
-      .populate("property");
-
-  if (!viewing) {
+  if (!organizationId) {
     throw new Error(
-      "Viewing not found."
+      "Organization context is required."
     );
+  }
+
+  /* ------------------------------------
+     Load Viewing
+  ------------------------------------ */
+
+  const viewing = await getViewingForOrganization({
+    viewingId,
+    organizationId,
+    populate: true,
+    session,
+  });
+
+  /* ------------------------------------
+     Feedback Only After Completion
+  ------------------------------------ */
+
+  if (viewing.status !== VIEWING_STATUS.COMPLETED) {
+    throw new Error(
+      "Viewing must be completed before feedback can be submitted."
+    );
+  }
+
+  /* ------------------------------------
+     Prevent Duplicate Feedback
+  ------------------------------------ */
+
+  const existingFeedback =
+    viewing.feedback &&
+    typeof viewing.feedback.toObject === "function"
+      ? viewing.feedback.toObject()
+      : viewing.feedback;
+
+  if (
+    existingFeedback &&
+    Object.keys(existingFeedback).length > 0
+  ) {
+    throw new Error(
+      "Feedback has already been submitted for this viewing."
+    );
+  }
+
+  /* ------------------------------------
+     Validate Rating
+  ------------------------------------ */
+
+  let normalizedRating;
+
+  if (
+    viewerRating !== undefined &&
+    viewerRating !== null
+  ) {
+    normalizedRating = Number(viewerRating);
+
+    if (
+      !Number.isFinite(normalizedRating) ||
+      normalizedRating < 1 ||
+      normalizedRating > 5
+    ) {
+      throw new Error(
+        "Viewer rating must be between 1 and 5."
+      );
+    }
   }
 
   /* ------------------------------------
@@ -1020,79 +1638,86 @@ export const submitFeedback = async ({
   ------------------------------------ */
 
   viewing.feedback = {
-
-    viewerRating,
-
+    viewerRating: normalizedRating,
     viewerComment,
-
     agentOutcome,
-
-    followUpRequired,
-
+    followUpRequired: Boolean(followUpRequired),
   };
 
-  await viewing.save();
+  await saveWithSession(viewing, session);
 
   /* ------------------------------------
      Update Property Rating
   ------------------------------------ */
 
-  if (viewerRating) {
+  if (normalizedRating !== undefined) {
+    let propertyQuery = Property.findOne({
+      _id: viewing.property._id,
+      organizationId,
+    });
 
-    const property =
-      await Property.findById(
-        viewing.property._id
-      );
+    if (session) {
+      propertyQuery = propertyQuery.session(session);
+    }
 
-    const stats =
-      property.viewingStats;
+    const property = await propertyQuery;
 
-    const completed =
-      Math.max(
-        stats.completedViewings,
-        1
-      );
+    if (!property) {
+      throw new Error("Property not found.");
+    }
 
-    const currentAverage =
-      stats.averageRating || 0;
+    if (!property.viewingStats) {
+      property.viewingStats = {};
+    }
 
-    stats.averageRating =
-      Number(
+    const stats = property.viewingStats;
 
+    /*
+     * Preserve the existing rating calculation:
+     *
+     * new average =
+     * ((old average * (completed count - 1)) + rating)
+     * / completed count
+     *
+     * This assumes the viewing's rating has not already
+     * contributed to the stored average.
+     */
+    const completed = Math.max(
+      Number(stats.completedViewings || 0),
+      1
+    );
+
+    const currentAverage = Number(
+      stats.averageRating || 0
+    );
+
+    stats.averageRating = Number(
+      (
         (
-          (
-            currentAverage *
-            (completed - 1)
-          ) +
-          viewerRating
+          currentAverage * (completed - 1) +
+          normalizedRating
         ) / completed
+      ).toFixed(2)
+    );
 
-      ).toFixed(2);
-
-    await property.save();
+    await saveWithSession(property, session);
   }
 
   /* ------------------------------------
-     Lead Follow-up Recommendation
+     Update Lead Follow-up
   ------------------------------------ */
 
   if (followUpRequired) {
+    const lead = await getLeadForOrganization({
+      leadId: viewing.lead._id,
+      organizationId,
+      session,
+    });
 
-    await Lead.findByIdAndUpdate(
+    lead.followUpStatus = "pending";
+    lead.nextAction = "Follow up after viewing";
 
-      viewing.lead._id,
-
-      {
-
-        followUpStatus:
-          "pending",
-
-        nextAction:
-          "Follow up after viewing",
-
-      }
-
-    );
+    await saveWithSession(lead, session);
   }
 
   /* ------------------------------------
@@ -1100,25 +1725,15 @@ export const submitFeedback = async ({
   ------------------------------------ */
 
   await createNotification({
-
     organizationId,
-
-    userId:
-      viewing.agent,
-
-    title:
-      "Viewing Feedback Submitted",
-
-    message:
-      `Feedback has been submitted for "${viewing.property.title}".`,
-
-    metadata: {
-
-      viewingId:
-        viewing._id,
-
-    },
-
+    userId: viewing.agent,
+    title: "Viewing Feedback Submitted",
+    message: `Feedback has been submitted for "${viewing.property.title}".`,
+    type: "VIEWING_REMINDER",
+    viewingId: viewing._id,
+    leadId: viewing.lead._id,
+    propertyId: viewing.property._id,
+    session,
   });
 
   return viewing.feedback;
@@ -1133,6 +1748,11 @@ export const getAllViewings = async ({
   role,
   userId,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
   const query = {
     organizationId,
@@ -1170,6 +1790,11 @@ export const getUpcomingViewings = async ({
   role,
   userId,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
   const query = {
     organizationId,
@@ -1180,8 +1805,8 @@ export const getUpcomingViewings = async ({
 
     status: {
       $in: [
-        "Approved",
-        "Rescheduled",
+        VIEWING_STATUS.APPROVED,
+        VIEWING_STATUS.RESCHEDULED,
       ],
     },
   };
@@ -1218,6 +1843,11 @@ export const getTodayViewings = async ({
   role,
   userId,
 }) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
   const start = new Date();
 
@@ -1238,29 +1868,19 @@ export const getTodayViewings = async ({
   );
 
   const query = {
-
     organizationId,
 
     viewingDate: {
-
       $gte: start,
-
       $lte: end,
-
     },
 
     status: {
-
       $in: [
-
-        "Approved",
-
-        "Rescheduled",
-
+        VIEWING_STATUS.APPROVED,
+        VIEWING_STATUS.RESCHEDULED,
       ],
-
     },
-
   };
 
   if (role === "agent") {
@@ -1290,12 +1910,19 @@ export const getTodayViewings = async ({
 ========================================================== */
 
 export const getViewingById = async (
-  viewingId
+  viewingId,
+  organizationId
 ) => {
+  if (!organizationId) {
+    throw new Error(
+      "Organization context is required."
+    );
+  }
 
-  return Viewing.findById(
-    viewingId
-  )
+  return Viewing.findOne({
+    _id: viewingId,
+    organizationId,
+  })
     .populate("lead")
     .populate("property")
     .populate("agent")
@@ -1306,10 +1933,11 @@ export const getViewingById = async (
 };
 
 /* ==========================================================
-   EXPORT
+   DEFAULT EXPORT
 ========================================================== */
 
 export default {
+  VIEWING_STATUS,
 
   requestViewing,
 
@@ -1336,5 +1964,4 @@ export default {
   checkPropertyConflict,
 
   checkAgentConflict,
-
 };

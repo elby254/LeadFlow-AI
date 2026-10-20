@@ -33,7 +33,11 @@
 //   ↓
 // Update workload counters
 //   ↓
-// Emit real-time events
+// Reliable Outbox Event
+//   ↓
+// Outbox Worker
+//   ↓
+// realtimeEngine
 //
 // AGENT
 //   ↓
@@ -75,26 +79,53 @@
 //
 // The assignment resolver is the final authority.
 //
+// IMPORTANT EVENT ARCHITECTURE
+// -----------------------------------------------------
+// This controller does NOT directly call:
+//
+//   leadEventBus.emit()
+//
+// Critical assignment events are persisted through:
+//
+//   services/outboxIntegrationService.js
+//
+// The Outbox worker later publishes:
+//
+//   LEAD_ASSIGNED
+//
+// to:
+//
+//   events/leadEvents.js
+//
+// which is consumed by realtimeEngine.
+//
 // =====================================================
+
+import {
+  randomUUID,
+} from "node:crypto";
 
 import mongoose from "mongoose";
 
 import Lead from "../models/lead.js";
 import User from "../models/user.js";
 
-import leadEventBus, {
-  LEAD_EVENTS,
-} from "../events/leadEvents.js";
-
 import {
   resolveAssignmentConflict,
 } from "../services/assignmentConflictResolver.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 
 // =====================================================
 // HELPER: AUTHENTICATED USER ID
 // =====================================================
 
-const getUserId = (req) => {
+const getUserId = (
+  req
+) => {
   return (
     req.user?._id ||
     req.user?.id ||
@@ -106,7 +137,8 @@ const getUserId = (req) => {
 // HELPER: ORGANIZATION ID
 // =====================================================
 //
-// Organization must come from authenticated context.
+// Organization must come from the centralized
+// organization resolver.
 //
 // Never trust:
 //
@@ -116,13 +148,26 @@ const getUserId = (req) => {
 //
 // =====================================================
 
-const getOrganizationId = (req) => {
-  return (
-    req.organizationId ||
-    req.user?.organizationId ||
-    null
-  );
-};
+const getOrganizationId =
+  async (
+    req
+  ) => {
+    const organization =
+      await resolveFromRequest(
+        req
+      );
+
+    if (
+      !organization
+    ) {
+      return null;
+    }
+
+    return (
+      organization._id ||
+      null
+    );
+  };
 
 // =====================================================
 // HELPER: OBJECT ID VALIDATION
@@ -140,40 +185,46 @@ const isValidObjectId = (
 };
 
 // =====================================================
-// HELPER: EMIT LEAD UPDATE
+// HELPER: REQUEST / OPERATION ID
 // =====================================================
 //
-// Events are emitted only after the database operation
-// succeeds.
+// Used for Outbox deduplication.
+//
+// Priority:
+//
+// 1. req.id
+// 2. req.requestId
+// 3. x-request-id
+// 4. x-correlation-id
+// 5. generated UUID
+//
+// This keeps repeated requests identifiable by the Outbox
+// reliability layer.
 //
 // =====================================================
 
-const emitAssignmentEvents = (
-  lead
+const getOperationId = (
+  req,
+  operation
 ) => {
-  try {
-    leadEventBus.emit(
-      LEAD_EVENTS.LEAD_UPDATED,
-      lead
-    );
-  } catch (error) {
-    console.error(
-      "⚠️ LEAD UPDATED EVENT ERROR:",
-      error
-    );
-  }
+  const requestId =
+    req.id ||
+    req.requestId ||
+    req.headers?.[
+      "x-request-id"
+    ] ||
+    req.headers?.[
+      "x-correlation-id"
+    ] ||
+    randomUUID();
 
-  try {
-    leadEventBus.emit(
-      LEAD_EVENTS.PIPELINE_UPDATE,
-      lead
-    );
-  } catch (error) {
-    console.error(
-      "⚠️ PIPELINE UPDATE EVENT ERROR:",
-      error
-    );
-  }
+  return [
+    "lead-assignment",
+    operation,
+    String(
+      requestId
+    ),
+  ].join(":");
 };
 
 // =====================================================
@@ -181,68 +232,147 @@ const emitAssignmentEvents = (
 // =====================================================
 //
 // Workload counters are changed ONLY after the resolver
-// has successfully returned an assignment.
+// has successfully returned an accepted assignment.
+//
+// IMPORTANT
+// -----------------------------------------------------
+// Organization is included in both user queries so a
+// workload counter cannot accidentally be modified on
+// a user from another organization.
 //
 // =====================================================
 
-const updateAssignmentWorkload = async (
-  previousAgentId,
-  newAgentId
-) => {
-  // ---------------------------------------------------
-  // No new assignment
-  // ---------------------------------------------------
-
-  if (!newAgentId) {
-    return;
-  }
-
-  // ---------------------------------------------------
-  // Same agent
-  // ---------------------------------------------------
-  //
-  // No workload change.
-  //
-  // ---------------------------------------------------
-
-  if (
-    previousAgentId &&
-    String(previousAgentId) ===
-      String(newAgentId)
-  ) {
-    return;
-  }
-
-  // ---------------------------------------------------
-  // Decrease previous agent workload
-  // ---------------------------------------------------
-
-  if (
-    previousAgentId
-  ) {
-    await User.findByIdAndUpdate(
-      previousAgentId,
-      {
-        $inc: {
-          assignedLeadCount: -1,
-        },
-      }
-    );
-  }
-
-  // ---------------------------------------------------
-  // Increase new agent workload
-  // ---------------------------------------------------
-
-  await User.findByIdAndUpdate(
+const updateAssignmentWorkload =
+  async (
+    previousAgentId,
     newAgentId,
-    {
-      $inc: {
-        assignedLeadCount: 1,
-      },
+    organizationId
+  ) => {
+
+    // ---------------------------------------------------
+    // No new assignment
+    // ---------------------------------------------------
+
+    if (
+      !newAgentId
+    ) {
+      return;
     }
-  );
-};
+
+    // ---------------------------------------------------
+    // Same agent
+    // ---------------------------------------------------
+    //
+    // No workload change.
+    //
+    // ---------------------------------------------------
+
+    if (
+      previousAgentId &&
+      String(
+        previousAgentId
+      ) ===
+        String(
+          newAgentId
+        )
+    ) {
+      return;
+    }
+
+    // ---------------------------------------------------
+    // Decrease previous agent workload
+    // ---------------------------------------------------
+
+    if (
+      previousAgentId
+    ) {
+      const previousAgent =
+        await User.findOneAndUpdate(
+          {
+            _id:
+              previousAgentId,
+
+            organizationId,
+
+            role:
+              "agent",
+          },
+
+          {
+            $inc: {
+              assignedLeadCount:
+                -1,
+            },
+          }
+        );
+
+      if (
+        !previousAgent
+      ) {
+        console.warn(
+          "⚠️ Previous agent workload could not be updated:",
+          {
+            previousAgentId:
+              String(
+                previousAgentId
+              ),
+
+            organizationId:
+              String(
+                organizationId
+              ),
+          }
+        );
+      }
+    }
+
+    // ---------------------------------------------------
+    // Increase new agent workload
+    // ---------------------------------------------------
+
+    const newAgent =
+      await User.findOneAndUpdate(
+        {
+          _id:
+            newAgentId,
+
+          organizationId,
+
+          role:
+            "agent",
+
+          isActive:
+            true,
+        },
+
+        {
+          $inc: {
+            assignedLeadCount:
+              1,
+          },
+        }
+      );
+
+    if (
+      !newAgent
+    ) {
+      console.warn(
+        "⚠️ New agent workload could not be updated:",
+        {
+          newAgentId:
+            String(
+              newAgentId
+            ),
+
+          organizationId:
+            String(
+              organizationId
+            ),
+        }
+      );
+    }
+  };
+
 
 // =====================================================
 // ASSIGN LEAD TO AGENT
@@ -261,342 +391,470 @@ const updateAssignmentWorkload = async (
 //
 // =====================================================
 
-export const assignLead = async (
-  req,
-  res
-) => {
-  try {
-    console.log(
-      "👤 ADMIN ASSIGN LEAD REQUEST"
-    );
+export const assignLead =
+  async (
+    req,
+    res
+  ) => {
 
-    const {
-      id,
-    } = req.params;
-
-    const {
-      agentId,
-    } = req.body || {};
-
-    const adminId =
-      getUserId(req);
-
-    const organizationId =
-      getOrganizationId(req);
-
-    // =================================================
-    // AUTHENTICATION
-    // =================================================
-
-    if (
-      !req.user ||
-      !adminId
-    ) {
-      return res.status(401).json({
-        success: false,
-        message:
-          "Authentication required.",
-      });
-    }
-
-    // =================================================
-    // ORGANIZATION
-    // =================================================
-
-    if (
-      !organizationId
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Organization not assigned.",
-      });
-    }
-
-    // =================================================
-    // LEAD ID
-    // =================================================
-
-    if (
-      !isValidObjectId(id)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid lead ID.",
-      });
-    }
-
-    // =================================================
-    // AGENT ID
-    // =================================================
-
-    if (
-      !isValidObjectId(agentId)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "A valid agent ID is required.",
-      });
-    }
-
-    // =================================================
-    // FIND LEAD
-    // =================================================
-    //
-    // Organization restriction is mandatory.
-    //
-    // =================================================
-
-    const lead =
-      await Lead.findOne({
-        _id: id,
-        organizationId,
-      });
-
-    if (!lead) {
-      return res.status(404).json({
-        success: false,
-        message:
-          "Lead not found.",
-      });
-    }
-
-    // =================================================
-    // FIND TARGET AGENT
-    // =================================================
-    //
-    // Controller validates the requested target.
-    //
-    // The resolver validates it again because the resolver
-    // remains the final security boundary.
-    //
-    // =================================================
-
-    const agent =
-      await User.findOne({
-        _id: agentId,
-        role: "agent",
-        isActive: true,
-        organizationId,
-      }).select(
-        "_id name email role organizationId isActive"
+    try {
+      console.log(
+        "👤 ADMIN ASSIGN LEAD REQUEST"
       );
 
-    if (!agent) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "The selected user is not an active agent in this organization.",
-      });
-    }
+      const {
+        id,
+      } =
+        req.params;
 
-    // =================================================
-    // STORE PREVIOUS ASSIGNMENT
-    // =================================================
-    //
-    // This is read-only information.
-    //
-    // The controller does NOT mutate the assignment here.
-    //
-    // =================================================
+      const {
+        agentId,
+      } =
+        req.body ||
+        {};
 
-    const previousAgentId =
-      lead.assignedTo ||
-      null;
+      const adminId =
+        getUserId(
+          req
+        );
 
-    // =================================================
-    // PREVENT UNNECESSARY REASSIGNMENT
-    // =================================================
+      const organizationId =
+        await getOrganizationId(
+          req
+        );
 
-    if (
-      previousAgentId &&
-      String(previousAgentId) ===
-        String(agent._id)
-    ) {
-      return res.status(200).json({
-        success: true,
-        message:
-          "Lead is already assigned to this agent.",
-        data: lead,
-        assignedAgent: {
-          _id: agent._id,
-          name: agent.name,
-          email: agent.email,
-          role: agent.role,
-        },
-      });
-    }
+      // =================================================
+      // AUTHENTICATION
+      // =================================================
 
-    // =================================================
-    // DELEGATE ASSIGNMENT TO RESOLVER
-    // =================================================
-    //
-    // IMPORTANT:
-    //
-    // Do NOT write:
-    //
-    // lead.assignedTo = agent._id
-    //
-    // here.
-    //
-    // The resolver owns the mutation.
-    //
-    // =================================================
+      if (
+        !req.user ||
+        !adminId
+      ) {
+        return res
+          .status(401)
+          .json({
+            success:
+              false,
 
-    const resolvedLead =
-      await resolveAssignmentConflict(
-        lead._id,
+            message:
+              "Authentication required.",
+          });
+      }
+
+      // =================================================
+      // ORGANIZATION
+      // =================================================
+
+      if (
+        !organizationId
+      ) {
+        return res
+          .status(403)
+          .json({
+            success:
+              false,
+
+            message:
+              "Organization not assigned.",
+          });
+      }
+
+      // =================================================
+      // LEAD ID
+      // =================================================
+
+      if (
+        !isValidObjectId(
+          id
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "Invalid lead ID.",
+          });
+      }
+
+      // =================================================
+      // AGENT ID
+      // =================================================
+
+      if (
+        !isValidObjectId(
+          agentId
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "A valid agent ID is required.",
+          });
+      }
+
+      // =================================================
+      // FIND LEAD
+      // =================================================
+
+      const lead =
+        await Lead.findOne({
+          _id:
+            id,
+
+          organizationId,
+        });
+
+      if (
+        !lead
+      ) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            message:
+              "Lead not found.",
+          });
+      }
+
+      // =================================================
+      // FIND TARGET AGENT
+      // =================================================
+
+      const agent =
+        await User.findOne({
+          _id:
+            agentId,
+
+          role:
+            "agent",
+
+          isActive:
+            true,
+
+          organizationId,
+        })
+          .select(
+            "_id name email role organizationId isActive assignedLeadCount"
+          );
+
+      if (
+        !agent
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "The selected user is not an active agent in this organization.",
+          });
+      }
+
+      // =================================================
+      // STORE PREVIOUS ASSIGNMENT
+      // =================================================
+
+      const previousAgentId =
+        lead.assignedTo ||
+        null;
+
+      // =================================================
+      // PREVENT UNNECESSARY REASSIGNMENT
+      // =================================================
+
+      if (
+        previousAgentId &&
+        String(
+          previousAgentId
+        ) ===
+          String(
+            agent._id
+          )
+      ) {
+        return res
+          .status(200)
+          .json({
+            success:
+              true,
+
+            message:
+              "Lead is already assigned to this agent.",
+
+            data:
+              lead,
+
+            assignedAgent: {
+              _id:
+                agent._id,
+
+              name:
+                agent.name,
+
+              email:
+                agent.email,
+
+              role:
+                agent.role,
+            },
+          });
+      }
+
+      // =================================================
+      // OPERATION ID
+      // =================================================
+
+      const operationId =
+        getOperationId(
+          req,
+          "assign"
+        );
+
+      // =================================================
+      // DELEGATE ASSIGNMENT TO RESOLVER
+      // =================================================
+      //
+      // IMPORTANT:
+      //
+      // Do NOT write:
+      //
+      // lead.assignedTo = agent._id
+      //
+      // here.
+      //
+      // The resolver owns the mutation.
+      //
+      // =================================================
+
+      const resolution =
+        await resolveAssignmentConflict(
+          lead._id,
+
+          {
+            assignedTo:
+              agent._id,
+
+            assignedBy:
+              adminId,
+
+            assignedSource:
+              "manual",
+
+            assignedAt:
+              new Date(),
+          },
+
+          organizationId
+        );
+
+      // =================================================
+      // RESOLUTION FAILURE
+      // =================================================
+
+      if (
+        !resolution ||
+        !resolution.accepted
+      ) {
+        console.warn(
+          "🛑 LEAD ASSIGNMENT REJECTED BY RESOLVER:",
+          {
+            leadId:
+              String(
+                lead._id
+              ),
+
+            reason:
+              resolution?.reason ||
+              "unknown",
+
+            organizationId:
+              String(
+                organizationId
+              ),
+          }
+        );
+
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "Lead assignment could not be completed.",
+
+            reason:
+              resolution?.reason ||
+              "assignment_rejected",
+          });
+      }
+
+      // =================================================
+      // RESOLVER RESULT
+      // =================================================
+
+      const resolvedLead =
+        resolution.lead;
+
+      if (
+        !resolvedLead
+      ) {
+        console.error(
+          "❌ Resolver accepted assignment but returned no lead."
+        );
+
+        return res
+          .status(500)
+          .json({
+            success:
+              false,
+
+            message:
+              "Assignment resolution returned an invalid result.",
+          });
+      }
+
+      // =================================================
+      // DETERMINE WHETHER ASSIGNMENT CHANGED
+      // =================================================
+
+      const newAgentId =
+        resolvedLead.assignedTo ||
+        null;
+
+      const assignmentChanged =
+        Boolean(
+          newAgentId &&
+          (
+            !previousAgentId ||
+            String(
+              previousAgentId
+            ) !==
+              String(
+                newAgentId
+              )
+          )
+        );
+
+      // =================================================
+      // UPDATE WORKLOAD
+      // =================================================
+
+      if (
+        assignmentChanged
+      ) {
+        await updateAssignmentWorkload(
+          previousAgentId,
+
+          newAgentId,
+
+          organizationId
+        );
+      }
+
+      // =================================================
+      // DEBUG
+      // =================================================
+
+      console.log(
+        "✅ LEAD ASSIGNMENT RESOLVED:",
         {
+          leadId:
+            String(
+              resolvedLead._id
+            ),
+
           assignedTo:
-            agent._id,
+            resolvedLead.assignedTo
+              ? String(
+                  resolvedLead.assignedTo
+                )
+              : null,
 
           assignedBy:
-            adminId,
+            resolvedLead.assignedBy
+              ? String(
+                  resolvedLead.assignedBy
+                )
+              : null,
 
           assignedSource:
-            "manual",
+            resolvedLead.assignedSource,
 
-          assignedAt:
-            new Date(),
+          organizationId:
+            String(
+              organizationId
+            ),
+
+          assignmentChanged,
+
+          operationId,
         }
       );
 
-    // =================================================
-    // RESOLUTION FAILURE
-    // =================================================
+      // =================================================
+      // RESPONSE
+      // =================================================
 
-    if (!resolvedLead) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Lead assignment could not be completed.",
-      });
-    }
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
 
-    // =================================================
-    // DETERMINE WHETHER ASSIGNMENT CHANGED
-    // =================================================
+          message:
+            assignmentChanged
+              ? "Lead assigned successfully."
+              : "Lead assignment was not changed.",
 
-    const newAgentId =
-      resolvedLead.assignedTo ||
-      null;
+          data:
+            resolvedLead,
 
-    const assignmentChanged =
-      Boolean(
-        newAgentId &&
-        (
-          !previousAgentId ||
-          String(
-            previousAgentId
-          ) !==
-            String(
-              newAgentId
-            )
-        )
-      );
+          assignedAgent: {
+            _id:
+              agent._id,
 
-    // =================================================
-    // UPDATE WORKLOAD
-    // =================================================
-    //
-    // Only update counters when the resolver actually
-    // changed the assignment.
-    //
-    // =================================================
+            name:
+              agent.name,
 
-    if (
-      assignmentChanged
-    ) {
-      await updateAssignmentWorkload(
-        previousAgentId,
-        newAgentId
-      );
-    }
+            email:
+              agent.email,
 
-    // =================================================
-    // REAL-TIME EVENTS
-    // =================================================
+            role:
+              agent.role,
+          },
+        });
 
-    if (
-      assignmentChanged
-    ) {
-      emitAssignmentEvents(
-        resolvedLead
-      );
-    }
-
-    // =================================================
-    // DEBUG
-    // =================================================
-
-    console.log(
-      "✅ LEAD ASSIGNMENT RESOLVED:",
-      {
-        leadId:
-          String(
-            resolvedLead._id
-          ),
-
-        assignedTo:
-          resolvedLead.assignedTo
-            ? String(
-                resolvedLead.assignedTo
-              )
-            : null,
-
-        assignedBy:
-          resolvedLead.assignedBy
-            ? String(
-                resolvedLead.assignedBy
-              )
-            : null,
-
-        assignedSource:
-          resolvedLead.assignedSource,
-
-        organizationId:
-          String(
-            organizationId
-          ),
-
-        assignmentChanged,
-      }
-    );
-
-    // =================================================
-    // RESPONSE
-    // =================================================
-
-    return res.status(200).json({
-      success: true,
-      message:
-        assignmentChanged
-          ? "Lead assigned successfully."
-          : "Lead assignment was not changed.",
-      data: resolvedLead,
-      assignedAgent: {
-        _id: agent._id,
-        name: agent.name,
-        email: agent.email,
-        role: agent.role,
-      },
-    });
-
-  } catch (error) {
-    console.error(
-      "❌ ASSIGN LEAD ERROR:",
+    } catch (
       error
-    );
+    ) {
 
-    return res.status(500).json({
-      success: false,
-      message:
-        "Failed to assign lead.",
-    });
-  }
-};
+      console.error(
+        "❌ ASSIGN LEAD ERROR:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          message:
+            "Failed to assign lead.",
+        });
+    }
+  };
 
 // =====================================================
 // REASSIGN LEAD
@@ -615,321 +873,491 @@ export const assignLead = async (
 //
 // =====================================================
 
-export const reassignLead = async (
-  req,
-  res
-) => {
-  try {
-    console.log(
-      "🔄 ADMIN REASSIGN LEAD REQUEST"
-    );
+export const reassignLead =
+  async (
+    req,
+    res
+  ) => {
 
-    const {
-      id,
-    } = req.params;
-
-    const {
-      newAgentId,
-    } = req.body || {};
-
-    const adminId =
-      getUserId(req);
-
-    const organizationId =
-      getOrganizationId(req);
-
-    // =================================================
-    // AUTHENTICATION
-    // =================================================
-
-    if (
-      !req.user ||
-      !adminId
-    ) {
-      return res.status(401).json({
-        success: false,
-        message:
-          "Authentication required.",
-      });
-    }
-
-    // =================================================
-    // ORGANIZATION
-    // =================================================
-
-    if (
-      !organizationId
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Organization not assigned.",
-      });
-    }
-
-    // =================================================
-    // LEAD ID
-    // =================================================
-
-    if (
-      !isValidObjectId(id)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid lead ID.",
-      });
-    }
-
-    // =================================================
-    // NEW AGENT ID
-    // =================================================
-
-    if (
-      !isValidObjectId(
-        newAgentId
-      )
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "A valid new agent ID is required.",
-      });
-    }
-
-    // =================================================
-    // FIND LEAD
-    // =================================================
-
-    const lead =
-      await Lead.findOne({
-        _id: id,
-        organizationId,
-      });
-
-    if (!lead) {
-      return res.status(404).json({
-        success: false,
-        message:
-          "Lead not found.",
-      });
-    }
-
-    // =================================================
-    // FIND NEW AGENT
-    // =================================================
-
-    const newAgent =
-      await User.findOne({
-        _id: newAgentId,
-        role: "agent",
-        isActive: true,
-        organizationId,
-      }).select(
-        "_id name email role organizationId isActive"
+    try {
+      console.log(
+        "🔄 ADMIN REASSIGN LEAD REQUEST"
       );
 
-    if (!newAgent) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "The selected user is not an active agent in this organization.",
-      });
-    }
+      const {
+        id,
+      } =
+        req.params;
 
-    // =================================================
-    // PREVIOUS AGENT
-    // =================================================
+      const {
+        newAgentId,
+      } =
+        req.body ||
+        {};
 
-    const previousAgentId =
-      lead.assignedTo ||
-      null;
+      const adminId =
+        getUserId(
+          req
+        );
 
-    // =================================================
-    // SAME AGENT
-    // =================================================
+      const organizationId =
+        await getOrganizationId(
+          req
+        );
 
-    if (
-      previousAgentId &&
-      String(previousAgentId) ===
-        String(newAgent._id)
-    ) {
-      return res.status(200).json({
-        success: true,
-        message:
-          "Lead is already assigned to this agent.",
-        data: lead,
-        assignedAgent: {
-          _id: newAgent._id,
-          name: newAgent.name,
-          email: newAgent.email,
-          role: newAgent.role,
-        },
-      });
-    }
+      // =================================================
+      // AUTHENTICATION
+      // =================================================
 
-    // =================================================
-    // DELEGATE REASSIGNMENT TO RESOLVER
-    // =================================================
-    //
-    // Manual assignment has the highest priority.
-    //
-    // The resolver performs the actual mutation.
-    //
-    // =================================================
+      if (
+        !req.user ||
+        !adminId
+      ) {
+        return res
+          .status(401)
+          .json({
+            success:
+              false,
 
-    const resolvedLead =
-      await resolveAssignmentConflict(
-        lead._id,
+            message:
+              "Authentication required.",
+          });
+      }
+
+      // =================================================
+      // ORGANIZATION
+      // =================================================
+
+      if (
+        !organizationId
+      ) {
+        return res
+          .status(403)
+          .json({
+            success:
+              false,
+
+            message:
+              "Organization not assigned.",
+          });
+      }
+
+      // =================================================
+      // LEAD ID
+      // =================================================
+
+      if (
+        !isValidObjectId(
+          id
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "Invalid lead ID.",
+          });
+      }
+
+      // =================================================
+      // NEW AGENT ID
+      // =================================================
+
+      if (
+        !isValidObjectId(
+          newAgentId
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "A valid new agent ID is required.",
+          });
+      }
+
+      // =================================================
+      // FIND LEAD
+      // =================================================
+
+      const lead =
+        await Lead.findOne({
+          _id:
+            id,
+
+          organizationId,
+        });
+
+      if (
+        !lead
+      ) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            message:
+              "Lead not found.",
+          });
+      }
+
+      // =================================================
+      // FIND NEW AGENT
+      // =================================================
+
+      const newAgent =
+        await User.findOne({
+          _id:
+            newAgentId,
+
+          role:
+            "agent",
+
+          isActive:
+            true,
+
+          organizationId,
+        })
+          .select(
+            "_id name email role organizationId isActive assignedLeadCount"
+          );
+
+      if (
+        !newAgent
+      ) {
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "The selected user is not an active agent in this organization.",
+          });
+      }
+
+      // =================================================
+      // PREVIOUS AGENT
+      // =================================================
+
+      const previousAgentId =
+        lead.assignedTo ||
+        null;
+
+      // =================================================
+      // SAME AGENT
+      // =================================================
+
+      if (
+        previousAgentId &&
+        String(
+          previousAgentId
+        ) ===
+          String(
+            newAgent._id
+          )
+      ) {
+        return res
+          .status(200)
+          .json({
+            success:
+              true,
+
+            message:
+              "Lead is already assigned to this agent.",
+
+            data:
+              lead,
+
+            assignedAgent: {
+              _id:
+                newAgent._id,
+
+              name:
+                newAgent.name,
+
+              email:
+                newAgent.email,
+
+              role:
+                newAgent.role,
+            },
+          });
+      }
+
+      // =================================================
+      // OPERATION ID
+      // =================================================
+
+      const operationId =
+        getOperationId(
+          req,
+          "reassign"
+        );
+
+      // =================================================
+      // DELEGATE REASSIGNMENT TO RESOLVER
+      // =================================================
+      //
+      // Manual reassignment has the highest priority.
+      //
+      // The resolver remains the final mutation authority.
+      //
+      // =================================================
+
+      const resolution =
+        await resolveAssignmentConflict(
+          lead._id,
+
+          {
+            assignedTo:
+              newAgent._id,
+
+            assignedBy:
+              adminId,
+
+            assignedSource:
+              "manual",
+
+            assignedAt:
+              new Date(),
+          },
+
+          organizationId
+        );
+
+      // =================================================
+      // RESOLUTION FAILURE
+      // =================================================
+
+      if (
+        !resolution ||
+        !resolution.accepted
+      ) {
+
+        console.warn(
+          "🛑 LEAD REASSIGNMENT REJECTED BY RESOLVER:",
+          {
+            leadId:
+              String(
+                lead._id
+              ),
+
+            reason:
+              resolution?.reason ||
+              "unknown",
+
+            organizationId:
+              String(
+                organizationId
+              ),
+          }
+        );
+
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "Lead reassignment could not be completed.",
+
+            reason:
+              resolution?.reason ||
+              "assignment_rejected",
+          });
+      }
+
+      // =================================================
+      // RESOLVER RESULT
+      // =================================================
+
+      const resolvedLead =
+        resolution.lead;
+
+      if (
+        !resolvedLead
+      ) {
+
+        console.error(
+          "❌ Resolver accepted reassignment but returned no lead."
+        );
+
+        return res
+          .status(500)
+          .json({
+            success:
+              false,
+
+            message:
+              "Assignment resolution returned an invalid result.",
+          });
+      }
+
+      // =================================================
+      // DETERMINE NEW ASSIGNMENT
+      // =================================================
+
+      const resolvedAgentId =
+        resolvedLead.assignedTo ||
+        null;
+
+      const assignmentChanged =
+        Boolean(
+          resolvedAgentId &&
+          (
+            !previousAgentId ||
+            String(
+              previousAgentId
+            ) !==
+              String(
+                resolvedAgentId
+              )
+          )
+        );
+
+      // =================================================
+      // UPDATE WORKLOAD COUNTERS
+      // =================================================
+
+      if (
+        assignmentChanged
+      ) {
+
+        await updateAssignmentWorkload(
+          previousAgentId,
+
+          resolvedAgentId,
+
+          organizationId
+        );
+      }
+
+      // =================================================
+      // RELIABLE ASSIGNMENT EVENT
+      // =================================================
+      //
+      // Reassignment is represented by another canonical
+      // LEAD_ASSIGNED event with previousAgentId populated.
+      //
+      // We deliberately DO NOT create an artificial:
+      //
+      //   LEAD_UNASSIGNED
+      //
+      // event for reassignment.
+      //
+      // =================================================
+
+      if (
+        assignmentChanged
+      )
+
+      // =================================================
+      // DEBUG
+      // =================================================
+
+      console.log(
+        "🔁 LEAD REASSIGNMENT RESOLVED:",
         {
-          assignedTo:
-            newAgent._id,
+          leadId:
+            String(
+              resolvedLead._id
+            ),
+
+          previousAgentId:
+            previousAgentId
+              ? String(
+                  previousAgentId
+                )
+              : null,
+
+          newAgentId:
+            resolvedAgentId
+              ? String(
+                  resolvedAgentId
+                )
+              : null,
 
           assignedBy:
-            adminId,
+            String(
+              adminId
+            ),
 
           assignedSource:
-            "manual",
+            resolvedLead.assignedSource,
 
-          assignedAt:
-            new Date(),
+          organizationId:
+            String(
+              organizationId
+            ),
+
+          assignmentChanged,
+
+          operationId,
         }
       );
 
-    // =================================================
-    // RESOLUTION FAILURE
-    // =================================================
+      // =================================================
+      // RESPONSE
+      // =================================================
 
-    if (!resolvedLead) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Lead reassignment could not be completed.",
-      });
-    }
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
 
-    // =================================================
-    // DETERMINE NEW ASSIGNMENT
-    // =================================================
+          message:
+            assignmentChanged
+              ? "Lead reassigned successfully."
+              : "Lead assignment was not changed.",
 
-    const resolvedAgentId =
-      resolvedLead.assignedTo ||
-      null;
+          data:
+            resolvedLead,
 
-    const assignmentChanged =
-      Boolean(
-        resolvedAgentId &&
-        (
-          !previousAgentId ||
-          String(
-            previousAgentId
-          ) !==
-            String(
-              resolvedAgentId
-            )
-        )
-      );
+          assignedAgent: {
+            _id:
+              newAgent._id,
 
-    // =================================================
-    // UPDATE WORKLOAD COUNTERS
-    // =================================================
+            name:
+              newAgent.name,
 
-    if (
-      assignmentChanged
-    ) {
-      await updateAssignmentWorkload(
-        previousAgentId,
-        resolvedAgentId
-      );
-    }
+            email:
+              newAgent.email,
 
-    // =================================================
-    // REAL-TIME EVENTS
-    // =================================================
+            role:
+              newAgent.role,
+          },
+        });
 
-    if (
-      assignmentChanged
-    ) {
-      emitAssignmentEvents(
-        resolvedLead
-      );
-    }
-
-    // =================================================
-    // DEBUG
-    // =================================================
-
-    console.log(
-      "🔁 LEAD REASSIGNMENT RESOLVED:",
-      {
-        leadId:
-          String(
-            resolvedLead._id
-          ),
-
-        previousAgentId:
-          previousAgentId
-            ? String(
-                previousAgentId
-              )
-            : null,
-
-        newAgentId:
-          resolvedAgentId
-            ? String(
-                resolvedAgentId
-              )
-            : null,
-
-        assignedBy:
-          String(
-            adminId
-          ),
-
-        assignedSource:
-          resolvedLead.assignedSource,
-
-        organizationId:
-          String(
-            organizationId
-          ),
-
-        assignmentChanged,
-      }
-    );
-
-    // =================================================
-    // RESPONSE
-    // =================================================
-
-    return res.status(200).json({
-      success: true,
-      message:
-        assignmentChanged
-          ? "Lead reassigned successfully."
-          : "Lead assignment was not changed.",
-      data: resolvedLead,
-      assignedAgent: {
-        _id: newAgent._id,
-        name: newAgent.name,
-        email: newAgent.email,
-        role: newAgent.role,
-      },
-    });
-
-  } catch (error) {
-    console.error(
-      "❌ REASSIGN LEAD ERROR:",
+    } catch (
       error
-    );
+    ) {
 
-    return res.status(500).json({
-      success: false,
-      message:
-        "Failed to reassign lead.",
-    });
-  }
-};
+      console.error(
+        "❌ REASSIGN LEAD ERROR:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          message:
+            "Failed to reassign lead.",
+        });
+    }
+  };
 
 // =====================================================
 // GET UNASSIGNED LEADS
@@ -947,13 +1375,16 @@ export const getUnassignedLeads =
     req,
     res
   ) => {
+
     try {
       console.log(
         "📋 FETCHING UNASSIGNED LEADS"
       );
 
       const organizationId =
-        getOrganizationId(req);
+        await getOrganizationId(
+          req
+        );
 
       // =================================================
       // AUTHENTICATION
@@ -962,11 +1393,15 @@ export const getUnassignedLeads =
       if (
         !req.user
       ) {
-        return res.status(401).json({
-          success: false,
-          message:
-            "Authentication required.",
-        });
+        return res
+          .status(401)
+          .json({
+            success:
+              false,
+
+            message:
+              "Authentication required.",
+          });
       }
 
       // =================================================
@@ -976,11 +1411,15 @@ export const getUnassignedLeads =
       if (
         !organizationId
       ) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "Organization not assigned.",
-        });
+        return res
+          .status(403)
+          .json({
+            success:
+              false,
+
+            message:
+              "Organization not assigned.",
+          });
       }
 
       // =================================================
@@ -999,13 +1438,15 @@ export const getUnassignedLeads =
 
             {
               assignedTo: {
-                $exists: false,
+                $exists:
+                  false,
               },
             },
           ],
         })
           .sort({
-            createdAt: -1,
+            createdAt:
+              -1,
           })
           .populate(
             "assignedBy",
@@ -1016,24 +1457,37 @@ export const getUnassignedLeads =
       // RESPONSE
       // =================================================
 
-      return res.status(200).json({
-        success: true,
-        count:
-          leads.length,
-        data: leads,
-      });
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
 
-    } catch (error) {
+          count:
+            leads.length,
+
+          data:
+            leads,
+        });
+
+    } catch (
+      error
+    ) {
+
       console.error(
         "❌ GET UNASSIGNED LEADS ERROR:",
         error
       );
 
-      return res.status(500).json({
-        success: false,
-        message:
-          "Failed to fetch unassigned leads.",
-      });
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          message:
+            "Failed to fetch unassigned leads.",
+        });
     }
   };
 
@@ -1058,104 +1512,134 @@ export const getUnassignedLeads =
 //
 // =====================================================
 
-export const getMyLeads = async (
-  req,
-  res
-) => {
-  try {
-    console.log(
-      "🤝 AGENT FETCHING ASSIGNED LEADS"
-    );
+export const getMyLeads =
+  async (
+    req,
+    res
+  ) => {
 
-    const agentId =
-      getUserId(req);
+    try {
+      console.log(
+        "🤝 AGENT FETCHING ASSIGNED LEADS"
+      );
 
-    const organizationId =
-      getOrganizationId(req);
-
-    // =================================================
-    // AUTHENTICATION
-    // =================================================
-
-    if (
-      !req.user ||
-      !agentId
-    ) {
-      return res.status(401).json({
-        success: false,
-        message:
-          "Authentication required.",
-      });
-    }
-
-    // =================================================
-    // ORGANIZATION
-    // =================================================
-
-    if (
-      !organizationId
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          "Organization not assigned.",
-      });
-    }
-
-    // =================================================
-    // AUTHORITATIVE QUERY
-    // =================================================
-    //
-    // assignedTo is the ONLY assignment identity.
-    //
-    // =================================================
-
-    const leads =
-      await Lead.find({
-        organizationId,
-        assignedTo: agentId,
-      })
-        .sort({
-          updatedAt: -1,
-        })
-        .populate(
-          "assignedTo",
-          "name email role"
-        )
-        .populate(
-          "assignedBy",
-          "name email role"
+      const agentId =
+        getUserId(
+          req
         );
 
-    console.log(
-      "📦 Agent leads found:",
-      leads.length
-    );
+      const organizationId =
+        await getOrganizationId(
+          req
+        );
 
-    // =================================================
-    // RESPONSE
-    // =================================================
+      // =================================================
+      // AUTHENTICATION
+      // =================================================
 
-    return res.status(200).json({
-      success: true,
-      count:
-        leads.length,
-      data: leads,
-    });
+      if (
+        !req.user ||
+        !agentId
+      ) {
+        return res
+          .status(401)
+          .json({
+            success:
+              false,
 
-  } catch (error) {
-    console.error(
-      "❌ GET MY LEADS ERROR:",
+            message:
+              "Authentication required.",
+          });
+      }
+
+      // =================================================
+      // ORGANIZATION
+      // =================================================
+
+      if (
+        !organizationId
+      ) {
+        return res
+          .status(403)
+          .json({
+            success:
+              false,
+
+            message:
+              "Organization not assigned.",
+          });
+      }
+
+      // =================================================
+      // AUTHORITATIVE QUERY
+      // =================================================
+      //
+      // assignedTo is the ONLY assignment identity.
+      //
+      // =================================================
+
+      const leads =
+        await Lead.find({
+          organizationId,
+
+          assignedTo:
+            agentId,
+        })
+          .sort({
+            updatedAt:
+              -1,
+          })
+          .populate(
+            "assignedTo",
+            "name email role"
+          )
+          .populate(
+            "assignedBy",
+            "name email role"
+          );
+
+      console.log(
+        "📦 Agent leads found:",
+        leads.length
+      );
+
+      // =================================================
+      // RESPONSE
+      // =================================================
+
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
+
+          count:
+            leads.length,
+
+          data:
+            leads,
+        });
+
+    } catch (
       error
-    );
+    ) {
 
-    return res.status(500).json({
-      success: false,
-      message:
-        "Failed to fetch assigned leads.",
-    });
-  }
-};
+      console.error(
+        "❌ GET MY LEADS ERROR:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          message:
+            "Failed to fetch assigned leads.",
+        });
+    }
+  };
 
 // =====================================================
 // GET MY LEAD BY ID
@@ -1173,6 +1657,7 @@ export const getMyLeadById =
     req,
     res
   ) => {
+
     try {
       console.log(
         "🔎 AGENT FETCHING ASSIGNED LEAD"
@@ -1180,13 +1665,18 @@ export const getMyLeadById =
 
       const {
         id,
-      } = req.params;
+      } =
+        req.params;
 
       const agentId =
-        getUserId(req);
+        getUserId(
+          req
+        );
 
       const organizationId =
-        getOrganizationId(req);
+        await getOrganizationId(
+          req
+        );
 
       // =================================================
       // AUTHENTICATION
@@ -1196,11 +1686,15 @@ export const getMyLeadById =
         !req.user ||
         !agentId
       ) {
-        return res.status(401).json({
-          success: false,
-          message:
-            "Authentication required.",
-        });
+        return res
+          .status(401)
+          .json({
+            success:
+              false,
+
+            message:
+              "Authentication required.",
+          });
       }
 
       // =================================================
@@ -1210,11 +1704,15 @@ export const getMyLeadById =
       if (
         !organizationId
       ) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "Organization not assigned.",
-        });
+        return res
+          .status(403)
+          .json({
+            success:
+              false,
+
+            message:
+              "Organization not assigned.",
+          });
       }
 
       // =================================================
@@ -1222,13 +1720,19 @@ export const getMyLeadById =
       // =================================================
 
       if (
-        !isValidObjectId(id)
+        !isValidObjectId(
+          id
+        )
       ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Invalid lead ID.",
-        });
+        return res
+          .status(400)
+          .json({
+            success:
+              false,
+
+            message:
+              "Invalid lead ID.",
+          });
       }
 
       // =================================================
@@ -1240,13 +1744,17 @@ export const getMyLeadById =
       // organizationId
       // assignedTo
       //
-      // =================================================
+      // =====================================================
 
       const lead =
         await Lead.findOne({
-          _id: id,
+          _id:
+            id,
+
           organizationId,
-          assignedTo: agentId,
+
+          assignedTo:
+            agentId,
         })
           .populate(
             "assignedTo",
@@ -1270,33 +1778,51 @@ export const getMyLeadById =
       //
       // =================================================
 
-      if (!lead) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Lead not found.",
-        });
+      if (
+        !lead
+      ) {
+        return res
+          .status(404)
+          .json({
+            success:
+              false,
+
+            message:
+              "Lead not found.",
+          });
       }
 
       // =================================================
       // RESPONSE
       // =================================================
 
-      return res.status(200).json({
-        success: true,
-        data: lead,
-      });
+      return res
+        .status(200)
+        .json({
+          success:
+            true,
 
-    } catch (error) {
+          data:
+            lead,
+        });
+
+    } catch (
+      error
+    ) {
+
       console.error(
         "❌ GET MY LEAD ERROR:",
         error
       );
 
-      return res.status(500).json({
-        success: false,
-        message:
-          "Failed to fetch lead.",
-      });
+      return res
+        .status(500)
+        .json({
+          success:
+            false,
+
+          message:
+            "Failed to fetch lead.",
+        });
     }
   };

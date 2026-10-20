@@ -104,6 +104,143 @@ const normalizeOrganizationId = (
 };
 
 /* ==========================================================
+   TENANT SAFETY
+========================================================== */
+
+/*
+ * Conversation memory is intentionally passed an already
+ * resolved organizationId by the calling layer.
+ *
+ * This service does not receive req, so it must NOT resolve
+ * the organization through req.user / req.organizationId.
+ *
+ * The checks below ensure that a conversation being mutated
+ * actually belongs to an organization and, when a lead is
+ * supplied, that the lead belongs to the same organization.
+ */
+
+const validateConversationOrganization = (
+  conversation
+) => {
+  if (
+    !conversation
+  ) {
+    return false;
+  }
+
+  const conversationOrganizationId =
+    normalizeOrganizationId(
+      conversation.organizationId
+    );
+
+  if (
+    !conversationOrganizationId
+  ) {
+    console.error(
+      "❌ Conversation tenant validation failed: conversation has no organizationId.",
+      {
+        conversationId:
+          conversation._id
+            ? String(
+                conversation._id
+              )
+            : null,
+      }
+    );
+
+    return false;
+  }
+
+  return true;
+};
+
+const validateConversationLeadOrganization = (
+  conversation,
+  lead
+) => {
+  if (
+    !validateConversationOrganization(
+      conversation
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !lead
+  ) {
+    return true;
+  }
+
+  const conversationOrganizationId =
+    normalizeOrganizationId(
+      conversation.organizationId
+    );
+
+  const leadOrganizationId =
+    normalizeOrganizationId(
+      lead.organizationId
+    );
+
+  if (
+    !leadOrganizationId
+  ) {
+    console.error(
+      "❌ Lead tenant validation failed: lead has no organizationId.",
+      {
+        leadId:
+          lead._id
+            ? String(
+                lead._id
+              )
+            : null,
+
+        conversationId:
+          conversation._id
+            ? String(
+                conversation._id
+              )
+            : null,
+      }
+    );
+
+    return false;
+  }
+
+  if (
+    conversationOrganizationId !==
+    leadOrganizationId
+  ) {
+    console.error(
+      "❌ Conversation/Lead tenant mismatch detected.",
+      {
+        conversationId:
+          conversation._id
+            ? String(
+                conversation._id
+              )
+            : null,
+
+        conversationOrganizationId,
+
+        leadId:
+          lead._id
+            ? String(
+                lead._id
+              )
+            : null,
+
+        leadOrganizationId,
+      }
+    );
+
+    return false;
+  }
+
+  return true;
+};
+
+/* ==========================================================
    NORMALIZE CUSTOMER
 ========================================================== */
 
@@ -502,11 +639,18 @@ export const getConversationContext =
         {
           status,
           stage,
+          organizationId:
+            normalizedOrganizationId,
         }
       );
 
       conversation =
         await Conversation.create({
+          /*
+           * IMPORTANT:
+           * Conversation creation is always explicitly
+           * tenant-scoped.
+           */
           organizationId:
             normalizedOrganizationId,
 
@@ -550,6 +694,37 @@ export const getConversationContext =
         )
       );
     } else {
+      /*
+       * Existing conversations are returned only after
+       * the organizationId was included in the lookup.
+       *
+       * Keep this explicit guard so malformed legacy
+       * documents cannot silently enter the memory layer.
+       */
+      if (
+        !validateConversationOrganization(
+          conversation
+        )
+      ) {
+        throw new Error(
+          "Conversation does not belong to a valid organization."
+        );
+      }
+
+      const conversationOrganizationId =
+        normalizeOrganizationId(
+          conversation.organizationId
+        );
+
+      if (
+        conversationOrganizationId !==
+        normalizedOrganizationId
+      ) {
+        throw new Error(
+          "Conversation organization does not match the requested organization."
+        );
+      }
+
       console.log(
         "♻️ Existing conversation loaded:",
         String(
@@ -778,6 +953,26 @@ export const recordAskedQuestion =
       return conversation;
     }
 
+    /*
+     * Tenant safety:
+     *
+     * This function receives an existing conversation
+     * document rather than req, so the centralized request
+     * resolver cannot be used here.
+     *
+     * Ensure the document being mutated is tenant-bound
+     * before saving it.
+     */
+    if (
+      !validateConversationOrganization(
+        conversation
+      )
+    ) {
+      throw new Error(
+        "Cannot update conversation without a valid organizationId."
+      );
+    }
+
     const validQuestions =
       getAskedQuestionEnum();
 
@@ -898,6 +1093,26 @@ export const updateConversationQualification =
       !lead
     ) {
       return conversation;
+    }
+
+    /*
+     * Tenant isolation:
+     *
+     * The controller/service layer resolves the organization
+     * before loading the conversation. At this point we make
+     * sure the conversation and lead still belong to the same
+     * organization before allowing qualification memory to
+     * mutate and save.
+     */
+    if (
+      !validateConversationLeadOrganization(
+        conversation,
+        lead
+      )
+    ) {
+      throw new Error(
+        "Conversation and lead organization mismatch."
+      );
     }
 
     const missing =
@@ -1089,6 +1304,9 @@ export const updateConversationQualification =
 
     console.dir(
       {
+        organizationId:
+          conversation.organizationId,
+
         stage:
           conversation.stage,
 
@@ -1182,6 +1400,11 @@ export const updateConversationQualification =
 
     console.log(
       "🧠 Conversation qualification synchronized."
+    );
+
+    console.log(
+      "🧠 Final Conversation Organization:",
+      conversation.organizationId
     );
 
     console.log(

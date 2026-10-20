@@ -111,7 +111,8 @@ const normalizePhone = (
 export const sendWhatsAppMessage = async (
   phone,
   message,
-  phoneNumberId
+  phoneNumberId,
+  context = {}
 ) => {
 
   const {
@@ -129,6 +130,26 @@ export const sendWhatsAppMessage = async (
     normalizePhone(
       phone
     );
+
+
+  const idempotencyKey =
+    context?.idempotencyKey || null;
+
+  const messageId =
+    context?.messageId || null;
+
+  const deliveryJobId =
+    context?.deliveryJobId || null;
+
+
+  console.log(
+    "🔑 WHATSAPP DELIVERY IDENTITY:",
+    {
+      idempotencyKey,
+      messageId,
+      deliveryJobId,
+    }
+  );
 
 
   if (
@@ -195,18 +216,16 @@ export const sendWhatsAppMessage = async (
         },
 
         {
+  timeout: 25_000,
 
-          headers: {
+  headers: {
+    Authorization:
+      `Bearer ${accessToken}`,
 
-            Authorization:
-              `Bearer ${accessToken}`,
-
-            "Content-Type":
-              "application/json",
-
-          },
-
-        }
+    "Content-Type":
+      "application/json",
+  },
+}
 
       );
 
@@ -216,6 +235,21 @@ export const sendWhatsAppMessage = async (
       response.data
     );
 
+
+        const providerMessageId =
+      response.data?.messages?.[0]?.id || null;
+
+    if (!providerMessageId) {
+      console.error(
+        "WHATSAPP_PROVIDER_MESSAGE_ID_MISSING",
+        {
+          phoneNumberId:
+            organizationPhoneNumberId,
+          providerStatus:
+            response.status,
+        }
+      );
+    }
 
     return {
 
@@ -237,8 +271,30 @@ export const sendWhatsAppMessage = async (
       phoneNumberId:
         organizationPhoneNumberId,
 
+      providerMessageId,
+
       providerResponse:
         response.data,
+
+
+          /*
+   * TEST-ONLY DIAGNOSTICS
+   * --------------------------------------------------------
+   * Expose the identity received by this adapter only when
+   * explicitly enabled by a test.
+   *
+   * This does not claim that Meta deduplicates requests.
+   * The test must mock axios.post to prevent real HTTP calls.
+   */
+  ...(process.env.TEST_CAPTURE_PROVIDER_IDEMPOTENCY === "true"
+    ? {
+        testProviderIdentity: {
+          idempotencyKey,
+          messageId,
+          deliveryJobId,
+        },
+      }
+    : {}),
 
     };
 

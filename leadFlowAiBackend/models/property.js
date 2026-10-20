@@ -680,8 +680,37 @@ MODEL
 ============================================================
 */
 
+const existingPropertyModel =
+  mongoose.models.Property;
+
+/*
+ * ----------------------------------------------------------
+ * DEVELOPMENT / RUNTIME SAFETY
+ * ----------------------------------------------------------
+ *
+ * LeadFlow AI requires organizationId on EVERY Property.
+ *
+ * If an older Property model was already compiled in the
+ * current Node process without organizationId, reusing that
+ * model could silently discard the tenant field.
+ *
+ * Detect that situation explicitly.
+ */
+
+if (
+  existingPropertyModel &&
+  !existingPropertyModel.schema.path(
+    "organizationId"
+  )
+) {
+
+  throw new Error(
+    "INVALID PROPERTY MODEL: The currently loaded Property model does not contain organizationId. Restart the backend so the current Property schema is compiled."
+  );
+}
+
 const Property =
-  mongoose.models.Property ||
+  existingPropertyModel ||
   mongoose.model(
     "Property",
     propertySchema

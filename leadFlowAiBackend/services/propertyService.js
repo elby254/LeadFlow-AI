@@ -998,103 +998,283 @@ class PropertyService {
   }
 
 
-  /* ========================================================
-     CREATE PROPERTY
-  ======================================================== */
+/* ========================================================
+   CREATE PROPERTY
+======================================================== */
 
-  async createProperty(
-    data,
-    organizationId,
-    userId
-  ) {
+async createProperty(
+  data,
+  organizationId,
+  userId
+) {
 
-    const safeData = {
-      ...(data || {}),
-    };
+  /* --------------------------------------------------------
+     ORGANIZATION VALIDATION
+  -------------------------------------------------------- */
 
+  if (!organizationId) {
 
-    delete safeData.organizationId;
-
-    delete safeData._id;
-
-
-    if (
-      safeData.propertyType !==
-      undefined
-    ) {
-
-      safeData.propertyType =
-        this.normalizePropertyType(
-          safeData.propertyType
-        );
-    }
-
-
-    if (
-      safeData.status !==
-      undefined
-    ) {
-
-      safeData.status =
-        this.normalizeStatus(
-          safeData.status
-        );
-    }
-
-
-    const propertyData = {
-
-      ...safeData,
-
-      organizationId,
-
-    };
-
-
-    const property =
-      await Property.create(
-        propertyData
-      );
-
-
-    await this.recordPriceChange({
-
-      property:
-        property._id,
-
-      organizationId,
-
-      previousPrice:
-        property.price,
-
-      newPrice:
-        property.price,
-
-      currency:
-        property.currency ||
-        "KES",
-
-      changeType:
-        "initial",
-
-      changedBy:
-        userId,
-
-      reason:
-        "Initial property listing",
-
-    });
-
-
-    return await this.getPropertyById(
-
-      property._id,
-
-      organizationId
-
+    throw new Error(
+      "Organization ID is required when creating a property."
     );
+
   }
 
+
+  /* --------------------------------------------------------
+     PROPERTY MODEL VALIDATION
+     
+     Prevent creation if an old/stale Property model has
+     been loaded without organizationId.
+  -------------------------------------------------------- */
+
+  if (
+    !Property.schema.path(
+      "organizationId"
+    )
+  ) {
+
+    throw new Error(
+      "Property model is invalid: organizationId field is missing from the loaded Mongoose schema."
+    );
+
+  }
+
+
+  /* --------------------------------------------------------
+     NORMALIZE ORGANIZATION ID
+     
+     Always convert to a real MongoDB ObjectId.
+  -------------------------------------------------------- */
+
+  let normalizedOrganizationId;
+
+  try {
+
+    normalizedOrganizationId =
+      new Property.base.Types.ObjectId(
+        String(
+          organizationId
+        )
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      `Invalid organization ID: ${organizationId}`
+    );
+
+  }
+
+
+  /* --------------------------------------------------------
+     SAFE PROPERTY DATA
+     
+     NEVER trust organizationId from the request body.
+  -------------------------------------------------------- */
+
+  const safeData = {
+    ...(data || {}),
+  };
+
+
+  delete safeData.organizationId;
+
+  delete safeData._id;
+
+
+  /* --------------------------------------------------------
+     PROPERTY TYPE
+  -------------------------------------------------------- */
+
+  if (
+    safeData.propertyType !==
+    undefined
+  ) {
+
+    safeData.propertyType =
+      this.normalizePropertyType(
+        safeData.propertyType
+      );
+
+  }
+
+
+  /* --------------------------------------------------------
+     STATUS
+  -------------------------------------------------------- */
+
+  if (
+    safeData.status !==
+    undefined
+  ) {
+
+    safeData.status =
+      this.normalizeStatus(
+        safeData.status
+      );
+
+  }
+
+
+  /* --------------------------------------------------------
+     COVER IMAGE
+     
+     Property creation does not own image assignment.
+  -------------------------------------------------------- */
+
+  safeData.coverImage =
+    null;
+
+
+  /* --------------------------------------------------------
+     FINAL PROPERTY PAYLOAD
+     
+     organizationId is injected ONLY by the backend.
+  -------------------------------------------------------- */
+
+  const propertyData = {
+
+    ...safeData,
+
+    organizationId:
+      normalizedOrganizationId,
+
+  };
+
+
+  /* --------------------------------------------------------
+     DEBUG
+  -------------------------------------------------------- */
+
+  console.log(
+    "🏢 CREATE PROPERTY ORGANIZATION:",
+    {
+      organizationId:
+        String(
+          normalizedOrganizationId
+        ),
+
+      userId:
+        userId
+          ? String(userId)
+          : null,
+
+      title:
+        safeData.title,
+
+      propertyType:
+        safeData.propertyType,
+
+      location:
+        safeData.location,
+    }
+  );
+
+
+  /* --------------------------------------------------------
+     CREATE PROPERTY
+  -------------------------------------------------------- */
+
+  const property =
+    await Property.create(
+      propertyData
+    );
+
+
+  /* --------------------------------------------------------
+     POST-CREATE SAFETY CHECK
+     
+     Never allow a property to continue through the
+     workflow without organization ownership.
+  -------------------------------------------------------- */
+
+  if (
+    !property.organizationId
+  ) {
+
+    console.error(
+      "❌ PROPERTY CREATED WITHOUT ORGANIZATION ID:",
+      property._id
+    );
+
+
+    throw new Error(
+      "Property creation failed: organizationId was not persisted."
+    );
+
+  }
+
+
+  /* --------------------------------------------------------
+     VERIFY TENANT
+     
+     Make absolutely certain MongoDB persisted the same
+     organization that authenticated the request.
+  -------------------------------------------------------- */
+
+  if (
+    String(
+      property.organizationId
+    ) !==
+    String(
+      normalizedOrganizationId
+    )
+  ) {
+
+    throw new Error(
+      "Property creation failed: persisted organizationId does not match the authenticated organization."
+    );
+
+  }
+
+
+  /* --------------------------------------------------------
+     RECORD INITIAL PRICE
+  -------------------------------------------------------- */
+
+  await this.recordPriceChange({
+
+    property:
+      property._id,
+
+    organizationId:
+      normalizedOrganizationId,
+
+    previousPrice:
+      property.price,
+
+    newPrice:
+      property.price,
+
+    currency:
+      property.currency ||
+      "KES",
+
+    changeType:
+      "initial",
+
+    changedBy:
+      userId,
+
+    reason:
+      "Initial property listing",
+
+  });
+
+
+  /* --------------------------------------------------------
+     RETURN ORGANIZATION-SCOPED PROPERTY
+  -------------------------------------------------------- */
+
+  return await this.getPropertyById(
+
+    property._id,
+
+    normalizedOrganizationId
+
+  );
+}
 
   /* ========================================================
      UPDATE PROPERTY

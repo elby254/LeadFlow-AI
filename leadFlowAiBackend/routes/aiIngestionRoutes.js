@@ -10,57 +10,42 @@
  * PURPOSE
  * ------------------------------------------------------------
  *
- * Central HTTP entry point for normalized incoming messages.
+ * Central HTTP entry point for website/direct message
+ * ingestion.
  *
  *
- * CHANNEL ARCHITECTURE
+ * PUBLIC REQUEST CONTRACT
  * ------------------------------------------------------------
  *
- * WhatsApp
- *    ↓
- * WhatsApp webhook / adapter
- *    ↓
- * normalized payload
- *    ↓
- * aiIngestionRoutes
- *    ↓
- * aiIngestionController
- *    ↓
- * deterministic extraction
- *    ↓
- * Lead / Conversation
- *    ↓
- * AI Auto Reply
- *    ↓
- * source-based transport
- *    ↓
- * WhatsApp / SMS
+ * Body:
+ *
+ * {
+ *   "phone": "+254712345678",
+ *   "message": "I want a 3 bedroom house in Kilimani."
+ * }
+ *
+ *
+ * Tenant routing:
+ *
+ * X-LeadFlow-Website-Key: <websiteKey>
  *
  *
  * IMPORTANT
  * ------------------------------------------------------------
  *
- * This route does NOT:
+ * The client does NOT send organizationId in the body.
  *
- * - extract intent
- * - call OpenAI directly
- * - persist Lead.intent directly
- * - send SMS
- * - send WhatsApp
- * - determine the customer's intent
+ * The route establishes:
  *
+ *     source = "website"
  *
- * Those responsibilities belong to the appropriate layers.
+ * The centralized organization resolver establishes:
  *
- *
- * RESPONSIBILITIES
- * ------------------------------------------------------------
- *
- * 1. Receive normalized ingestion requests.
- * 2. Pass the request to aiIngestionController.
- * 3. Keep channel-specific transport logic outside the
- *    ingestion controller.
- *
+ *     websiteKey
+ *          ↓
+ *     Organization
+ *          ↓
+ *     organizationId
  *
  * ============================================================
  */
@@ -84,45 +69,18 @@ const router =
 // POST /
 // ============================================================
 //
-// Receives a normalized incoming customer message.
+// POST /api/ai-ingestion
 //
-// Expected structure:
+// Body:
 //
 // {
-//   organizationId: "...",
-//
-//   source: "whatsapp",
-//
-//   customer: {
-//
-//     name: "...",
-//
-//     phone: "...",
-//
-//   },
-//
-//   message: "I want to rent a house.",
-//
-//   whatsapp: {
-//
-//     messageId: "...",
-//
-//     phoneNumberId: "...",
-//
-//     businessNumber: "...",
-//
-//   },
-//
+//   "phone": "+254712345678",
+//   "message": "I want a house in Kilimani."
 // }
 //
-// The exact channel-specific metadata may differ.
+// Header:
 //
-// The important fields are:
-//
-// organizationId
-// source
-// customer
-// message
+// X-LeadFlow-Website-Key: lfw_...
 //
 // ============================================================
 
@@ -145,16 +103,15 @@ router.post(
       );
 
       console.log(
-        "=================================================="
-      );
+        "==================================================");
 
 
       // ======================================================
-      // DEBUG REQUEST
+      // DEBUG REQUEST BODY
       // ======================================================
 
       console.log(
-        "📦 AI INGESTION REQUEST BODY:"
+        "📦 RAW AI INGESTION REQUEST BODY:"
       );
 
       console.dir(
@@ -166,7 +123,7 @@ router.post(
 
 
       // ======================================================
-      // BASIC VALIDATION
+      // BASIC BODY VALIDATION
       // ======================================================
 
       const body =
@@ -174,12 +131,14 @@ router.post(
 
 
       if (
-        !body.source
+        typeof body !== "object" ||
+        Array.isArray(body)
       ) {
 
         console.warn(
-          "⚠️ AI ingestion request has no source."
+          "⚠️ AI ingestion request body must be an object."
         );
+
 
         return res
           .status(400)
@@ -189,20 +148,59 @@ router.post(
               false,
 
             message:
-              "Message source is required.",
+              "Request body must be a JSON object.",
 
           });
+
       }
 
 
+      // ======================================================
+      // PHONE VALIDATION
+      // ======================================================
+
+      if (
+        !body.phone ||
+        !String(
+          body.phone
+        ).trim()
+      ) {
+
+        console.warn(
+          "⚠️ AI ingestion request has no phone."
+        );
+
+
+        return res
+          .status(400)
+          .json({
+
+            success:
+              false,
+
+            message:
+              "Phone is required.",
+
+          });
+
+      }
+
+
+      // ======================================================
+      // MESSAGE VALIDATION
+      // ======================================================
+
       if (
         !body.message ||
-        !String(body.message).trim()
+        !String(
+          body.message
+        ).trim()
       ) {
 
         console.warn(
           "⚠️ AI ingestion request has no message."
         );
+
 
         return res
           .status(400)
@@ -215,133 +213,94 @@ router.post(
               "Message is required.",
 
           });
+
       }
 
 
       // ======================================================
-      // SUPPORTED SOURCES
+      // WEBSITE SOURCE
       // ======================================================
       //
-      // The source should have already been established by
-      // the trusted channel adapter/webhook.
+      // This route represents direct website ingestion.
       //
-      // The customer must NEVER be allowed to arbitrarily
-      // choose an organization.
+      // source is trusted infrastructure metadata.
       //
-      // ======================================================
-
-      const supportedSources = [
-
-        "whatsapp",
-
-        "sms",
-
-        "facebook",
-
-      ];
-
-
-      const source =
-        String(
-          body.source
-        )
-          .trim()
-          .toLowerCase();
-
-
-      if (
-        !supportedSources.includes(
-          source
-        )
-      ) {
-
-        console.warn(
-          "⚠️ Unsupported ingestion source:",
-          body.source
-        );
-
-        return res
-          .status(400)
-          .json({
-
-            success:
-              false,
-
-            message:
-              "Unsupported message source.",
-
-          });
-      }
-
-
-      // ======================================================
-      // NORMALIZED SOURCE
-      // ======================================================
-      //
-      // Make sure downstream services receive the canonical
-      // source value.
+      // It is NOT accepted from req.body.
       //
       // ======================================================
 
-      const normalizedBody = {
+      req.source =
+        "website";
 
-        ...body,
-
-        source,
-
-      };
+      req.channel =
+        "website";
 
 
       console.log(
         "📡 AI INGESTION SOURCE:",
-        source
+        req.source
       );
 
 
       // ======================================================
-      // ORGANIZATION
+      // WEBSITE TENANT ROUTING KEY
       // ======================================================
       //
-      // Organization resolution should happen BEFORE this
-      // layer for external channels.
+      // Canonical header:
       //
-      // Examples:
+      // X-LeadFlow-Website-Key
       //
-      // WhatsApp:
+      // The header identifies the organization's website.
       //
-      // Meta phone_number_id
-      //        ↓
-      // WhatsApp organization resolver
-      //        ↓
-      // organizationId
+      // It does NOT grant dashboard permissions.
       //
+      // ======================================================
+
+      const websiteKey =
+        typeof req.get ===
+          "function"
+
+          ? (
+              req.get(
+                "X-LeadFlow-Website-Key"
+              ) || ""
+            ).trim()
+
+          : (
+              req.headers?.[
+                "x-leadflow-website-key"
+              ] ||
+              ""
+            ).trim();
+
+
+      const authenticatedOrganizationId =
+        req?.user?.organizationId ||
+        req?.organization?._id ||
+        req?.organization?.id ||
+        null;
+
+
+      // ======================================================
+      // WEBSITE ROUTING KEY VALIDATION
+      // ======================================================
       //
-      // SMS:
+      // Public website/Postman requests need the website key.
       //
-      // configured business number / provider metadata
-      //        ↓
-      // organization resolver
-      //        ↓
-      // organizationId
-      //
-      //
-      // Facebook:
-      //
-      // page ID
-      //        ↓
-      // Facebook organization resolver
-      //        ↓
-      // organizationId
+      // Trusted authenticated internal requests may resolve
+      // their organization through req.user / req.organization.
       //
       // ======================================================
 
       if (
-        !normalizedBody.organizationId
+        !websiteKey &&
+        !authenticatedOrganizationId
       ) {
 
         console.warn(
-          "⚠️ AI ingestion request has no resolved organizationId."
+          "⚠️ AI ingestion request has no website routing key."
         );
+
 
         return res
           .status(400)
@@ -351,108 +310,85 @@ router.post(
               false,
 
             message:
-              "Organization could not be resolved.",
+              "Website routing key is required.",
 
           });
+
       }
 
 
-      // ======================================================
-      // NORMALIZED PAYLOAD
-      // ======================================================
+      if (
+        websiteKey
+      ) {
 
-      const normalizedPayload = {
+        req.websiteKey =
+          websiteKey;
 
-        ...normalizedBody,
-
-        customer:
-          normalizedBody.customer ||
-          {},
-
-      };
+      }
 
 
       console.log(
-        "🧠 NORMALIZED AI INGESTION PAYLOAD:"
-      );
-
-      console.dir(
-        normalizedPayload,
-        {
-          depth: null,
-        }
+        "🌐 WEBSITE TENANT KEY PRESENT:",
+        Boolean(
+          websiteKey
+        )
       );
 
 
       // ======================================================
-      // PASS TO CONTROLLER
-      // ======================================================
-      //
-      // The controller owns the actual AI ingestion workflow.
-      //
-      // Route
-      //   ↓
-      // Controller
-      //   ↓
-      // Lead resolution
-      //   ↓
-      // deterministic extraction
-      //   ↓
-      // intent persistence
-      //   ↓
-      // conversation state
-      //   ↓
-      // AI response
-      //   ↓
-      // auto reply
-      //
-      // ======================================================
-
-      const result =
-        await ingestMessage({
-
-          body:
-            normalizedPayload,
-
-        });
-
-
-      // ======================================================
-      // CONTROLLER RESULT
+      // ORGANIZATION DEBUG CONTEXT
       // ======================================================
 
       console.log(
-        "🧠 AI INGESTION CONTROLLER RESULT:"
+        "🏢 AI INGESTION ORGANIZATION CONTEXT:"
       );
 
-      console.dir(
-        result,
-        {
-          depth: null,
-        }
+      console.log({
+
+        authenticatedOrganizationId:
+          authenticatedOrganizationId,
+
+        websiteKeyPresent:
+          Boolean(
+            websiteKey
+          ),
+
+      });
+
+
+      // ======================================================
+      // FORWARD ORIGINAL EXPRESS REQUEST
+      // ======================================================
+      //
+      // ingestMessage expects:
+      //
+      // ingestMessage(req, res)
+      //
+      // Passing the original request preserves:
+      //
+      // req.body
+      // req.source
+      // req.channel
+      // req.websiteKey
+      // req.user
+      // req.organization
+      //
+      // ======================================================
+
+      console.log(
+        "🚀 FORWARDING REQUEST TO AI INGESTION CONTROLLER..."
       );
 
 
-      // ======================================================
-      // SUCCESS
-      // ======================================================
+      return await ingestMessage(
+        req,
+        res
+      );
 
-      return res
-        .status(200)
-        .json({
 
-          success:
-            true,
-
-          ...(result || {}),
-
-        });
-
-    } catch (error) {
-
-      // ======================================================
-      // ERROR
-      // ======================================================
+    } catch (
+      error
+    ) {
 
       console.error(
         "=================================================="
@@ -478,7 +414,9 @@ router.post(
       return next(
         error
       );
+
     }
+
   }
 );
 

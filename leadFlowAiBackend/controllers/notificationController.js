@@ -26,6 +26,29 @@ import Viewing from "../models/viewing.js";
 import Lead from "../models/lead.js";
 import Property from "../models/property.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
+/* ============================================================
+   ORGANIZATION RESOLVER
+============================================================ */
+
+/**
+ * Resolve the authenticated user's active organization
+ * through the centralized organization resolver.
+ */
+const getOrganizationId = async (req) => {
+  const organization =
+    await resolveFromRequest(req);
+
+  if (!organization) {
+    return null;
+  }
+
+  return organization._id || null;
+};
+
 /* ============================================================
    CREATE NOTIFICATION
 ============================================================ */
@@ -62,11 +85,23 @@ export const notifyViewingApproved = async (
   res
 ) => {
   try {
-    const viewing = await Viewing.findById(
-      req.params.id
-    )
-      .populate("lead")
-      .populate("property");
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
+    const viewing =
+      await Viewing.findOne({
+        _id: req.params.id,
+        organizationId,
+      })
+        .populate("lead")
+        .populate("property");
 
     if (!viewing) {
       return res.status(404).json({
@@ -76,8 +111,7 @@ export const notifyViewingApproved = async (
     }
 
     await createNotification({
-      organizationId:
-        viewing.organizationId,
+      organizationId,
 
       userId:
         viewing.requestedBy,
@@ -117,10 +151,22 @@ export const notifyViewingApproved = async (
 export const notifyViewingRejected =
   async (req, res) => {
     try {
+      const organizationId =
+        await getOrganizationId(req);
+
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Authentication required",
+        });
+      }
+
       const viewing =
-        await Viewing.findById(
-          req.params.id
-        )
+        await Viewing.findOne({
+          _id: req.params.id,
+          organizationId,
+        })
           .populate("lead")
           .populate("property");
 
@@ -133,8 +179,7 @@ export const notifyViewingRejected =
       }
 
       await createNotification({
-        organizationId:
-          viewing.organizationId,
+        organizationId,
 
         userId:
           viewing.requestedBy,
@@ -174,10 +219,22 @@ export const notifyViewingRejected =
 export const notifyViewingRescheduled =
   async (req, res) => {
     try {
+      const organizationId =
+        await getOrganizationId(req);
+
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Authentication required",
+        });
+      }
+
       const viewing =
-        await Viewing.findById(
-          req.params.id
-        )
+        await Viewing.findOne({
+          _id: req.params.id,
+          organizationId,
+        })
           .populate("lead")
           .populate("property");
 
@@ -190,8 +247,7 @@ export const notifyViewingRescheduled =
       }
 
       await createNotification({
-        organizationId:
-          viewing.organizationId,
+        organizationId,
 
         userId:
           viewing.requestedBy,
@@ -232,10 +288,22 @@ export const notifyViewingRescheduled =
 export const notifyViewingCancelled =
   async (req, res) => {
     try {
+      const organizationId =
+        await getOrganizationId(req);
+
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Authentication required",
+        });
+      }
+
       const viewing =
-        await Viewing.findById(
-          req.params.id
-        )
+        await Viewing.findOne({
+          _id: req.params.id,
+          organizationId,
+        })
           .populate("lead")
           .populate("property");
 
@@ -248,8 +316,7 @@ export const notifyViewingCancelled =
       }
 
       await createNotification({
-        organizationId:
-          viewing.organizationId,
+        organizationId,
 
         userId:
           viewing.requestedBy,
@@ -290,10 +357,22 @@ export const notifyViewingCancelled =
 export const sendViewingReminder =
   async (req, res) => {
     try {
+      const organizationId =
+        await getOrganizationId(req);
+
+      if (!organizationId) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Authentication required",
+        });
+      }
+
       const viewing =
-        await Viewing.findById(
-          req.params.id
-        )
+        await Viewing.findOne({
+          _id: req.params.id,
+          organizationId,
+        })
           .populate("lead")
           .populate("property");
 
@@ -306,8 +385,7 @@ export const sendViewingReminder =
       }
 
       await createNotification({
-        organizationId:
-          viewing.organizationId,
+        organizationId,
 
         userId:
           viewing.requestedBy,

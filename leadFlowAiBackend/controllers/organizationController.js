@@ -23,6 +23,10 @@
  *
  * The authenticated user's organizationId is authoritative.
  *
+ * Organization resolution is centralized through:
+ *
+ * organizationResolverService.js
+ *
  * WhatsApp configuration belongs to the Organization document.
  *
  * ==========================================================
@@ -30,30 +34,36 @@
 
 import Organization from "../models/organization.js";
 
+import {
+  resolveFromRequest,
+  resolveByWhatsApp,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    HELPERS
 ========================================================== */
 
 /**
- * Get the authenticated organization's ID.
+ * Resolve the authenticated organization.
  *
- * The authentication middleware already attaches:
+ * IMPORTANT
+ * ----------------------------------------------------------
  *
- * req.user.organizationId
+ * Organization resolution is centralized through the shared
+ * organizationResolverService.
  *
  * We intentionally do NOT trust:
  *
  * req.body.organizationId
  * req.params.organizationId
  * req.query.organizationId
+ *
+ * The authenticated request context is authoritative.
  */
-const getAuthenticatedOrganizationId = (req) => {
-  return (
-    req.user?.organizationId ||
-    req.organizationId ||
-    null
-  );
-};
+const getAuthenticatedOrganization =
+  async (req) => {
+    return resolveFromRequest(req);
+  };
 
 /**
  * Normalize optional string values.
@@ -120,10 +130,16 @@ const serializeWhatsAppConfig = (
 export const getWhatsAppConfiguration =
   async (req, res) => {
     try {
-      const organizationId =
-        getAuthenticatedOrganizationId(req);
+      /* ====================================================
+         RESOLVE AUTHENTICATED ORGANIZATION
+      ==================================================== */
 
-      if (!organizationId) {
+      const organization =
+        await getAuthenticatedOrganization(
+          req
+        );
+
+      if (!organization) {
         return res.status(403).json({
           success: false,
           message:
@@ -131,28 +147,9 @@ export const getWhatsAppConfiguration =
         });
       }
 
-      const organization =
-        await Organization.findById(
-          organizationId
-        ).select(
-          [
-            "_id",
-            "name",
-            "whatsappPhoneNumberId",
-            "whatsappBusinessNumber",
-            "whatsappBusinessAccountId",
-            "whatsappDisplayName",
-            "whatsappEnabled",
-          ].join(" ")
-        );
-
-      if (!organization) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Organization not found",
-        });
-      }
+      /* ====================================================
+         RETURN SAFE WHATSAPP CONFIGURATION
+      ==================================================== */
 
       return res.status(200).json({
         success: true,
@@ -196,16 +193,25 @@ export const getWhatsAppConfiguration =
 export const updateWhatsAppConfiguration =
   async (req, res) => {
     try {
-      const organizationId =
-        getAuthenticatedOrganizationId(req);
+      /* ====================================================
+         RESOLVE AUTHENTICATED ORGANIZATION
+      ==================================================== */
 
-      if (!organizationId) {
+      const organization =
+        await getAuthenticatedOrganization(
+          req
+        );
+
+      if (!organization) {
         return res.status(403).json({
           success: false,
           message:
             "Authenticated organization is required",
         });
       }
+
+      const organizationId =
+        organization._id;
 
       /* ====================================================
          EXTRACT ONLY ALLOWED FIELDS
@@ -265,26 +271,34 @@ export const updateWhatsAppConfiguration =
          CHECK PHONE NUMBER ID OWNERSHIP
       ====================================================
       
-      A Meta phone_number_id must belong to only one
-      LeadFlow AI organization.
+      Organization resolution is centralized through
+      organizationResolverService.js.
       
-      The Organization model also has a unique sparse
-      index, but we perform an explicit check so the API
-      can return a useful conflict response.
-      */
+      The shared resolver checks whether the supplied
+      WhatsApp phone_number_id already belongs to an
+      active/enabled LeadFlow AI organization.
+      
+      If it resolves to the same organization, that is
+      allowed.
+      
+      If it resolves to another organization, return
+      a conflict response.
+      
+      The Organization schema's unique sparse index
+      remains the final database-level protection.
+      ==================================================== */
 
       if (normalizedPhoneNumberId) {
         const existingOrganization =
-          await Organization.findOne({
-            whatsappPhoneNumberId:
-              normalizedPhoneNumberId,
+          await resolveByWhatsApp(
+            normalizedPhoneNumberId
+          );
 
-            _id: {
-              $ne: organizationId,
-            },
-          }).select("_id name");
-
-        if (existingOrganization) {
+        if (
+          existingOrganization &&
+          existingOrganization._id.toString() !==
+            organizationId.toString()
+        ) {
           return res.status(409).json({
             success: false,
             message:
@@ -318,14 +332,14 @@ export const updateWhatsAppConfiguration =
          UPDATE ORGANIZATION
       ==================================================== */
 
-      const organization =
+      const updatedOrganization =
         await Organization.findByIdAndUpdate(
           organizationId,
           {
             $set: updates,
           },
           {
-            new: true,
+            returnDocument: 'after',
             runValidators: true,
           }
         ).select(
@@ -340,7 +354,7 @@ export const updateWhatsAppConfiguration =
           ].join(" ")
         );
 
-      if (!organization) {
+      if (!updatedOrganization) {
         return res.status(404).json({
           success: false,
           message:
@@ -348,22 +362,30 @@ export const updateWhatsAppConfiguration =
         });
       }
 
+      /* ====================================================
+         SUCCESS LOG
+      ==================================================== */
+
       console.log(
         "✅ WhatsApp organization configuration updated:",
         {
           organizationId:
-            organization._id.toString(),
+            updatedOrganization._id.toString(),
 
           organizationName:
-            organization.name,
+            updatedOrganization.name,
 
           whatsappPhoneNumberId:
-            organization.whatsappPhoneNumberId,
+            updatedOrganization.whatsappPhoneNumberId,
 
           whatsappEnabled:
-            organization.whatsappEnabled,
+            updatedOrganization.whatsappEnabled,
         }
       );
+
+      /* ====================================================
+         RESPONSE
+      ==================================================== */
 
       return res.status(200).json({
         success: true,
@@ -372,7 +394,7 @@ export const updateWhatsAppConfiguration =
 
         data:
           serializeWhatsAppConfig(
-            organization
+            updatedOrganization
           ),
       });
     } catch (error) {

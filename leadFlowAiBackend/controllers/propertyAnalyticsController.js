@@ -43,20 +43,45 @@ import User from "../models/user.js";
 
 import propertyService from "../services/propertyService.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    HELPERS
    ========================================================== */
 
 /**
- * Resolve organization ID from authenticated request.
+ * Resolve organization through the centralized
+ * organization-resolution boundary.
  *
- * Different middleware layers may expose organizationId
- * directly on req or through req.user.
+ * IMPORTANT
+ * ----------
+ * Organization identity is never taken directly from:
+ *
+ *   • req.body
+ *   • req.query
+ *   • req.params
+ *   • req.user.organizationId
+ *   • req.organizationId
+ *
+ * The centralized organizationResolverService.js is the
+ * trusted resolution boundary.
  */
-const getOrganizationId = (req) => {
+const getOrganizationId = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (!organization) {
+    return null;
+  }
+
   return (
-    req.organizationId ||
-    req.user?.organizationId ||
+    organization._id ||
     null
   );
 };
@@ -65,8 +90,12 @@ const getOrganizationId = (req) => {
 /**
  * Convert a value to a safe number.
  */
-const toNumber = (value, fallback = 0) => {
-  const number = Number(value);
+const toNumber = (
+  value,
+  fallback = 0
+) => {
+  const number =
+    Number(value);
 
   return Number.isFinite(number)
     ? number
@@ -77,13 +106,22 @@ const toNumber = (value, fallback = 0) => {
 /**
  * Safely calculate percentage.
  */
-const percentage = (numerator, denominator) => {
-  if (!denominator || denominator <= 0) {
+const percentage = (
+  numerator,
+  denominator
+) => {
+  if (
+    !denominator ||
+    denominator <= 0
+  ) {
     return 0;
   }
 
   return Number(
-    ((numerator / denominator) * 100).toFixed(2)
+    (
+      (numerator / denominator) *
+      100
+    ).toFixed(2)
   );
 };
 
@@ -92,7 +130,9 @@ const percentage = (numerator, denominator) => {
  * Normalize MongoDB ObjectId values to strings
  * when required for grouping.
  */
-const idToString = (value) => {
+const idToString = (
+  value
+) => {
   if (!value) {
     return null;
   }
@@ -119,7 +159,9 @@ export const getPropertyAnalytics = async (
 ) => {
   try {
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(
+        req
+      );
 
     if (!organizationId) {
       return res.status(400).json({
@@ -214,7 +256,9 @@ export const getPropertyPerformance = async (
 ) => {
   try {
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(
+        req
+      );
 
     if (!organizationId) {
       return res.status(400).json({
@@ -521,7 +565,9 @@ export const getPropertyOccupancy = async (
 ) => {
   try {
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(
+        req
+      );
 
     if (!organizationId) {
       return res.status(400).json({
@@ -703,7 +749,9 @@ export const getPropertyViewingAnalytics = async (
 ) => {
   try {
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(
+        req
+      );
 
     if (!organizationId) {
       return res.status(400).json({
@@ -1046,7 +1094,9 @@ export const getPropertyRevenueAnalytics = async (
 ) => {
   try {
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(
+        req
+      );
 
     if (!organizationId) {
       return res.status(400).json({

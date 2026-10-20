@@ -10,8 +10,8 @@
  * Central intelligence engine responsible for:
  *
  * ✓ Converting lead information into a score from 0–100
- * ✓ Applying weighted qualification rules
- * ✓ Classifying leads into lifecycle stages
+ * ✓ Applying weighted scoring rules
+ * ✓ Classifying leads into score bands
  * ✓ Supporting organization-level scoring configuration
  * ✓ Feeding the AI ingestion workflow
  * ✓ Feeding the lead lifecycle workflow
@@ -19,29 +19,94 @@
  *
  * ===========================================================
  *
- * LIFECYCLE ALIGNMENT
- * ------------------------------------------------------------
- *
- * Score       Category       Assignment Strategy
- * ------------------------------------------------------------
- * 0–49        new            Round robin
- * 50–79       qualified      Least-busy agent
- * 80–100      hot            Best-performing agent
+ * CANONICAL ARCHITECTURE
+ * ===========================================================
  *
  * IMPORTANT
  * ------------------------------------------------------------
- * This service ONLY calculates score/category.
  *
- * It does NOT assign agents.
+ * This service owns:
  *
- * Agent assignment is handled by:
+ *     LEAD SCORE
+ *     LEAD SCORE CATEGORY
  *
- * services/leadAutoAssignmentService.js
+ * It does NOT own:
+ *
+ *     Lead.status
+ *     Agent assignment
+ *     Viewing state
+ *     Follow-up state
+ *
+ * Those responsibilities belong to separate services.
+ *
+ * ------------------------------------------------------------
+ *
+ * LIFECYCLE AUTHORITY
+ * ------------------------------------------------------------
+ *
+ * services/leadLifeCycleService.js
+ *
+ * Canonical Lead.status values:
+ *
+ *     new
+ *     contacted
+ *     qualified
+ *     viewing
+ *     negotiation
+ *     won
+ *     lost
+ *
+ * ------------------------------------------------------------
+ *
+ * SCORING AUTHORITY
+ * ------------------------------------------------------------
+ *
+ * This service calculates:
+ *
+ *     score:    0–100
+ *
+ *     category:
+ *       new
+ *       qualified
+ *       hot
+ *
+ * IMPORTANT:
+ *
+ * "hot" is a SCORE CATEGORY.
+ *
+ * "hot" is NOT a Lead.status value.
+ *
+ * ===========================================================
+ *
+ * CANONICAL SCORE BANDS
+ * ===========================================================
+ *
+ * Score       Category
+ * --------------------
+ *
+ * 0–49        new
+ * 50–79       qualified
+ * 80–100      hot
+ *
+ * HOT_THRESHOLD = 80
+ *
+ * ===========================================================
+ *
+ * SCORE WEIGHTS
+ * ===========================================================
+ *
+ * intent      30
+ * budget      25
+ * location    20
+ * bedrooms    15
+ * urgency     10
+ *
+ * Total       100
  *
  * ===========================================================
  *
  * INTENT ALIGNMENT
- * ------------------------------------------------------------
+ * ===========================================================
  *
  * Lead.intent is the customer's expressed transaction intent.
  *
@@ -51,91 +116,181 @@
  *     rent
  *     buy
  *
- * IMPORTANT
- * ------------------------------------------------------------
+ * This scoring engine does NOT invent customer intent.
  *
- * This engine does NOT determine customer intent.
+ * It reads the already persisted intent and uses it as a
+ * scoring signal.
  *
- * Intent is determined by the AI/deterministic extraction
- * layer and persisted through the intent persistence service.
+ * Channel source alone does NOT constitute transaction intent.
  *
- * This engine only:
+ * Example:
  *
- * ✓ Reads persisted Lead.intent
- * ✓ Normalizes it for scoring
- * ✓ Uses its existence as a scoring signal
+ * WhatsApp + no stated intent
  *
- * It does NOT convert:
+ *     intent score = 0
  *
- *     property_search -> rent
- *     property_search -> buy
+ * WhatsApp + customer explicitly wants to rent
  *
- * without explicit customer intent.
+ *     intent score = full intent weight
  *
  * ===========================================================
  */
 
-import Lead from "../models/lead.js";
+import {
+  // Intentionally no Lead model import here.
+  //
+  // Lead persistence belongs to:
+  //
+  // services/leadIntentPersistenceService.js
+} from "./leadIntentPersistenceService.js";
 
-// ============================================================
-// DEFAULT WEIGHTS
-// ============================================================
+/*
+ * The scoring engine must remain free of direct persistence
+ * responsibility.
+ *
+ * IMPORTANT:
+ * ------------------------------------------------------------
+ * The import above is intentionally NOT used directly because
+ * leadIntentPersistenceService.js imports scoring functions.
+ *
+ * To avoid a static circular dependency, the compatibility
+ * persistence wrapper below uses a dynamic import.
+ */
+
+/* ============================================================
+   CANONICAL SCORE THRESHOLDS
+============================================================ */
+
+// These values are part of the LeadFlow AI scoring contract.
 //
+// Other services should import these constants rather than
+// creating their own thresholds.
+//
+
+export const NEW_SCORE_MAX =
+  49;
+
+export const QUALIFIED_SCORE_MIN =
+  50;
+
+export const QUALIFIED_SCORE_MAX =
+  79;
+
+export const HOT_SCORE_THRESHOLD =
+  80;
+
+export const MAX_LEAD_SCORE =
+  100;
+
+/* ============================================================
+   CANONICAL SCORE CATEGORIES
+============================================================ */
+
+// IMPORTANT:
+// These are score categories, NOT Lead.status values.
+//
+
+export const LEAD_SCORE_CATEGORIES =
+  Object.freeze({
+    NEW:
+      "new",
+
+    QUALIFIED:
+      "qualified",
+
+    HOT:
+      "hot",
+  });
+
+/* ============================================================
+   DEFAULT WEIGHTS
+============================================================ */
+
 // Total = 100
-//
-// These are the global baseline weights.
 //
 // Future SaaS enhancement:
 // Each organization can have its own scoring configuration.
 //
 
-const DEFAULT_WEIGHTS = {
-  intent: 30,
-  budget: 25,
-  location: 20,
-  bedrooms: 15,
-  urgency: 10,
-};
+export const DEFAULT_WEIGHTS =
+  Object.freeze({
+    intent:
+      30,
 
-// ============================================================
-// HIGH-DEMAND LOCATIONS
-// ============================================================
+    budget:
+      25,
 
-const HIGH_DEMAND_LOCATIONS = [
-  "ruaka",
-  "kiambu",
-  "kileleshwa",
-  "westlands",
-  "ruiru",
-];
+    location:
+      20,
 
-// ============================================================
-// URGENCY KEYWORDS
-// ============================================================
+    bedrooms:
+      15,
 
-const URGENCY_KEYWORDS = [
-  "urgent",
-  "urgently",
-  "asap",
-  "immediately",
-  "immediate",
-  "as soon as possible",
-  "right away",
-  "need it now",
-  "this week",
-  "this month",
-  "today",
-  "tomorrow",
-];
+    urgency:
+      10,
+  });
 
-// ============================================================
-// INTENT VALUES
-// ============================================================
-//
-// IMPORTANT
-// ------------------------------------------------------------
-//
-// These are the canonical LeadFlow AI intent values.
+/* ============================================================
+   HIGH-DEMAND LOCATIONS
+============================================================ */
+
+export const HIGH_DEMAND_LOCATIONS =
+  Object.freeze([
+    "ruaka",
+
+    "kiambu",
+
+    "kileleshwa",
+
+    "westlands",
+
+    "ruiru",
+  ]);
+
+/* ============================================================
+   URGENCY KEYWORDS
+============================================================ */
+
+export const URGENCY_KEYWORDS =
+  Object.freeze([
+    "urgent",
+
+    "urgently",
+
+    "asap",
+
+    "immediately",
+
+    "immediate",
+
+    "as soon as possible",
+
+    "right away",
+
+    "need it now",
+
+    "this week",
+
+    "next week",
+
+    "this month",
+
+    "next month",
+
+    "today",
+
+    "tomorrow",
+
+    "within 7 days",
+
+    "within 30 days",
+  ]);
+
+/* ============================================================
+   INTENT VALUES
+============================================================ */
+
+// Canonical LeadFlow AI intent values.
 //
 // property_search:
 //     Customer is looking for a property but has NOT explicitly
@@ -147,33 +302,21 @@ const URGENCY_KEYWORDS = [
 // buy:
 //     Customer explicitly wants to buy / purchase a property.
 //
-// IMPORTANT:
-//
-// "lease" is NOT persisted as a separate intent.
-// It is normalized to:
-//
-//     rent
-//
-// "purchase" is NOT persisted as a separate intent.
-// It is normalized to:
-//
-//     buy
-//
-// ============================================================
 
-const VALID_INTENTS = [
-  "property_search",
-  "rent",
-  "buy",
-];
+export const VALID_INTENTS =
+  Object.freeze([
+    "property_search",
 
-// ============================================================
-// GET ORGANIZATION WEIGHTS
-// ============================================================
-//
-// Future multi-tenant SaaS upgrade.
-//
-// Eventually:
+    "rent",
+
+    "buy",
+  ]);
+
+/* ============================================================
+   GET ORGANIZATION WEIGHTS
+============================================================ */
+
+// Future multi-tenant SaaS upgrade:
 //
 // Organization
 //      ↓
@@ -181,81 +324,69 @@ const VALID_INTENTS = [
 //      ↓
 // Organization-specific weights
 //
-// For now we use the global baseline.
+// For now the global baseline is returned.
+//
+// IMPORTANT:
+// A copy is returned so callers cannot mutate the shared
+// DEFAULT_WEIGHTS object.
 //
 
 export const getOrgWeights = (
   organizationId
 ) => {
   if (!organizationId) {
-    return DEFAULT_WEIGHTS;
+    return {
+      ...DEFAULT_WEIGHTS,
+    };
   }
 
-  return DEFAULT_WEIGHTS;
+  return {
+    ...DEFAULT_WEIGHTS,
+  };
 };
 
-// ============================================================
-// NORMALIZE TEXT
-// ============================================================
+/* ============================================================
+   NORMALIZE TEXT
+============================================================ */
 
 const normalizeText = (
   value
 ) => {
   if (
-    value === undefined ||
-    value === null
+    value ===
+      undefined ||
+    value ===
+      null
   ) {
     return "";
   }
 
-  return String(value)
+  return String(
+    value
+  )
     .trim()
     .toLowerCase();
 };
 
-// ============================================================
-// NORMALIZE INTENT
-// ============================================================
-//
-// IMPORTANT
-// ------------------------------------------------------------
-//
-// This function normalizes equivalent intent expressions into
-// the canonical LeadFlow AI vocabulary:
+/* ============================================================
+   NORMALIZE INTENT
+============================================================ */
+
+// Equivalent expressions are normalized to:
 //
 //     property_search
 //     rent
 //     buy
 //
-// Examples:
-//
-// "Buy"
-// "BUY"
-// "buying"
-// "I want to buy"
-// "purchase"
-// "purchasing"
-//     -> buy
-//
-// "Rent"
-// "renting"
-// "rental"
-// "lease"
-// "leasing"
-// "I want to rent"
-//     -> rent
-//
-// "property_search"
-// "property search"
-// "looking for a property"
-//     -> property_search
-//
 // IMPORTANT:
+// This function does NOT infer intent from:
 //
-// This function does NOT infer transaction intent from unrelated
-// information such as budget, location, bedrooms, or move date.
+//     budget
+//     location
+//     bedrooms
+//     move date
+//     channel
 //
-// ============================================================
 
 export const normalizeIntent = (
   value
@@ -269,17 +400,23 @@ export const normalizeIntent = (
     return "";
   }
 
-  // ==========================================================
-  // BUY
-  // ==========================================================
+  /* ========================================================
+     BUY
+  ======================================================== */
 
   if (
-    intent === "buy" ||
-    intent === "buying" ||
-    intent === "purchase" ||
-    intent === "purchasing" ||
-    intent === "property_purchase" ||
-    intent === "property-purchase" ||
+    intent ===
+      "buy" ||
+    intent ===
+      "buying" ||
+    intent ===
+      "purchase" ||
+    intent ===
+      "purchasing" ||
+    intent ===
+      "property_purchase" ||
+    intent ===
+      "property-purchase" ||
     intent.includes(
       "want to buy"
     ) ||
@@ -296,18 +433,25 @@ export const normalizeIntent = (
     return "buy";
   }
 
-  // ==========================================================
-  // RENT
-  // ==========================================================
+  /* ========================================================
+     RENT
+  ======================================================== */
 
   if (
-    intent === "rent" ||
-    intent === "renting" ||
-    intent === "rental" ||
-    intent === "lease" ||
-    intent === "leasing" ||
-    intent === "property_rental" ||
-    intent === "property-rental" ||
+    intent ===
+      "rent" ||
+    intent ===
+      "renting" ||
+    intent ===
+      "rental" ||
+    intent ===
+      "lease" ||
+    intent ===
+      "leasing" ||
+    intent ===
+      "property_rental" ||
+    intent ===
+      "property-rental" ||
     intent.includes(
       "want to rent"
     ) ||
@@ -324,9 +468,9 @@ export const normalizeIntent = (
     return "rent";
   }
 
-  // ==========================================================
-  // GENERIC PROPERTY SEARCH
-  // ==========================================================
+  /* ========================================================
+     GENERIC PROPERTY SEARCH
+  ======================================================== */
 
   if (
     intent ===
@@ -351,37 +495,31 @@ export const normalizeIntent = (
     return "property_search";
   }
 
-  // ==========================================================
-  // LEGACY / OTHER VALUES
-  // ==========================================================
+  /* ========================================================
+     UNKNOWN / LEGACY
+  ======================================================== */
   //
-  // IMPORTANT:
+  // Do NOT guess.
   //
-  // We intentionally do NOT convert unrelated values such as:
+  // Example:
   //
-  //     viewing
-  //     inquiry
-  //     sell
-  //     invest
+  // viewing
+  // inquiry
+  // sell
+  // invest
   //
-  // into one of the canonical transaction intents.
+  // These are not automatically converted into rent/buy/search.
   //
-  // The scoring layer must not guess what the customer wants.
-  //
-  // Returning the normalized value here allows compatibility
-  // with existing data while VALID_INTENTS below determines
-  // whether it is a valid canonical transaction intent.
-  //
-  // ==========================================================
+  // ========================================================
 
   return intent;
 };
 
-// ============================================================
-// VALID CANONICAL INTENT
-// ============================================================
+/* ============================================================
+   VALID CANONICAL INTENT
+============================================================ */
 
-const isValidIntent = (
+export const isValidCanonicalIntent = (
   value
 ) => {
   const normalized =
@@ -394,15 +532,17 @@ const isValidIntent = (
   );
 };
 
-// ============================================================
-// NUMERIC VALUE HELPER
-// ============================================================
+/* ============================================================
+   NUMERIC VALUE HELPER
+============================================================ */
 
 const toNumber = (
   value
 ) => {
   const number =
-    Number(value);
+    Number(
+      value
+    );
 
   return Number.isFinite(
     number
@@ -411,33 +551,44 @@ const toNumber = (
     : 0;
 };
 
-// ============================================================
-// GET PERSISTED INTENT
-// ============================================================
-//
-// Reads intent without modifying the Lead.
-//
+/* ============================================================
+   NORMALIZE SCORE
+============================================================ */
+
+export const normalizeScore = (
+  score
+) => {
+  const normalized =
+    toNumber(
+      score
+    );
+
+  return Math.max(
+    0,
+
+    Math.min(
+      MAX_LEAD_SCORE,
+
+      normalized
+    )
+  );
+};
+
+/* ============================================================
+   GET PERSISTED INTENT
+============================================================ */
+
 // Priority:
 //
 // 1. lead.intent
 // 2. lead.customerIntent
 //
-// This allows compatibility with older lead documents.
+// customerIntent exists only as a legacy compatibility
+// fallback.
 //
-// IMPORTANT
-// ------------------------------------------------------------
+// Current source of truth:
+//     lead.intent
 //
-// lead.intent is the current source of truth.
-//
-// customerIntent is retained only as a compatibility fallback.
-//
-// The returned value is normalized into:
-//
-//     property_search
-//     rent
-//     buy
-//
-// ============================================================
 
 export const getPersistedLeadIntent = (
   lead
@@ -456,153 +607,91 @@ export const getPersistedLeadIntent = (
       intent
     );
 
-  // ==========================================================
-  // ONLY RETURN CANONICAL INTENTS
-  // ==========================================================
-
   if (
-    isValidIntent(
+    isValidCanonicalIntent(
       normalizedIntent
     )
   ) {
     return normalizedIntent;
   }
 
-  // ==========================================================
-  // UNKNOWN / LEGACY INTENT
-  // ==========================================================
-  //
-  // Do not invent a transaction intent.
-  //
-  // For example:
-  //
-  // viewing
-  // inquiry
-  // sell
-  // invest
-  //
-  // should not automatically become rent/buy/search.
-  //
-  // ==========================================================
-
   return "";
 };
 
-// ============================================================
-// PERSIST LEAD INTENT
-// ============================================================
-//
-// IMPORTANT
-// ------------------------------------------------------------
-//
-// This function is the explicit persistence boundary.
-//
-// Scoring functions remain pure and do NOT automatically
-// modify MongoDB.
-//
-// Call this after AI/user intent has been determined.
-//
-// Example:
-//
-// await persistLeadIntent(
-//   lead._id,
-//   extracted.intent
-// );
-//
-// IMPORTANT
-// ------------------------------------------------------------
-//
-// This compatibility function uses the same canonical intent
-// semantics as the main intent persistence service.
-//
-// Canonical values:
-//
-//     property_search
-//     rent
-//     buy
-//
-// ============================================================
+/* ============================================================
+   PERSIST LEAD INTENT — COMPATIBILITY WRAPPER
+============================================================ */
 
-export const persistLeadIntent = async (
-  leadId,
-  intent
-) => {
-  if (!leadId) {
-    throw new Error(
-      "Lead ID is required to persist intent."
-    );
-  }
+/**
+ * IMPORTANT
+ * ------------------------------------------------------------
+ *
+ * Lead scoring does NOT own persistence.
+ *
+ * Canonical persistence authority:
+ *
+ *   services/leadIntentPersistenceService.js
+ *
+ * This function remains temporarily available for compatibility
+ * with existing callers that historically imported
+ * persistLeadIntent() from this scoring engine.
+ *
+ * It delegates to the canonical persistence service.
+ *
+ * IMPORTANT:
+ * organizationId is required.
+ *
+ * The dynamic import avoids a static circular dependency because
+ * leadIntentPersistenceService.js imports calculateLeadScore()
+ * from this module.
+ */
 
-  const normalizedIntent =
-    normalizeIntent(
-      intent
-    );
+export const persistLeadIntent =
+  async (
+    leadId,
 
-  // ==========================================================
-  // NEVER WRITE UNKNOWN / EMPTY INTENT
-  // ==========================================================
+    intent,
 
-  if (
-    !isValidIntent(
-      normalizedIntent
-    )
-  ) {
-    console.log(
-      "[LeadScoringRulesEngine] Intent persistence skipped:",
-      intent || "(empty/unsupported)"
-    );
+    organizationId
+  ) => {
+    if (!organizationId) {
+      throw new Error(
+        "Organization ID is required to persist intent."
+      );
+    }
 
-    return null;
-  }
+    const {
+      persistLeadIntent:
+        canonicalPersistLeadIntent,
+    } =
+      await import(
+        "./leadIntentPersistenceService.js"
+      );
 
-  const updatedLead =
-    await Lead.findByIdAndUpdate(
+    return canonicalPersistLeadIntent(
       leadId,
-      {
-        $set: {
-          intent:
-            normalizedIntent,
-        },
-      },
-      {
-        new: true,
-        runValidators: true,
-      }
+
+      intent,
+
+      organizationId
     );
+  };
 
-  if (!updatedLead) {
-    throw new Error(
-      `Lead not found while persisting intent: ${leadId}`
-    );
-  }
+/* ============================================================
+   INTENT SCORING
+============================================================ */
 
-  console.log(
-    `[LeadScoringRulesEngine] Intent persisted: ${normalizedIntent} for lead ${leadId}`
-  );
-
-  return updatedLead;
-};
-
-// ============================================================
-// INTENT SCORING
-// ============================================================
+// Intent points are awarded ONLY when explicit canonical
+// intent exists.
+//
+// Channel source alone does NOT award intent points.
+//
 
 const calculateIntentScore = (
   lead,
+
   weights
 ) => {
-
-  // ----------------------------------------------------------
-  // IMPORTANT
-  // ----------------------------------------------------------
-  //
-  // Use the persisted intent first.
-  //
-  // This means once intent has been saved to the Lead,
-  // subsequent scoring requests continue to see it.
-  //
-  // ----------------------------------------------------------
-
   const intent =
     getPersistedLeadIntent(
       lead
@@ -610,63 +699,53 @@ const calculateIntentScore = (
 
   console.log(
     "[LeadScoringRulesEngine] Persisted intent for scoring:",
-    intent || "(none)"
+    intent ||
+      "(none)"
   );
 
   if (
-    isValidIntent(
+    isValidCanonicalIntent(
       intent
     )
   ) {
     return weights.intent;
   }
 
-  // ----------------------------------------------------------
-  // WhatsApp leads indicate active inbound intent.
-  // ----------------------------------------------------------
-
-  const source =
-    normalizeText(
-      lead.source
-    );
-
-  if (
-    source ===
-    "whatsapp"
-  ) {
-    return weights.intent;
-  }
-
-  // ----------------------------------------------------------
-  // Other known active communication channels
-  // ----------------------------------------------------------
-
-  if (
-    source === "sms" ||
-    source === "web" ||
-    source === "website" ||
-    source === "chat"
-  ) {
-    return (
-      weights.intent *
-      0.8
-    );
-  }
-
   return 0;
 };
 
-// ============================================================
-// BUDGET SCORING
-// ============================================================
+/* ============================================================
+   BUDGET SCORING
+============================================================ */
+
+// Current scoring semantics:
+//
+// No usable budget:
+//     0
+//
+// KES 1–99,999:
+//     50% of budget weight
+//
+// KES 100,000–199,999:
+//     80% of budget weight
+//
+// KES 200,000+:
+//     100% of budget weight
+//
+// IMPORTANT:
+// This is a budget signal used by the existing LeadFlow
+// scoring model. It is not itself a "budget match" against
+// a particular property.
+//
 
 const calculateBudgetScore = (
   lead,
+
   weights
 ) => {
   const budget =
     toNumber(
-      lead.budget
+      lead?.budget
     );
 
   if (
@@ -677,13 +756,15 @@ const calculateBudgetScore = (
   }
 
   if (
-    budget >= 200000
+    budget >=
+    200000
   ) {
     return weights.budget;
   }
 
   if (
-    budget >= 100000
+    budget >=
+    100000
   ) {
     return (
       weights.budget *
@@ -697,17 +778,28 @@ const calculateBudgetScore = (
   );
 };
 
-// ============================================================
-// LOCATION SCORING
-// ============================================================
+/* ============================================================
+   LOCATION SCORING
+============================================================ */
+
+// No location:
+//     0
+//
+// Known location but not in high-demand list:
+//     60% of location weight
+//
+// High-demand location:
+//     100% of location weight
+//
 
 const calculateLocationScore = (
   lead,
+
   weights
 ) => {
   const location =
     normalizeText(
-      lead.location
+      lead?.location
     );
 
   if (!location) {
@@ -736,17 +828,28 @@ const calculateLocationScore = (
   );
 };
 
-// ============================================================
-// BEDROOM SCORING
-// ============================================================
+/* ============================================================
+   BEDROOM SCORING
+============================================================ */
+
+// No usable bedroom value:
+//     0
+//
+// 1–2 bedrooms:
+//     70% of bedroom weight
+//
+// 3+ bedrooms:
+//     100% of bedroom weight
+//
 
 const calculateBedroomScore = (
   lead,
+
   weights
 ) => {
   const bedrooms =
     toNumber(
-      lead.bedrooms
+      lead?.bedrooms
     );
 
   if (
@@ -757,7 +860,8 @@ const calculateBedroomScore = (
   }
 
   if (
-    bedrooms >= 3
+    bedrooms >=
+    3
   ) {
     return weights.bedrooms;
   }
@@ -768,16 +872,23 @@ const calculateBedroomScore = (
   );
 };
 
-// ============================================================
-// URGENCY SCORING
-// ============================================================
+/* ============================================================
+   URGENCY SCORING
+============================================================ */
+
+// Urgency can come from:
+// ✓ lead.urgent
+// ✓ moveDate text containing a recognized urgency signal
+//
 
 const calculateUrgencyScore = (
   lead,
+
   weights
 ) => {
   if (
-    lead?.urgent === true
+    lead?.urgent ===
+    true
   ) {
     return weights.urgency;
   }
@@ -793,7 +904,9 @@ const calculateUrgencyScore = (
 
   const isUrgent =
     URGENCY_KEYWORDS.some(
-      (keyword) =>
+      (
+        keyword
+      ) =>
         moveDate.includes(
           keyword
         )
@@ -808,14 +921,22 @@ const calculateUrgencyScore = (
   return 0;
 };
 
-// ============================================================
-// CORE SCORE CALCULATION
-// ============================================================
-//
-// Returns an integer between 0 and 100.
+/* ============================================================
+   CORE SCORE CALCULATION
+============================================================ */
+
+// Returns:
+//     integer 0–100
 //
 // IMPORTANT:
-// This function does NOT save anything to MongoDB.
+// This function does NOT:
+//
+// ❌ modify Lead.status
+// ❌ set Lead.intent
+// ❌ assign an agent
+// ❌ update MongoDB
+//
+// It only calculates a score.
 //
 
 export const calculateLeadScore = (
@@ -825,146 +946,166 @@ export const calculateLeadScore = (
     return 0;
   }
 
-  let score = 0;
+  let score =
+    0;
 
   const weights =
     getOrgWeights(
       lead.organizationId
     );
 
-  // ==========================================================
-  // 1. INTENT
-  // ==========================================================
+  /* ========================================================
+     1. INTENT
+  ======================================================== */
 
   score +=
     calculateIntentScore(
       lead,
+
       weights
     );
 
-  // ==========================================================
-  // 2. BUDGET
-  // ==========================================================
+  /* ========================================================
+     2. BUDGET
+  ======================================================== */
 
   score +=
     calculateBudgetScore(
       lead,
+
       weights
     );
 
-  // ==========================================================
-  // 3. LOCATION
-  // ==========================================================
+  /* ========================================================
+     3. LOCATION
+  ======================================================== */
 
   score +=
     calculateLocationScore(
       lead,
+
       weights
     );
 
-  // ==========================================================
-  // 4. BEDROOMS
-  // ==========================================================
+  /* ========================================================
+     4. BEDROOMS
+  ======================================================== */
 
   score +=
     calculateBedroomScore(
       lead,
+
       weights
     );
 
-  // ==========================================================
-  // 5. URGENCY
-  // ==========================================================
+  /* ========================================================
+     5. URGENCY
+  ======================================================== */
 
   score +=
     calculateUrgencyScore(
       lead,
+
       weights
     );
 
-  // ==========================================================
-  // NORMALIZATION
-  // ==========================================================
+  /* ========================================================
+     NORMALIZATION
+  ======================================================== */
 
-  score = Math.max(
-    0,
-    Math.min(
-      100,
+  const normalizedScore =
+    normalizeScore(
       score
-    )
-  );
+    );
 
   console.log(
     "[LeadScoringRulesEngine] Final lead score:",
-    Math.round(score)
+    Math.round(
+      normalizedScore
+    )
   );
 
   return Math.round(
-    score
+    normalizedScore
   );
 };
 
-// ============================================================
-// LEAD CATEGORY CLASSIFIER
-// ============================================================
+/* ============================================================
+   LEAD SCORE CATEGORY
+============================================================ */
+
+// IMPORTANT:
 //
-// IMPORTANT
-// ------------------------------------------------------------
+// These are SCORE BANDS.
 //
-// "hot" is a SCORING CATEGORY.
+// They do NOT write to Lead.status.
 //
-// It is NOT Lead.status.
-//
-// Lead.status remains:
-//
-//     new
-//     contacted
-//     qualified
-//     viewing
-//     negotiation
-//     won
-//     lost
-//
-// Therefore this function returning:
-//
-//     hot
-//
-// does NOT mean:
-//
-//     lead.status = "hot"
-//
-// ============================================================
 
 export const getLeadCategory = (
   score
 ) => {
   const normalizedScore =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        Number(score) || 0
-      )
+    normalizeScore(
+      score
     );
 
   if (
-    normalizedScore >= 80
+    normalizedScore >=
+    HOT_SCORE_THRESHOLD
   ) {
-    return "hot";
+    return (
+      LEAD_SCORE_CATEGORIES.HOT
+    );
   }
 
   if (
-    normalizedScore >= 50
+    normalizedScore >=
+    QUALIFIED_SCORE_MIN
   ) {
-    return "qualified";
+    return (
+      LEAD_SCORE_CATEGORIES.QUALIFIED
+    );
   }
 
-  return "new";
+  return (
+    LEAD_SCORE_CATEGORIES.NEW
+  );
 };
 
-// ============================================================
-// COMPLETE SCORING RESULT
-// ============================================================
+/* ============================================================
+   HOT SCORE CHECK
+============================================================ */
+
+// Canonical HOT threshold:
+//     80
+//
+
+export const isHotScore = (
+  score
+) => {
+  return (
+    normalizeScore(
+      score
+    ) >=
+    HOT_SCORE_THRESHOLD
+  );
+};
+
+/* ============================================================
+   COMPLETE SCORING RESULT
+============================================================ */
+
+// Returns the scoring contract:
+//
+// {
+//   score,
+//   category,
+//   intent
+// }
+//
+// IMPORTANT:
+// category is NOT Lead.status.
+//
 
 export const evaluateLead = (
   lead
@@ -991,9 +1132,16 @@ export const evaluateLead = (
   };
 };
 
-// ============================================================
-// AI SCORE ENHANCER
-// ============================================================
+/* ============================================================
+   AI SCORE ENHANCER
+============================================================ */
+
+// Extension point for future structured AI scoring.
+//
+// IMPORTANT:
+// Any future AI boost MUST remain bounded inside 0–100 and
+// MUST NOT directly modify Lead.status.
+//
 
 export const aiScoreEnhancer =
   async (
@@ -1001,18 +1149,25 @@ export const aiScoreEnhancer =
   ) => {
     if (!lead) {
       return {
-        aiBoost: 0,
+        aiBoost:
+          0,
       };
     }
 
     return {
-      aiBoost: 0,
+      aiBoost:
+        0,
     };
   };
 
-// ============================================================
-// OPTIONAL AI + RULE SCORE
-// ============================================================
+/* ============================================================
+   OPTIONAL AI + RULE SCORE
+============================================================ */
+
+// This returns a final score only.
+//
+// It does NOT persist the score.
+//
 
 export const calculateEnhancedLeadScore =
   async (
@@ -1035,13 +1190,9 @@ export const calculateEnhancedLeadScore =
       );
 
     const finalScore =
-      Math.max(
-        0,
-        Math.min(
-          100,
-          baseScore +
-            aiBoost
-        )
+      normalizeScore(
+        baseScore +
+          aiBoost
       );
 
     return Math.round(
@@ -1049,19 +1200,37 @@ export const calculateEnhancedLeadScore =
     );
   };
 
-// ============================================================
-// DEBUG / EXPLANATION HELPER
-// ============================================================
+/* ============================================================
+   DEBUG / EXPLANATION HELPER
+============================================================ */
+
+// Returns:
+//
+// score
+// category
+// intent
+// breakdown
+//
+// IMPORTANT:
+// category remains a score category, not Lead.status.
+//
 
 export const explainLeadScore = (
   lead
 ) => {
   if (!lead) {
     return {
-      score: 0,
-      category: "new",
-      intent: "",
-      breakdown: {},
+      score:
+        0,
+
+      category:
+        LEAD_SCORE_CATEGORIES.NEW,
+
+      intent:
+        "",
+
+      breakdown:
+        {},
     };
   }
 
@@ -1074,45 +1243,55 @@ export const explainLeadScore = (
     intent:
       calculateIntentScore(
         lead,
+
         weights
       ),
 
     budget:
       calculateBudgetScore(
         lead,
+
         weights
       ),
 
     location:
       calculateLocationScore(
         lead,
+
         weights
       ),
 
     bedrooms:
       calculateBedroomScore(
         lead,
+
         weights
       ),
 
     urgency:
       calculateUrgencyScore(
         lead,
+
         weights
       ),
   };
 
   const score =
     Math.round(
-      Object.values(
-        breakdown
-      ).reduce(
-        (
-          total,
-          value
-        ) =>
-          total + value,
-        0
+      normalizeScore(
+        Object.values(
+          breakdown
+        ).reduce(
+          (
+            total,
+
+            value
+          ) =>
+            total +
+            value,
+
+          0
+        )
       )
     );
 
@@ -1133,9 +1312,9 @@ export const explainLeadScore = (
   };
 };
 
-// ============================================================
-// DEFAULT EXPORT
-// ============================================================
+/* ============================================================
+   DEFAULT EXPORT
+============================================================ */
 
 export default {
   calculateLeadScore,
@@ -1156,5 +1335,33 @@ export default {
 
   getPersistedLeadIntent,
 
+  /*
+   * Compatibility wrapper.
+   *
+   * Canonical persistence authority remains:
+   * leadIntentPersistenceService.js
+   */
   persistLeadIntent,
+
+  isValidCanonicalIntent,
+
+  normalizeScore,
+
+  isHotScore,
+
+  HOT_SCORE_THRESHOLD,
+
+  NEW_SCORE_MAX,
+
+  QUALIFIED_SCORE_MIN,
+
+  QUALIFIED_SCORE_MAX,
+
+  MAX_LEAD_SCORE,
+
+  LEAD_SCORE_CATEGORIES,
+
+  DEFAULT_WEIGHTS,
+
+  VALID_INTENTS,
 };

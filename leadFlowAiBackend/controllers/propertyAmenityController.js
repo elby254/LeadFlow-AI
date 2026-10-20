@@ -22,8 +22,12 @@
  * ==========================================================
  */
 
-import Property from "../models/Property.js";
-import PropertyAmenity from "../models/PropertyAmenity.js";
+import Property from "../models/property.js";
+import PropertyAmenity from "../models/propertyAmenity.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
 
 /**
  * ==========================================================
@@ -31,9 +35,38 @@ import PropertyAmenity from "../models/PropertyAmenity.js";
  * ==========================================================
  */
 
-const buildOrganizationQuery = (req) => ({
-  organizationId: req.user.organizationId,
-});
+/**
+ * Resolve the authenticated organization through the
+ * centralized organization-resolution boundary.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Organization identity is never taken directly from:
+ *
+ * • req.body
+ * • req.query
+ * • req.params
+ *
+ * The centralized organizationResolverService.js is the
+ * trusted organization-resolution boundary.
+ */
+const buildOrganizationQuery = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (!organization) {
+    return null;
+  }
+
+  return {
+    organizationId:
+      organization._id,
+  };
+};
 
 /**
  * ==========================================================
@@ -43,9 +76,36 @@ const buildOrganizationQuery = (req) => ({
  * ==========================================================
  */
 
-export const getPropertyAmenities = async (req, res) => {
+export const getPropertyAmenities = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    VERIFY ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -53,15 +113,17 @@ export const getPropertyAmenities = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      isArchived: false,
+        isArchived: false,
 
-    });
+      });
 
     if (!property) {
 
@@ -81,25 +143,27 @@ export const getPropertyAmenities = async (req, res) => {
     ==========================================================
     */
 
-    const amenities = await PropertyAmenity.find({
+    const amenities =
+      await PropertyAmenity.find({
 
-      property: property._id,
+        property:
+          property._id,
 
-      active: true,
-
-    })
-
-      .sort({
-
-        category: 1,
-
-        displayOrder: 1,
-
-        createdAt: 1,
+        active: true,
 
       })
 
-      .lean();
+        .sort({
+
+          category: 1,
+
+          displayOrder: 1,
+
+          createdAt: 1,
+
+        })
+
+        .lean();
 
     return res.status(200).json({
 
@@ -115,7 +179,9 @@ export const getPropertyAmenities = async (req, res) => {
 
   catch (error) {
 
-    console.error("GET PROPERTY AMENITIES ERROR");
+    console.error(
+      "GET PROPERTY AMENITIES ERROR"
+    );
 
     console.error(error);
 
@@ -123,7 +189,8 @@ export const getPropertyAmenities = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -139,9 +206,36 @@ export const getPropertyAmenities = async (req, res) => {
  * ==========================================================
  */
 
-export const createPropertyAmenity = async (req, res) => {
+export const createPropertyAmenity = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    VERIFY ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -149,15 +243,17 @@ export const createPropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      isArchived: false,
+        isArchived: false,
 
-    });
+      });
 
     if (!property) {
 
@@ -197,7 +293,8 @@ export const createPropertyAmenity = async (req, res) => {
 
         success: false,
 
-        message: "Amenity name is required.",
+        message:
+          "Amenity name is required.",
 
       });
 
@@ -209,33 +306,39 @@ export const createPropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    const amenity = await PropertyAmenity.create({
+    const amenity =
+      await PropertyAmenity.create({
 
-      property: property._id,
+        property:
+          property._id,
 
-      organizationId: property.organizationId,
+        organizationId:
+          property.organizationId,
 
-      name,
+        name,
 
-      value,
+        value,
 
-      category,
+        category,
 
-      icon,
+        icon,
 
-      displayOrder,
+        displayOrder,
 
-      createdBy: req.user._id,
+        createdBy:
+          req.user._id,
 
-    });
+      });
 
     return res.status(201).json({
 
       success: true,
 
-      message: "Property amenity created successfully.",
+      message:
+        "Property amenity created successfully.",
 
-      data: amenity,
+      data:
+        amenity,
 
     });
 
@@ -243,7 +346,9 @@ export const createPropertyAmenity = async (req, res) => {
 
   catch (error) {
 
-    console.error("CREATE PROPERTY AMENITY ERROR");
+    console.error(
+      "CREATE PROPERTY AMENITY ERROR"
+    );
 
     console.error(error);
 
@@ -251,7 +356,8 @@ export const createPropertyAmenity = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -267,19 +373,42 @@ export const createPropertyAmenity = async (req, res) => {
  * ==========================================================
  */
 
-export const updatePropertyAmenity = async (req, res) => {
+export const updatePropertyAmenity = async (
+  req,
+  res
+) => {
 
   try {
 
-    const amenity = await PropertyAmenity.findOne({
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
 
-      _id: req.params.amenityId,
+    if (!organizationQuery) {
 
-      ...buildOrganizationQuery(req),
+      return res.status(401).json({
 
-      active: true,
+        success: false,
 
-    });
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
+
+    const amenity =
+      await PropertyAmenity.findOne({
+
+        _id:
+          req.params.amenityId,
+
+        ...organizationQuery,
+
+        active: true,
+
+      });
 
     if (!amenity) {
 
@@ -287,7 +416,8 @@ export const updatePropertyAmenity = async (req, res) => {
 
         success: false,
 
-        message: "Property amenity not found.",
+        message:
+          "Property amenity not found.",
 
       });
 
@@ -330,10 +460,12 @@ export const updatePropertyAmenity = async (req, res) => {
     }
 
     if (displayOrder !== undefined) {
-      amenity.displayOrder = displayOrder;
+      amenity.displayOrder =
+        displayOrder;
     }
 
-    amenity.updatedBy = req.user._id;
+    amenity.updatedBy =
+      req.user._id;
 
     await amenity.save();
 
@@ -341,9 +473,11 @@ export const updatePropertyAmenity = async (req, res) => {
 
       success: true,
 
-      message: "Property amenity updated successfully.",
+      message:
+        "Property amenity updated successfully.",
 
-      data: amenity,
+      data:
+        amenity,
 
     });
 
@@ -351,7 +485,9 @@ export const updatePropertyAmenity = async (req, res) => {
 
   catch (error) {
 
-    console.error("UPDATE PROPERTY AMENITY ERROR");
+    console.error(
+      "UPDATE PROPERTY AMENITY ERROR"
+    );
 
     console.error(error);
 
@@ -359,7 +495,8 @@ export const updatePropertyAmenity = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -377,9 +514,36 @@ export const updatePropertyAmenity = async (req, res) => {
  * ==========================================================
  */
 
-export const deletePropertyAmenity = async (req, res) => {
+export const deletePropertyAmenity = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -387,15 +551,17 @@ export const deletePropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    const amenity = await PropertyAmenity.findOne({
+    const amenity =
+      await PropertyAmenity.findOne({
 
-      _id: req.params.amenityId,
+        _id:
+          req.params.amenityId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      active: true,
+        active: true,
 
-    });
+      });
 
     if (!amenity) {
 
@@ -403,7 +569,8 @@ export const deletePropertyAmenity = async (req, res) => {
 
         success: false,
 
-        message: "Property amenity not found.",
+        message:
+          "Property amenity not found.",
 
       });
 
@@ -415,9 +582,11 @@ export const deletePropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    amenity.active = false;
+    amenity.active =
+      false;
 
-    amenity.updatedBy = req.user._id;
+    amenity.updatedBy =
+      req.user._id;
 
     await amenity.save();
 
@@ -425,7 +594,8 @@ export const deletePropertyAmenity = async (req, res) => {
 
       success: true,
 
-      message: "Property amenity deleted successfully.",
+      message:
+        "Property amenity deleted successfully.",
 
     });
 
@@ -433,7 +603,9 @@ export const deletePropertyAmenity = async (req, res) => {
 
   catch (error) {
 
-    console.error("DELETE PROPERTY AMENITY ERROR");
+    console.error(
+      "DELETE PROPERTY AMENITY ERROR"
+    );
 
     console.error(error);
 
@@ -441,7 +613,8 @@ export const deletePropertyAmenity = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -457,9 +630,36 @@ export const deletePropertyAmenity = async (req, res) => {
  * ==========================================================
  */
 
-export const restorePropertyAmenity = async (req, res) => {
+export const restorePropertyAmenity = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -467,15 +667,17 @@ export const restorePropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    const amenity = await PropertyAmenity.findOne({
+    const amenity =
+      await PropertyAmenity.findOne({
 
-      _id: req.params.amenityId,
+        _id:
+          req.params.amenityId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      active: false,
+        active: false,
 
-    });
+      });
 
     if (!amenity) {
 
@@ -483,7 +685,8 @@ export const restorePropertyAmenity = async (req, res) => {
 
         success: false,
 
-        message: "Archived property amenity not found.",
+        message:
+          "Archived property amenity not found.",
 
       });
 
@@ -495,9 +698,11 @@ export const restorePropertyAmenity = async (req, res) => {
     ==========================================================
     */
 
-    amenity.active = true;
+    amenity.active =
+      true;
 
-    amenity.updatedBy = req.user._id;
+    amenity.updatedBy =
+      req.user._id;
 
     await amenity.save();
 
@@ -505,9 +710,11 @@ export const restorePropertyAmenity = async (req, res) => {
 
       success: true,
 
-      message: "Property amenity restored successfully.",
+      message:
+        "Property amenity restored successfully.",
 
-      data: amenity,
+      data:
+        amenity,
 
     });
 
@@ -515,7 +722,9 @@ export const restorePropertyAmenity = async (req, res) => {
 
   catch (error) {
 
-    console.error("RESTORE PROPERTY AMENITY ERROR");
+    console.error(
+      "RESTORE PROPERTY AMENITY ERROR"
+    );
 
     console.error(error);
 
@@ -523,7 +732,8 @@ export const restorePropertyAmenity = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 

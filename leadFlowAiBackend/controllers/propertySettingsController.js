@@ -15,9 +15,8 @@
  * ----------------------------------------------------------
  * organizationId is NEVER accepted from the frontend.
  *
- * It is obtained from the authenticated user:
- *
- * req.user.organizationId
+ * It is obtained from the authenticated user through the
+ * centralized organization resolver.
  *
  * This prevents one organization from reading or modifying
  * another organization's property settings.
@@ -29,6 +28,10 @@ import mongoose from "mongoose";
 
 import PropertySettings from "../models/propertySettings.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 
 /* ==========================================================
    HELPER
@@ -37,23 +40,27 @@ import PropertySettings from "../models/propertySettings.js";
 /**
  * Get the organization ID from the authenticated request.
  *
- * The authentication middleware is expected to populate:
+ * Organization resolution is centralized through
+ * organizationResolverService.js.
  *
- * req.user = {
- *   id,
- *   organizationId,
- *   role,
- *   ...
- * }
+ * The resolver uses trusted authentication context:
+ *
+ * req.user.organizationId
+ * req.organizationId
+ * req.organization
+ *
+ * organizationId is NEVER accepted from the request body.
  */
-const getOrganizationId = (req) => {
+const getOrganizationId = async (req) => {
 
-  return (
-    req.user?.organizationId ??
-    req.user?.organization?._id ??
-    req.user?.organization?.id ??
-    null
-  );
+  const organization =
+    await resolveFromRequest(req);
+
+  if (!organization) {
+    return null;
+  }
+
+  return organization._id || null;
 
 };
 
@@ -97,7 +104,7 @@ export const getPropertySettings = async (
     ------------------------------------------------------ */
 
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(req);
 
 
     if (!organizationId) {
@@ -250,7 +257,7 @@ export const updatePropertySettings = async (
     ------------------------------------------------------ */
 
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(req);
 
 
     if (!organizationId) {

@@ -1,65 +1,209 @@
-// =====================================================
-//
-// AGENT CONTROLLER
-//
-// Purpose
-// -----------------------------------------------------
-// Handles AGENT-SIDE lead operations in LeadFlow AI.
-//
-// Responsibilities
-// -----------------------------------------------------
-//
-// ✓ View/update status of assigned leads
-// ✓ Add notes to assigned leads
-// ✓ Schedule/update viewing information
-// ✓ Get authenticated agent performance
-// ✓ Emit lead pipeline events
-//
-// IMPORTANT
-// -----------------------------------------------------
-// Lead assignment is NOT handled here.
-//
-// ADMIN assignment workflow:
-//
-//   leadAssignmentController
-//              ↓
-//   resolveAssignmentConflict()
-//              ↓
-//   lead.assignedTo = agent._id
-//
-// Agent workflow:
-//
-//   agentController
-//              ↓
-//   assignedTo === authenticated agent
-//
-// Therefore:
-//
-// ❌ Agents cannot assign leads
-// ❌ Agents cannot reassign leads
-// ❌ Agents cannot choose agentId
-// ❌ Agents cannot choose organizationId
-//
-// Security:
-//
-//   organizationId === authenticated organization
-//   assignedTo     === authenticated agent
-//
-// =====================================================
+/**
+ * ==========================================================
+ * AGENT CONTROLLER
+ * ==========================================================
+ *
+ * Purpose
+ * ----------------------------------------------------------
+ * Handles AGENT-SIDE lead operations in LeadFlow AI.
+ *
+ * Responsibilities
+ * ----------------------------------------------------------
+ *
+ * ✓ View/update status of assigned leads
+ * ✓ Add notes to assigned leads
+ * ✓ Request/update viewing workflow
+ * ✓ Submit viewing feedback
+ * ✓ Get authenticated agent performance
+ * ✓ Emit canonical lead/viewing pipeline events
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Lead assignment is NOT handled here.
+ *
+ * ADMIN / SYSTEM assignment workflow:
+ *
+ *   leadAutoAssignmentService
+ *              ↓
+ *   assignmentConflictResolver
+ *              ↓
+ *   lead.assignedTo = agent._id
+ *
+ * Agent workflow:
+ *
+ *   agentController
+ *              ↓
+ *   assignedTo === authenticated agent
+ *
+ * Therefore:
+ *
+ * ❌ Agents cannot assign leads
+ * ❌ Agents cannot reassign leads
+ * ❌ Agents cannot choose agentId
+ * ❌ Agents cannot choose organizationId
+ *
+ * ==========================================================
+ *
+ * CANONICAL LEAD LIFECYCLE
+ * ==========================================================
+ *
+ * Lead.status:
+ *
+ *   new
+ *   contacted
+ *   qualified
+ *   viewing
+ *   negotiation
+ *   won
+ *   lost
+ *
+ * Lifecycle authority:
+ *
+ *   services/leadLifeCycleService.js
+ *
+ * ==========================================================
+ *
+ * CANONICAL SCORING
+ * ==========================================================
+ *
+ * Lead.score:
+ *
+ *   0–49   → new
+ *   50–79  → qualified
+ *   80–100 → hot
+ *
+ * IMPORTANT:
+ *
+ * "hot" is a score category.
+ *
+ * "hot" is NOT Lead.status.
+ *
+ * ==========================================================
+ *
+ * CANONICAL VIEWING WORKFLOW
+ * ==========================================================
+ *
+ * Viewing.status:
+ *
+ *   Requested
+ *   Pending Approval
+ *   Approved
+ *   Rescheduled
+ *   Rejected
+ *   Cancelled
+ *   Completed
+ *
+ * Viewing workflow authority:
+ *
+ *   services/viewingService.js
+ *
+ * Lead.status may become:
+ *
+ *   viewing
+ *
+ * when the viewing workflow legitimately moves the lead
+ * into the viewing lifecycle stage.
+ *
+ * Lead.viewingStatus is LEGACY compatibility data only.
+ *
+ * ==========================================================
+ *
+ * RELIABLE EVENT ARCHITECTURE
+ * ==========================================================
+ *
+ * Critical business events are persisted through the
+ * MongoDB Outbox.
+ *
+ * Critical lifecycle events:
+ *
+ *   lead.status.changed
+ *   lead.won
+ *   lead.lost
+ *
+ * Critical viewing events:
+ *
+ *   lead.viewing.requested
+ *   lead.viewing.confirmed
+ *   lead.viewing.completed
+ *   lead.viewing.cancelled
+ *
+ * Flow:
+ *
+ *   domain mutation
+ *          ↓
+ *   OutboxEvent persisted
+ *          ↓
+ *   Outbox Worker
+ *          ↓
+ *   leadEventBus
+ *          ↓
+ *   realtimeEngine
+ *
+ * IMPORTANT:
+ *
+ * updateLeadStatus() persists the Lead mutation and its
+ * lifecycle event(s) in the SAME transaction.
+ *
+ * ViewingService currently owns the Viewing mutation itself.
+ * Therefore this controller queues the corresponding viewing
+ * Outbox event after the domain service succeeds.
+ *
+ * The viewing transaction can be made fully atomic later by
+ * adding session support to viewingService.js.
+ *
+ * ==========================================================
+ */
 
 import mongoose from "mongoose";
 
 import Lead from "../models/lead.js";
 import Conversation from "../models/conversation.js";
 import Message from "../models/message.js";
+import Viewing from "../models/viewing.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
+import {
+  canTransitionLeadStatus,
+  transitionLeadStatus,
+} from "../services/leadLifeCycleService.js";
+
+import {
+  HOT_SCORE_THRESHOLD,
+} from "../services/leadScoringRulesEngine.js";
+
+import {
+  requestViewing,
+  approveViewing,
+  rejectViewing,
+  rescheduleViewing,
+  cancelViewing,
+  completeViewing,
+  submitFeedback,
+} from "../services/viewingService.js";
 
 import leadEventBus, {
   LEAD_EVENTS,
 } from "../events/leadEvents.js";
 
+import {
+  withReliableTransaction,
+  addLeadStatusChangedEvent,
+  addLeadWonEvent,
+  addLeadLostEvent,
+  addViewingRequestedEvent,
+  addViewingConfirmedEvent,
+  addViewingCompletedEvent,
+  addViewingCancelledEvent,
+} from "../services/outboxIntegrationService.js";
+
+
 // =====================================================
 // HELPERS
 // =====================================================
+
 
 /**
  * Get authenticated user/agent ID.
@@ -69,7 +213,10 @@ import leadEventBus, {
  *
  * req.user._id is retained as a safe fallback.
  */
-const getAuthenticatedAgentId = (req) => {
+const getAuthenticatedAgentId = (
+  req
+) => {
+
   return (
     req.agentId ||
     req.user?._id ||
@@ -78,28 +225,51 @@ const getAuthenticatedAgentId = (req) => {
   );
 };
 
+
 /**
  * Get authenticated organization ID.
  *
- * Organization MUST come from authenticated context.
+ * Organization MUST come from the centralized
+ * organization resolver.
  */
-const getAuthenticatedOrganizationId = (req) => {
+const getAuthenticatedOrganizationId = async (
+  req
+) => {
+
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (
+    !organization
+  ) {
+
+    return null;
+  }
+
   return (
-    req.organizationId ||
-    req.user?.organizationId ||
+    organization._id ||
     null
   );
 };
 
+
 /**
  * Validate MongoDB ObjectId.
  */
-const isValidObjectId = (value) => {
+const isValidObjectId = (
+  value
+) => {
+
   return Boolean(
     value &&
-      mongoose.Types.ObjectId.isValid(value)
+    mongoose.Types.ObjectId.isValid(
+      value
+    )
   );
 };
+
 
 /**
  * Safely convert a value to Number.
@@ -108,12 +278,17 @@ const toNumber = (
   value,
   fallback = 0
 ) => {
-  const number = Number(value);
 
-  return Number.isFinite(number)
+  const number =
+    Number(value);
+
+  return Number.isFinite(
+    number
+  )
     ? number
     : fallback;
 };
+
 
 /**
  * Compare ObjectId/string values safely.
@@ -122,10 +297,12 @@ const sameId = (
   first,
   second
 ) => {
+
   if (
     !first ||
     !second
   ) {
+
     return false;
   }
 
@@ -135,13 +312,18 @@ const sameId = (
   );
 };
 
+
 /**
  * Safely parse a date.
  */
 const parseDate = (
   value
 ) => {
-  if (!value) {
+
+  if (
+    !value
+  ) {
+
     return null;
   }
 
@@ -153,38 +335,660 @@ const parseDate = (
       date.getTime()
     )
   ) {
+
     return null;
   }
 
   return date;
 };
 
+
 /**
- * Emit standard lead events.
+ * Normalize viewing status.
  *
- * Events are emitted only after the database
- * operation has successfully completed.
+ * IMPORTANT:
+ * -----------------------------------------------------
+ * This reads the REAL Viewing.status.
+ *
+ * It does NOT read Lead.viewingStatus.
+ */
+const normalizeViewingStatus = (
+  status
+) => {
+
+  if (
+    !status
+  ) {
+
+    return null;
+  }
+
+  return String(status)
+    .trim();
+};
+
+
+/**
+ * Extract viewing document from a viewing service result.
+ *
+ * Compatible with service methods returning either:
+ *
+ *   viewing
+ *
+ * or:
+ *
+ *   { viewing, lead, property, ... }
+ */
+const extractViewingFromResult = (
+  result
+) => {
+
+  if (
+    !result
+  ) {
+
+    return null;
+  }
+
+  return (
+    result.viewing ||
+    result.data?.viewing ||
+    result
+  );
+};
+
+
+/**
+ * Extract lead document from a viewing service result.
+ */
+const extractLeadFromViewingResult = (
+  result
+) => {
+
+  return (
+    result?.lead ||
+    result?.data?.lead ||
+    null
+  );
+};
+
+
+/**
+ * Resolve a stable request/operation ID when the
+ * infrastructure provides one.
+ *
+ * This is intentionally NOT generated from Date.now(),
+ * because deterministic identifiers are preferable for
+ * Outbox deduplication.
+ */
+const getRequestOperationId = (
+  req,
+  operation
+) => {
+
+  const requestId =
+    req?.id ||
+    req?.requestId ||
+    req?.headers?.["x-request-id"] ||
+    req?.headers?.["x-correlation-id"] ||
+    null;
+
+
+  if (
+    !requestId
+  ) {
+
+    return null;
+  }
+
+
+  return `${operation}:${String(requestId)}`;
+};
+
+
+/**
+ * =====================================================
+ * EMIT GENERIC LEAD UPDATE
+ * =====================================================
+ *
+ * These are non-critical realtime/read-model events.
+ *
+ * They intentionally remain direct during the current
+ * migration phase.
+ *
+ * Critical lifecycle/viewing events do NOT use this helper.
  */
 const emitLeadUpdate = (
   lead
 ) => {
+
   try {
-    leadEventBus.emit(
-      LEAD_EVENTS.LEAD_UPDATED,
-      lead
-    );
+
+    const organizationId =
+      lead?.organizationId ||
+      null;
+
+    const payload = {
+
+      leadId:
+        lead?._id ||
+        null,
+
+      organizationId,
+
+      lead,
+
+      status:
+        lead?.status ||
+        null,
+
+      score:
+        Number(
+          lead?.score ||
+          0
+        ),
+
+      assignedTo:
+        lead?.assignedTo ||
+        null,
+
+      currentViewingId:
+        lead?.currentViewing ||
+        null,
+
+      followUpStatus:
+        lead?.followUpStatus ||
+        null,
+
+      occurredAt:
+        new Date(),
+
+    };
+
+
+    // -------------------------------------------------
+    // NON-CRITICAL READ-MODEL EVENT
+    // -------------------------------------------------
 
     leadEventBus.emit(
-      LEAD_EVENTS.PIPELINE_UPDATE,
-      lead
+      LEAD_EVENTS.LEAD_UPDATED,
+      payload
     );
-  } catch (eventError) {
+
+
+    // -------------------------------------------------
+    // NON-CRITICAL PIPELINE EVENT
+    // -------------------------------------------------
+
+    leadEventBus.emit(
+      LEAD_EVENTS.PIPELINE_UPDATED,
+      payload
+    );
+
+
+  } catch (
+    eventError
+  ) {
+
     console.error(
       "[AgentController] LEAD EVENT EMISSION ERROR:",
       eventError
     );
   }
 };
+
+
+/**
+ * =====================================================
+ * QUEUE CANONICAL LEAD LIFECYCLE EVENTS
+ * =====================================================
+ *
+ * Critical lifecycle events are persisted to Outbox.
+ *
+ * This helper is used for lead mutations performed by
+ * viewingService where the Lead has already been changed
+ * by the domain service.
+ *
+ * updateLeadStatus() performs its own atomic transaction
+ * because it owns the Lead mutation directly.
+ */
+const queueLifecycleEvents = async ({
+  lead,
+  previousStatus,
+  operationId = null,
+}) => {
+
+  if (
+    !lead
+  ) {
+
+    return false;
+  }
+
+
+  const currentStatus =
+    lead.status ||
+    "new";
+
+
+  const statusChanged =
+    String(
+      previousStatus ||
+      ""
+    ) !==
+    String(
+      currentStatus
+    );
+
+
+  if (
+    !statusChanged
+  ) {
+
+    return false;
+  }
+
+
+  const organizationId =
+    lead.organizationId ||
+    null;
+
+
+  if (
+    !organizationId
+  ) {
+
+    throw new Error(
+      "Cannot queue lifecycle event without organizationId."
+    );
+  }
+
+
+  await withReliableTransaction(
+    async (
+      session
+    ) => {
+
+      // ================================================
+      // STATUS CHANGED
+      // ================================================
+
+      await addLeadStatusChangedEvent({
+
+        session,
+
+        lead,
+
+        organizationId,
+
+        previousStatus:
+          previousStatus ||
+          null,
+
+        status:
+          currentStatus,
+
+        operationId,
+
+      });
+
+
+      console.log(
+        "[AgentController] OUTBOX QUEUED: LEAD_STATUS_CHANGED"
+      );
+
+
+      // ================================================
+      // WON
+      // ================================================
+
+      if (
+        currentStatus ===
+        "won"
+      ) {
+
+        await addLeadWonEvent({
+
+          session,
+
+          lead,
+
+          organizationId,
+
+          previousStatus:
+            previousStatus ||
+            null,
+
+          operationId,
+
+        });
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_WON"
+        );
+      }
+
+
+      // ================================================
+      // LOST
+      // ================================================
+
+      if (
+        currentStatus ===
+        "lost"
+      ) {
+
+        await addLeadLostEvent({
+
+          session,
+
+          lead,
+
+          organizationId,
+
+          previousStatus:
+            previousStatus ||
+            null,
+
+          operationId,
+
+        });
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_LOST"
+        );
+      }
+
+    }
+  );
+
+
+  return true;
+};
+
+
+/**
+ * =====================================================
+ * QUEUE CANONICAL VIEWING EVENT
+ * =====================================================
+ *
+ * Viewing workflow is driven by the Viewing document.
+ *
+ * Lead.viewingStatus is NOT used.
+ *
+ * Canonical Viewing.status:
+ *
+ *   Requested
+ *   Pending Approval
+ *   Approved
+ *   Rescheduled
+ *   Rejected
+ *   Cancelled
+ *   Completed
+ *
+ * Event mapping:
+ *
+ *   Requested
+ *       ↓
+ *   LEAD_VIEWING_REQUESTED
+ *
+ *   Approved / Rescheduled
+ *       ↓
+ *   LEAD_VIEWING_CONFIRMED
+ *
+ *   Completed
+ *       ↓
+ *   LEAD_VIEWING_COMPLETED
+ *
+ *   Cancelled
+ *       ↓
+ *   LEAD_VIEWING_CANCELLED
+ *
+ * Rejected deliberately has no CANCELLED event.
+ */
+const queueViewingEvent = async ({
+  viewing,
+  lead,
+  previousViewingStatus,
+  operationId = null,
+}) => {
+
+  if (
+    !viewing
+  ) {
+
+    return false;
+  }
+
+
+  const currentViewingStatus =
+    normalizeViewingStatus(
+      viewing.status
+    );
+
+
+  const organizationId =
+    viewing.organizationId ||
+    lead?.organizationId ||
+    null;
+
+
+  if (
+    !currentViewingStatus
+  ) {
+
+    return false;
+  }
+
+
+  if (
+    !organizationId
+  ) {
+
+    throw new Error(
+      "Cannot queue viewing event without organizationId."
+    );
+  }
+
+
+  const statusChanged =
+    String(
+      previousViewingStatus ||
+      ""
+    ) !==
+    String(
+      currentViewingStatus
+    );
+
+
+  if (
+    !statusChanged
+  ) {
+
+    return false;
+  }
+
+
+  const queueOptions = {
+
+    session:
+      null,
+
+    viewing,
+
+    lead:
+      lead ||
+      null,
+
+    organizationId,
+
+    previousViewingStatus:
+      previousViewingStatus ||
+      null,
+
+    operationId,
+
+  };
+
+
+  await withReliableTransaction(
+    async (
+      session
+    ) => {
+
+      const eventOptions = {
+
+        ...queueOptions,
+
+        session,
+
+      };
+
+
+      // ================================================
+      // REQUESTED
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Requested"
+      ) {
+
+        await addViewingRequestedEvent(
+          eventOptions
+        );
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_VIEWING_REQUESTED"
+        );
+
+
+        return;
+      }
+
+
+      // ================================================
+      // APPROVED
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Approved"
+      ) {
+
+        await addViewingConfirmedEvent(
+          eventOptions
+        );
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_VIEWING_CONFIRMED"
+        );
+
+
+        return;
+      }
+
+
+      // ================================================
+      // RESCHEDULED
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Rescheduled"
+      ) {
+
+        await addViewingConfirmedEvent(
+          eventOptions
+        );
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_VIEWING_CONFIRMED"
+        );
+
+
+        return;
+      }
+
+
+      // ================================================
+      // COMPLETED
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Completed"
+      ) {
+
+        await addViewingCompletedEvent(
+          eventOptions
+        );
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_VIEWING_COMPLETED"
+        );
+
+
+        return;
+      }
+
+
+      // ================================================
+      // CANCELLED
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Cancelled"
+      ) {
+
+        await addViewingCancelledEvent(
+          eventOptions
+        );
+
+
+        console.log(
+          "[AgentController] OUTBOX QUEUED: LEAD_VIEWING_CANCELLED"
+        );
+
+
+        return;
+      }
+
+
+      // ================================================
+      // REJECTED
+      // ================================================
+      //
+      // Rejected deliberately produces no viewing
+      // cancellation event.
+      //
+      // The Viewing.status itself remains authoritative.
+      // ================================================
+
+      if (
+        currentViewingStatus ===
+        "Rejected"
+      ) {
+
+        console.log(
+          "[AgentController] Viewing rejected. No CANCELLED event queued."
+        );
+      }
+
+    }
+  );
+
+
+  return true;
+};
+
 
 // =====================================================
 // UPDATE LEAD STATUS
@@ -195,7 +999,7 @@ const emitLeadUpdate = (
 // POST
 // /api/agent/status
 //
-// Allowed statuses:
+// Canonical statuses:
 //
 //   new
 //   contacted
@@ -211,10 +1015,13 @@ export const updateLeadStatus = async (
   req,
   res
 ) => {
+
   try {
+
     console.log(
       "[AgentController] UPDATE LEAD STATUS REQUEST"
     );
+
 
     // -------------------------------------------------
     // LEAD ID
@@ -225,6 +1032,7 @@ export const updateLeadStatus = async (
       req.body?.leadId ||
       req.params?.id;
 
+
     // -------------------------------------------------
     // STATUS
     // -------------------------------------------------
@@ -233,15 +1041,22 @@ export const updateLeadStatus = async (
       status,
     } = req.body || {};
 
+
     // -------------------------------------------------
     // AUTHENTICATED CONTEXT
     // -------------------------------------------------
 
     const agentId =
-      getAuthenticatedAgentId(req);
+      getAuthenticatedAgentId(
+        req
+      );
+
 
     const organizationId =
-      getAuthenticatedOrganizationId(req);
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
 
     // =================================================
     // AUTHENTICATION
@@ -251,12 +1066,18 @@ export const updateLeadStatus = async (
       !req.user ||
       !agentId
     ) {
+
       return res.status(401).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Authentication required.",
+
       });
     }
+
 
     // =================================================
     // ORGANIZATION
@@ -265,12 +1086,18 @@ export const updateLeadStatus = async (
     if (
       !organizationId
     ) {
+
       return res.status(403).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Organization not assigned.",
+
       });
     }
+
 
     // =================================================
     // LEAD ID
@@ -281,12 +1108,18 @@ export const updateLeadStatus = async (
         leadId
       )
     ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "A valid lead ID is required.",
+
       });
     }
+
 
     // =================================================
     // STATUS
@@ -296,83 +1129,250 @@ export const updateLeadStatus = async (
       !status ||
       !String(status).trim()
     ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Lead status is required.",
+
       });
     }
+
 
     const normalizedStatus =
       String(status)
         .trim()
         .toLowerCase();
 
-    // =================================================
-    // VALID STATUS
-    // =================================================
-
-    const allowedStatuses = [
-      "new",
-      "contacted",
-      "qualified",
-      "viewing",
-      "negotiation",
-      "won",
-      "lost",
-    ];
-
-    if (
-      !allowedStatuses.includes(
-        normalizedStatus
-      )
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid lead status.",
-        allowedStatuses,
-      });
-    }
 
     // =================================================
-    // AUTHORITATIVE AGENT QUERY
+    // LOAD ONLY ASSIGNED LEAD
     // =================================================
 
     const lead =
       await Lead.findOne({
-        _id: leadId,
+
+        _id:
+          leadId,
+
         organizationId,
-        assignedTo: agentId,
+
+        assignedTo:
+          agentId,
+
       });
 
-    if (!lead) {
+
+    if (
+      !lead
+    ) {
+
       return res.status(404).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Lead not found.",
+
       });
     }
 
+
     // =================================================
-    // UPDATE STATUS
+    // VALIDATE CANONICAL TRANSITION
     // =================================================
 
-    lead.status =
-      normalizedStatus;
+    const currentStatus =
+      lead.status ||
+      "new";
 
-    await lead.save();
+
+    if (
+      !canTransitionLeadStatus(
+        currentStatus,
+        normalizedStatus
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          `Invalid lead lifecycle transition: ${currentStatus} → ${normalizedStatus}.`,
+
+      });
+    }
+
+
+    // =================================================
+    // CAPTURE PREVIOUS STATUS
+    // =================================================
+
+    const previousStatus =
+      currentStatus;
+
+
+    // =================================================
+    // APPLY CANONICAL TRANSITION
+    // =================================================
+
+    const transitionResult =
+      transitionLeadStatus(
+        lead,
+        normalizedStatus
+      );
+
+
+    // =================================================
+    // REQUEST / OPERATION ID
+    // =================================================
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-status-${String(
+          lead._id
+        )}`
+      );
+
+
+    // =================================================
+    // ATOMIC LEAD + OUTBOX TRANSACTION
+    // =================================================
+    //
+    // The Lead mutation and critical lifecycle events are
+    // committed together.
+    //
+    // =================================================
+
+    await withReliableTransaction(
+      async (
+        session
+      ) => {
+
+        await lead.save({
+          session,
+        });
+
+
+        // ---------------------------------------------
+        // STATUS CHANGED
+        // ---------------------------------------------
+
+        if (
+          transitionResult.changed
+        ) {
+
+          await addLeadStatusChangedEvent({
+
+            session,
+
+            lead,
+
+            organizationId,
+
+            previousStatus,
+
+            status:
+              lead.status,
+
+            operationId,
+
+          });
+
+
+          console.log(
+            "[AgentController] OUTBOX QUEUED: LEAD_STATUS_CHANGED"
+          );
+
+
+          // -------------------------------------------
+          // WON
+          // -------------------------------------------
+
+          if (
+            lead.status ===
+            "won"
+          ) {
+
+            await addLeadWonEvent({
+
+              session,
+
+              lead,
+
+              organizationId,
+
+              previousStatus,
+
+              operationId,
+
+            });
+
+
+            console.log(
+              "[AgentController] OUTBOX QUEUED: LEAD_WON"
+            );
+          }
+
+
+          // -------------------------------------------
+          // LOST
+          // -------------------------------------------
+
+          if (
+            lead.status ===
+            "lost"
+          ) {
+
+            await addLeadLostEvent({
+
+              session,
+
+              lead,
+
+              organizationId,
+
+              previousStatus,
+
+              operationId,
+
+            });
+
+
+            console.log(
+              "[AgentController] OUTBOX QUEUED: LEAD_LOST"
+            );
+          }
+        }
+
+      }
+    );
+
 
     console.log(
-      "[AgentController] Lead status updated:",
+      "[AgentController] Lead lifecycle transition completed:",
       {
+
         leadId:
           String(
             lead._id
           ),
 
+        previousStatus:
+          transitionResult.previousStatus,
+
         status:
-          lead.status,
+          transitionResult.status,
+
+        changed:
+          transitionResult.changed,
 
         agentId:
           String(
@@ -383,42 +1383,94 @@ export const updateLeadStatus = async (
           String(
             organizationId
           ),
+
       }
     );
 
+
     // =================================================
-    // EVENTS
+    // NON-CRITICAL PIPELINE SYNCHRONIZATION
     // =================================================
 
     emitLeadUpdate(
       lead
     );
 
+
     // =================================================
     // RESPONSE
     // =================================================
 
     return res.status(200).json({
-      success: true,
+
+      success:
+        true,
+
       message:
         "Lead status updated successfully.",
+
       data:
         lead,
+
+      lifecycle: {
+
+        previousStatus,
+
+        status:
+          lead.status,
+
+        changed:
+          previousStatus !==
+          lead.status,
+
+      },
+
     });
 
-  } catch (error) {
+
+  } catch (
+    error
+  ) {
+
     console.error(
       "[AgentController] UPDATE LEAD STATUS ERROR:",
       error
     );
 
+
+    if (
+      error?.message?.includes(
+        "Invalid Lead lifecycle transition"
+      ) ||
+      error?.message?.includes(
+        "Invalid Lead status"
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          error.message,
+
+      });
+    }
+
+
     return res.status(500).json({
-      success: false,
+
+      success:
+        false,
+
       message:
         "Failed to update lead status.",
+
     });
   }
 };
+
 
 // =====================================================
 // ADD LEAD NOTE
@@ -435,21 +1487,31 @@ export const addLeadNote = async (
   req,
   res
 ) => {
+
   try {
+
     console.log(
       "[AgentController] ADD LEAD NOTE REQUEST"
     );
+
 
     const {
       leadId,
       text,
     } = req.body || {};
 
+
     const agentId =
-      getAuthenticatedAgentId(req);
+      getAuthenticatedAgentId(
+        req
+      );
+
 
     const organizationId =
-      getAuthenticatedOrganizationId(req);
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
 
     // =================================================
     // AUTHENTICATION
@@ -459,12 +1521,18 @@ export const addLeadNote = async (
       !req.user ||
       !agentId
     ) {
+
       return res.status(401).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Authentication required.",
+
       });
     }
+
 
     // =================================================
     // ORGANIZATION
@@ -473,12 +1541,18 @@ export const addLeadNote = async (
     if (
       !organizationId
     ) {
+
       return res.status(403).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Organization not assigned.",
+
       });
     }
+
 
     // =================================================
     // LEAD ID
@@ -489,12 +1563,18 @@ export const addLeadNote = async (
         leadId
       )
     ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "A valid lead ID is required.",
+
       });
     }
+
 
     // =================================================
     // NOTE
@@ -504,12 +1584,18 @@ export const addLeadNote = async (
       !text ||
       !String(text).trim()
     ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Note text is required.",
+
       });
     }
+
 
     // =================================================
     // FIND ONLY AGENT'S LEAD
@@ -517,18 +1603,33 @@ export const addLeadNote = async (
 
     const lead =
       await Lead.findOne({
-        _id: leadId,
+
+        _id:
+          leadId,
+
         organizationId,
-        assignedTo: agentId,
+
+        assignedTo:
+          agentId,
+
       });
 
-    if (!lead) {
+
+    if (
+      !lead
+    ) {
+
       return res.status(404).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Lead not found.",
+
       });
     }
+
 
     // =================================================
     // ADD NOTE
@@ -539,13 +1640,17 @@ export const addLeadNote = async (
         lead.notes
       )
     ) {
+
       lead.notes = [];
     }
+
 
     const trimmedText =
       String(text).trim();
 
+
     lead.notes.push({
+
       text:
         trimmedText,
 
@@ -554,7 +1659,9 @@ export const addLeadNote = async (
 
       createdBy:
         agentId,
+
     });
+
 
     // =================================================
     // LEGACY COMPATIBILITY
@@ -563,11 +1670,14 @@ export const addLeadNote = async (
     lead.noteText =
       trimmedText;
 
+
     await lead.save();
+
 
     console.log(
       "[AgentController] Note added:",
       {
+
         leadId:
           String(
             lead._id
@@ -582,45 +1692,63 @@ export const addLeadNote = async (
           String(
             organizationId
           ),
+
       }
     );
 
+
     // =================================================
-    // EVENTS
+    // NON-CRITICAL EVENTS
     // =================================================
 
     emitLeadUpdate(
       lead
     );
 
+
     // =================================================
     // RESPONSE
     // =================================================
 
     return res.status(200).json({
-      success: true,
+
+      success:
+        true,
+
       message:
         "Lead note added successfully.",
+
       data:
         lead,
+
     });
 
-  } catch (error) {
+
+  } catch (
+    error
+  ) {
+
     console.error(
       "[AgentController] ADD LEAD NOTE ERROR:",
       error
     );
 
+
     return res.status(500).json({
-      success: false,
+
+      success:
+        false,
+
       message:
         "Failed to add lead note.",
+
     });
   }
 };
 
+
 // =====================================================
-// SCHEDULE VIEWING
+// REQUEST / SCHEDULE VIEWING
 // =====================================================
 //
 // AGENT ONLY
@@ -634,22 +1762,38 @@ export const scheduleViewing = async (
   req,
   res
 ) => {
+
   try {
+
     console.log(
-      "[AgentController] SCHEDULE VIEWING REQUEST"
+      "[AgentController] REQUEST VIEWING"
     );
+
 
     const {
       leadId,
+      propertyId,
       date,
+      viewingDate,
+      startTime,
+      endTime,
+      notes,
+      message,
       viewingStatus,
     } = req.body || {};
 
+
     const agentId =
-      getAuthenticatedAgentId(req);
+      getAuthenticatedAgentId(
+        req
+      );
+
 
     const organizationId =
-      getAuthenticatedOrganizationId(req);
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
 
     // =================================================
     // AUTHENTICATION
@@ -659,12 +1803,18 @@ export const scheduleViewing = async (
       !req.user ||
       !agentId
     ) {
+
       return res.status(401).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Authentication required.",
+
       });
     }
+
 
     // =================================================
     // ORGANIZATION
@@ -673,12 +1823,18 @@ export const scheduleViewing = async (
     if (
       !organizationId
     ) {
+
       return res.status(403).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Organization not assigned.",
+
       });
     }
+
 
     // =================================================
     // LEAD ID
@@ -689,242 +1845,2322 @@ export const scheduleViewing = async (
         leadId
       )
     ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "A valid lead ID is required.",
+
       });
     }
+
+
+    // =================================================
+    // PROPERTY ID
+    // =================================================
+
+    if (
+      propertyId &&
+      !isValidObjectId(
+        propertyId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid property ID is required.",
+
+      });
+    }
+
 
     // =================================================
     // DATE
     // =================================================
 
-    if (!date) {
+    const requestedViewingDate =
+      viewingDate ||
+      date ||
+      null;
+
+
+    if (
+      !requestedViewingDate
+    ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Viewing date is required.",
+
       });
     }
+
 
     const parsedDate =
-      parseDate(date);
+      parseDate(
+        requestedViewingDate
+      );
 
-    if (!parsedDate) {
+
+    if (
+      !parsedDate
+    ) {
+
       return res.status(400).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Invalid viewing date.",
+
       });
     }
 
+
     // =================================================
-    // FIND ONLY AGENT'S LEAD
+    // LOAD ONLY ASSIGNED LEAD
     // =================================================
 
-    const lead =
+    const leadBefore =
       await Lead.findOne({
-        _id: leadId,
+
+        _id:
+          leadId,
+
         organizationId,
-        assignedTo: agentId,
+
+        assignedTo:
+          agentId,
+
       });
 
-    if (!lead) {
+
+    if (
+      !leadBefore
+    ) {
+
       return res.status(404).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Lead not found.",
+
       });
     }
 
+
+    const previousLeadStatus =
+      leadBefore.status ||
+      "new";
+
+
     // =================================================
-    // VALID VIEWING STATUS
+    // CLIENT MUST NOT CONTROL VIEWING STATUS
     // =================================================
 
-    const allowedViewingStatuses = [
-      "none",
-      "requested",
-      "approved",
-      "scheduled",
-      "rescheduled",
-      "cancelled",
-      "completed",
-    ];
-
-    const normalizedViewingStatus =
+    if (
       viewingStatus
-        ? String(
-            viewingStatus
-          )
-            .trim()
-            .toLowerCase()
-        : "scheduled";
-
-    if (
-      !allowedViewingStatuses.includes(
-        normalizedViewingStatus
-      )
     ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Invalid viewing status.",
-        allowedViewingStatuses,
+
+      console.log(
+        "[AgentController] Legacy viewingStatus ignored. Viewing service owns viewing workflow:",
+        viewingStatus
+      );
+    }
+
+
+    // =================================================
+    // REQUEST VIEWING THROUGH DOMAIN SERVICE
+    // =================================================
+
+    const serviceResult =
+      await requestViewing({
+
+        leadId,
+
+        propertyId:
+          propertyId ||
+          null,
+
+        agentId,
+
+        organizationId,
+
+        date:
+          requestedViewingDate,
+
+        viewingDate:
+          requestedViewingDate,
+
+        startTime:
+          startTime ||
+          null,
+
+        endTime:
+          endTime ||
+          null,
+
+        notes:
+          notes ||
+          message ||
+          "",
+
+        requestedBy:
+          agentId,
+
       });
-    }
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      );
+
+
+    const serviceLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      );
+
 
     // =================================================
-    // UPDATE VIEWING
+    // LOAD FINAL LEAD
     // =================================================
 
-    lead.viewingStatus =
-      normalizedViewingStatus;
+    const finalLead =
+      serviceLead ||
+      await Lead.findOne({
 
-    lead.nextViewingDate =
-      parsedDate;
+        _id:
+          leadId,
 
-    // =================================================
-    // VIEWING REQUEST COUNT
-    // =================================================
-    //
-    // IMPORTANT:
-    // This is existing persisted viewing activity.
-    //
-    // We increment only when a viewing is actually
-    // requested/scheduled/rescheduled through this
-    // authenticated-agent endpoint.
-    //
-    // =================================================
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
 
     if (
-      normalizedViewingStatus ===
-        "requested" ||
-      normalizedViewingStatus ===
-        "scheduled" ||
-      normalizedViewingStatus ===
-        "rescheduled"
+      !finalLead
     ) {
-      lead.viewingRequestCount =
-        toNumber(
-          lead.viewingRequestCount,
-          0
-        ) + 1;
+
+      throw new Error(
+        "Lead could not be reloaded after viewing request."
+      );
     }
 
-    // =================================================
-    // ALIGN LEAD STATUS
-    // =================================================
-
-    if (
-      normalizedViewingStatus ===
-        "scheduled" ||
-      normalizedViewingStatus ===
-        "requested" ||
-      normalizedViewingStatus ===
-        "rescheduled"
-    ) {
-      lead.status =
-        "viewing";
-    }
-
-    // =================================================
-    // COMPLETED VIEWING
-    // =================================================
-
-    if (
-      normalizedViewingStatus ===
-      "completed"
-    ) {
-      lead.viewingCompleted =
-        true;
-    }
-
-    // =================================================
-    // CANCELLED VIEWING
-    // =================================================
-
-    if (
-      normalizedViewingStatus ===
-      "cancelled"
-    ) {
-      // Do not erase the historical
-      // viewingRequestCount.
-      //
-      // The request happened; cancellation
-      // is simply its resulting state.
-    }
-
-    await lead.save();
 
     console.log(
-      "[AgentController] Viewing updated:",
+      "[AgentController] Viewing request created:",
       {
+
+        viewingId:
+          viewing?._id
+            ? String(
+                viewing._id
+              )
+            : null,
+
         leadId:
           String(
-            lead._id
+            finalLead._id
           ),
+
+        leadStatus:
+          finalLead.status,
+
+        previousLeadStatus,
 
         viewingStatus:
-          lead.viewingStatus,
+          viewing?.status ||
+          null,
 
-        nextViewingDate:
-          lead.nextViewingDate,
-
-        status:
-          lead.status,
-
-        viewingRequestCount:
-          lead.viewingRequestCount,
-
-        viewingCompleted:
-          lead.viewingCompleted,
-
-        agentId:
-          String(
-            agentId
-          ),
-
-        organizationId:
-          String(
-            organizationId
-          ),
       }
     );
 
+
     // =================================================
-    // EVENTS
+    // REQUEST OPERATION ID
     // =================================================
 
-    emitLeadUpdate(
-      lead
-    );
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-request-${String(
+          viewing?._id ||
+          leadId
+        )}`
+      );
+
+
+    // =================================================
+    // VIEWING EVENT → OUTBOX
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus:
+        null,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE EVENT → OUTBOX
+    // =================================================
+
+    if (
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
 
     // =================================================
     // RESPONSE
     // =================================================
 
     return res.status(200).json({
-      success: true,
+
+      success:
+        true,
+
       message:
-        "Viewing scheduled successfully.",
-      data:
-        lead,
+        "Viewing request submitted successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
     });
 
-  } catch (error) {
+
+  } catch (
+    error
+  ) {
+
     console.error(
-      "[AgentController] SCHEDULE VIEWING ERROR:",
+      "[AgentController] REQUEST VIEWING ERROR:",
       error
     );
 
+
+    if (
+      error?.status
+    ) {
+
+      return res.status(
+        error.status
+      ).json({
+
+        success:
+          false,
+
+        message:
+          error.message,
+
+      });
+    }
+
+
     return res.status(500).json({
-      success: false,
+
+      success:
+        false,
+
       message:
-        "Failed to update viewing.",
+        "Failed to request viewing.",
+
+      error:
+        error.message,
+
     });
   }
 };
+
+
+// =====================================================
+// APPROVE VIEWING
+// =====================================================
+//
+// AGENT ONLY
+//
+// POST
+// /api/agent/approve-viewing
+//
+// =====================================================
+
+export const approveAgentViewing = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] APPROVE VIEWING REQUEST"
+    );
+
+
+    const {
+      viewingId,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const previousViewingStatus =
+      normalizeViewingStatus(
+        existingViewing.status
+      );
+
+
+    const previousLeadStatus =
+      lead.status ||
+      "new";
+
+
+    const serviceResult =
+      await approveViewing({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-approve-${String(
+          viewingId
+        )}`
+      );
+
+
+    // =================================================
+    // VIEWING EVENT → OUTBOX
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE → OUTBOX IF CHANGED
+    // =================================================
+
+    if (
+      finalLead &&
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing approved successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] APPROVE VIEWING ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to approve viewing.",
+
+    });
+  }
+};
+
+
+// =====================================================
+// REJECT VIEWING
+// =====================================================
+//
+// POST
+// /api/agent/reject-viewing
+//
+// =====================================================
+
+export const rejectAgentViewing = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] REJECT VIEWING REQUEST"
+    );
+
+
+    const {
+      viewingId,
+      reason,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const previousViewingStatus =
+      normalizeViewingStatus(
+        existingViewing.status
+      );
+
+
+    const previousLeadStatus =
+      lead.status ||
+      "new";
+
+
+    const serviceResult =
+      await rejectViewing({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+        reason:
+          reason ||
+          "",
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-reject-${String(
+          viewingId
+        )}`
+      );
+
+
+    // =================================================
+    // REJECTED HAS NO CANCELLED EVENT
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE EVENT IF SERVICE CHANGED IT
+    // =================================================
+
+    if (
+      finalLead &&
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing rejected successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] REJECT VIEWING ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to reject viewing.",
+
+    });
+  }
+};
+
+
+// =====================================================
+// RESCHEDULE VIEWING
+// =====================================================
+//
+// POST
+// /api/agent/reschedule-viewing
+//
+// =====================================================
+
+export const rescheduleAgentViewing = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] RESCHEDULE VIEWING REQUEST"
+    );
+
+
+    const {
+      viewingId,
+      date,
+      viewingDate,
+      startTime,
+      endTime,
+      reason,
+      notes,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const requestedDate =
+      viewingDate ||
+      date ||
+      null;
+
+
+    if (
+      !requestedDate
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A new viewing date is required.",
+
+      });
+    }
+
+
+    if (
+      !parseDate(
+        requestedDate
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "Invalid rescheduled viewing date.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const previousViewingStatus =
+      normalizeViewingStatus(
+        existingViewing.status
+      );
+
+
+    const previousLeadStatus =
+      lead.status ||
+      "new";
+
+
+    const serviceResult =
+      await rescheduleViewing({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+        date:
+          requestedDate,
+
+        viewingDate:
+          requestedDate,
+
+        startTime:
+          startTime ||
+          null,
+
+        endTime:
+          endTime ||
+          null,
+
+        reason:
+          reason ||
+          "",
+
+        notes:
+          notes ||
+          "",
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-reschedule-${String(
+          viewingId
+        )}`
+      );
+
+
+    // =================================================
+    // VIEWING EVENT → OUTBOX
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE → OUTBOX IF CHANGED
+    // =================================================
+
+    if (
+      finalLead &&
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing rescheduled successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] RESCHEDULE VIEWING ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to reschedule viewing.",
+
+    });
+  }
+};
+
+
+// =====================================================
+// CANCEL VIEWING
+// =====================================================
+//
+// POST
+// /api/agent/cancel-viewing
+//
+// =====================================================
+
+export const cancelAgentViewing = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] CANCEL VIEWING REQUEST"
+    );
+
+
+    const {
+      viewingId,
+      reason,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const previousViewingStatus =
+      normalizeViewingStatus(
+        existingViewing.status
+      );
+
+
+    const previousLeadStatus =
+      lead.status ||
+      "new";
+
+
+    const serviceResult =
+      await cancelViewing({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+        reason:
+          reason ||
+          "",
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-cancel-${String(
+          viewingId
+        )}`
+      );
+
+
+    // =================================================
+    // VIEWING EVENT → OUTBOX
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE → OUTBOX IF CHANGED
+    // =================================================
+
+    if (
+      finalLead &&
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing cancelled successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] CANCEL VIEWING ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to cancel viewing.",
+
+    });
+  }
+};
+
+
+// =====================================================
+// COMPLETE VIEWING
+// =====================================================
+//
+// POST
+// /api/agent/complete-viewing
+//
+// IMPORTANT
+// -----------------------------------------------------
+//
+// Completion of a viewing does NOT automatically change:
+//
+//   Lead.status = qualified
+//
+// or:
+//
+//   Lead.status = negotiation
+//
+// The Lead lifecycle remains governed by the lifecycle
+// service and the actual post-viewing outcome.
+//
+// =====================================================
+
+export const completeAgentViewing = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] COMPLETE VIEWING REQUEST"
+    );
+
+
+    const {
+      viewingId,
+      notes,
+      outcome,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const previousViewingStatus =
+      normalizeViewingStatus(
+        existingViewing.status
+      );
+
+
+    const previousLeadStatus =
+      lead.status ||
+      "new";
+
+
+    const serviceResult =
+      await completeViewing({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+        notes:
+          notes ||
+          "",
+
+        outcome:
+          outcome ||
+          null,
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    const operationId =
+      getRequestOperationId(
+        req,
+        `agent-viewing-complete-${String(
+          viewingId
+        )}`
+      );
+
+
+    // =================================================
+    // VIEWING EVENT → OUTBOX
+    // =================================================
+
+    await queueViewingEvent({
+
+      viewing,
+
+      lead:
+        finalLead,
+
+      previousViewingStatus,
+
+      operationId,
+
+    });
+
+
+    // =================================================
+    // LEAD LIFECYCLE → OUTBOX IF CHANGED
+    // =================================================
+
+    if (
+      finalLead &&
+      previousLeadStatus !==
+      finalLead.status
+    ) {
+
+      await queueLifecycleEvents({
+
+        lead:
+          finalLead,
+
+        previousStatus:
+          previousLeadStatus,
+
+        operationId,
+
+      });
+
+    } else if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing completed successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] COMPLETE VIEWING ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to complete viewing.",
+
+    });
+  }
+};
+
+
+// =====================================================
+// SUBMIT VIEWING FEEDBACK
+// =====================================================
+//
+// POST
+// /api/agent/viewing-feedback
+//
+// =====================================================
+
+export const submitViewingFeedback = async (
+  req,
+  res
+) => {
+
+  try {
+
+    console.log(
+      "[AgentController] SUBMIT VIEWING FEEDBACK REQUEST"
+    );
+
+
+    const {
+      viewingId,
+      feedback,
+      rating,
+      comment,
+      interested,
+      outcome,
+      followUpDate,
+    } = req.body || {};
+
+
+    const agentId =
+      getAuthenticatedAgentId(
+        req
+      );
+
+
+    const organizationId =
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
+
+    if (
+      !req.user ||
+      !agentId
+    ) {
+
+      return res.status(401).json({
+
+        success:
+          false,
+
+        message:
+          "Authentication required.",
+
+      });
+    }
+
+
+    if (
+      !organizationId
+    ) {
+
+      return res.status(403).json({
+
+        success:
+          false,
+
+        message:
+          "Organization not assigned.",
+
+      });
+    }
+
+
+    if (
+      !isValidObjectId(
+        viewingId
+      )
+    ) {
+
+      return res.status(400).json({
+
+        success:
+          false,
+
+        message:
+          "A valid viewing ID is required.",
+
+      });
+    }
+
+
+    const existingViewing =
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      }).lean();
+
+
+    if (
+      !existingViewing
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Viewing not found.",
+
+      });
+    }
+
+
+    const lead =
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    if (
+      !lead
+    ) {
+
+      return res.status(404).json({
+
+        success:
+          false,
+
+        message:
+          "Assigned lead not found.",
+
+      });
+    }
+
+
+    const feedbackPayload = {
+
+      ...(feedback || {}),
+
+      rating:
+        rating ??
+        feedback?.rating ??
+        null,
+
+      comment:
+        comment ??
+        feedback?.comment ??
+        "",
+
+      interested:
+        interested ??
+        feedback?.interested ??
+        null,
+
+      outcome:
+        outcome ??
+        feedback?.outcome ??
+        null,
+
+      followUpDate:
+        followUpDate ??
+        feedback?.followUpDate ??
+        null,
+
+      submittedBy:
+        agentId,
+
+      submittedAt:
+        new Date(),
+
+    };
+
+
+    const serviceResult =
+      await submitFeedback({
+
+        viewingId,
+
+        agentId,
+
+        organizationId,
+
+        feedback:
+          feedbackPayload,
+
+      });
+
+
+    const viewing =
+      extractViewingFromResult(
+        serviceResult
+      ) ||
+      await Viewing.findOne({
+
+        _id:
+          viewingId,
+
+        organizationId,
+
+      });
+
+
+    const finalLead =
+      extractLeadFromViewingResult(
+        serviceResult
+      ) ||
+      await Lead.findOne({
+
+        _id:
+          existingViewing.leadId,
+
+        organizationId,
+
+        assignedTo:
+          agentId,
+
+      });
+
+
+    // =================================================
+    // FEEDBACK DOES NOT CHANGE VIEWING STATUS HERE
+    // =================================================
+    //
+    // Therefore no viewing transition event is produced.
+    //
+    // Generic lead/pipeline synchronization remains direct
+    // during this migration phase.
+    // =================================================
+
+    if (
+      finalLead
+    ) {
+
+      emitLeadUpdate(
+        finalLead
+      );
+    }
+
+
+    return res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Viewing feedback submitted successfully.",
+
+      data: {
+
+        viewing,
+
+        lead:
+          finalLead,
+
+      },
+
+    });
+
+
+  } catch (
+    error
+  ) {
+
+    console.error(
+      "[AgentController] SUBMIT VIEWING FEEDBACK ERROR:",
+      error
+    );
+
+
+    return res.status(
+      error?.status ||
+      500
+    ).json({
+
+      success:
+        false,
+
+      message:
+        error?.message ||
+        "Failed to submit viewing feedback.",
+
+    });
+  }
+};
+
 
 // =====================================================
 // GET AGENT PERFORMANCE
@@ -944,12 +4180,7 @@ export const scheduleViewing = async (
 //
 // from the client.
 //
-// It uses:
-//
-//   req.agentId
-//   req.organizationId
-//
-// established by authentication.
+// It uses authenticated context only.
 //
 // =====================================================
 
@@ -957,25 +4188,35 @@ export const getAgentPerformance = async (
   req,
   res
 ) => {
+
   try {
+
     console.log(
       "[AgentPerformance] REQUEST RECEIVED"
     );
+
 
     // =================================================
     // AUTHENTICATED AGENT
     // =================================================
 
     const authenticatedAgentId =
-      getAuthenticatedAgentId(req);
+      getAuthenticatedAgentId(
+        req
+      );
+
 
     const organizationId =
-      getAuthenticatedOrganizationId(req);
+      await getAuthenticatedOrganizationId(
+        req
+      );
+
 
     const authenticatedAgentName =
       req.user?.name ||
       req.user?.email ||
       "Agent";
+
 
     // =================================================
     // DEBUG AUTH CONTEXT
@@ -984,6 +4225,7 @@ export const getAgentPerformance = async (
     console.log(
       "[AgentPerformance] Authenticated context:",
       {
+
         agentId:
           authenticatedAgentId
             ? String(
@@ -1004,8 +4246,10 @@ export const getAgentPerformance = async (
         role:
           req.user?.role ||
           null,
+
       }
     );
+
 
     // =================================================
     // AUTHENTICATION
@@ -1015,16 +4259,23 @@ export const getAgentPerformance = async (
       !req.user ||
       !authenticatedAgentId
     ) {
+
       console.error(
         "[AgentPerformance] Missing authenticated agent ID."
       );
 
+
       return res.status(401).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Authenticated agent could not be identified.",
+
       });
     }
+
 
     // =================================================
     // ORGANIZATION
@@ -1033,34 +4284,42 @@ export const getAgentPerformance = async (
     if (
       !organizationId
     ) {
+
       console.error(
         "[AgentPerformance] Missing authenticated organization ID."
       );
 
+
       return res.status(403).json({
-        success: false,
+
+        success:
+          false,
+
         message:
           "Organization not assigned.",
+
       });
     }
 
+
     // =================================================
-    // AUTHORITATIVE QUERY
-    // =================================================
-    //
-    // assignedTo is the authoritative assignment field.
-    //
+    // AUTHORITATIVE LEAD QUERY
     // =================================================
 
     const agentQuery = {
+
       organizationId,
+
       assignedTo:
         authenticatedAgentId,
+
     };
+
 
     console.log(
       "[AgentPerformance] AUTHORITATIVE QUERY:",
       {
+
         organizationId:
           String(
             organizationId
@@ -1070,8 +4329,10 @@ export const getAgentPerformance = async (
           String(
             authenticatedAgentId
           ),
+
       }
     );
+
 
     // =================================================
     // COUNT ASSIGNED LEADS
@@ -1082,10 +4343,12 @@ export const getAgentPerformance = async (
         agentQuery
       );
 
+
     console.log(
       "[AgentPerformance] ASSIGNED LEAD COUNT:",
       assignedLeadCount
     );
+
 
     // =================================================
     // FIND AGENT LEADS
@@ -1096,14 +4359,17 @@ export const getAgentPerformance = async (
         agentQuery
       )
         .sort({
-          updatedAt: -1,
+          updatedAt:
+            -1,
         })
         .lean();
+
 
     console.log(
       "[AgentPerformance] Agent leads found:",
       leads.length
     );
+
 
     // =================================================
     // DEBUG ASSIGNMENTS
@@ -1112,7 +4378,10 @@ export const getAgentPerformance = async (
     console.log(
       "[AgentPerformance] Assigned lead IDs:",
       leads.map(
-        (lead) => ({
+        (
+          lead
+        ) => ({
+
           id:
             lead?._id
               ? String(
@@ -1137,9 +4406,15 @@ export const getAgentPerformance = async (
           status:
             lead?.status ||
             null,
+
+          score:
+            lead?.score ||
+            0,
+
         })
       )
     );
+
 
     // =================================================
     // STATUS HELPER
@@ -1148,12 +4423,15 @@ export const getAgentPerformance = async (
     const getStatus = (
       lead
     ) => {
+
       return String(
-        lead?.status || ""
+        lead?.status ||
+        ""
       )
         .trim()
         .toLowerCase();
     };
+
 
     // =================================================
     // BASIC LEADS
@@ -1161,6 +4439,7 @@ export const getAgentPerformance = async (
 
     const totalLeads =
       assignedLeadCount;
+
 
     // =================================================
     // QUALIFIED LEADS
@@ -1173,6 +4452,22 @@ export const getAgentPerformance = async (
           "qualified"
       ).length;
 
+
+    // =================================================
+    // HOT LEADS
+    // =================================================
+
+    const hotLeads =
+      leads.filter(
+        (lead) =>
+          Number(
+            lead?.score ||
+            0
+          ) >=
+          HOT_SCORE_THRESHOLD
+      ).length;
+
+
     // =================================================
     // CONVERTED / WON
     // =================================================
@@ -1183,6 +4478,7 @@ export const getAgentPerformance = async (
           getStatus(lead) ===
           "won"
       ).length;
+
 
     // =================================================
     // LOST
@@ -1195,27 +4491,9 @@ export const getAgentPerformance = async (
           "lost"
       ).length;
 
+
     // =====================================================
     // FOLLOW-UP METRICS
-    // =====================================================
-    //
-    // IMPORTANT
-    // -----------------------------------------------------
-    // Current Lead schema contains follow-up STATE:
-    //
-    //   nextFollowUpDate
-    //   followUpStatus
-    //   followUpOutcome
-    //   followUpUpdatedAt
-    //
-    // There is NO followUpHistory[].
-    //
-    // Therefore we deliberately do NOT pretend that
-    // followUpUpdatedAt represents an individual follow-up
-    // event.
-    //
-    // We count only persisted follow-up state.
-    //
     // =====================================================
 
     let totalFollowUps = 0;
@@ -1226,8 +4504,10 @@ export const getAgentPerformance = async (
 
     let overdueFollowUps = 0;
 
+
     const today =
       new Date();
+
 
     today.setHours(
       0,
@@ -1236,11 +4516,16 @@ export const getAgentPerformance = async (
       0
     );
 
+
     leads.forEach(
-      (lead) => {
+      (
+        lead
+      ) => {
+
         const followUpDate =
           lead?.nextFollowUpDate ||
-          lead?.followUpDate;
+          null;
+
 
         const followUpStatus =
           String(
@@ -1250,8 +4535,9 @@ export const getAgentPerformance = async (
             .trim()
             .toLowerCase();
 
+
         // -------------------------------------------------
-        // No persisted follow-up state
+        // NO PERSISTED FOLLOW-UP STATE
         // -------------------------------------------------
 
         if (
@@ -1259,11 +4545,14 @@ export const getAgentPerformance = async (
           followUpStatus !==
             "completed"
         ) {
+
           return;
         }
 
+
         totalFollowUps +=
           1;
+
 
         // -------------------------------------------------
         // COMPLETED
@@ -1273,11 +4562,13 @@ export const getAgentPerformance = async (
           followUpStatus ===
           "completed"
         ) {
+
           completedFollowUps +=
             1;
 
           return;
         }
+
 
         // -------------------------------------------------
         // CANCELLED
@@ -1287,8 +4578,10 @@ export const getAgentPerformance = async (
           followUpStatus ===
           "cancelled"
         ) {
+
           return;
         }
+
 
         // -------------------------------------------------
         // PENDING / SCHEDULED
@@ -1300,28 +4593,37 @@ export const getAgentPerformance = async (
           followUpStatus ===
             "scheduled"
         ) {
+
           pendingFollowUps +=
             1;
         }
+
 
         // -------------------------------------------------
         // OVERDUE
         // -------------------------------------------------
 
-        if (!followUpDate) {
+        if (
+          !followUpDate
+        ) {
+
           return;
         }
+
 
         const parsedFollowUpDate =
           parseDate(
             followUpDate
           );
 
+
         if (
           !parsedFollowUpDate
         ) {
+
           return;
         }
+
 
         parsedFollowUpDate.setHours(
           0,
@@ -1330,19 +4632,24 @@ export const getAgentPerformance = async (
           0
         );
 
+
         if (
           parsedFollowUpDate <
           today
         ) {
+
           overdueFollowUps +=
             1;
         }
+
       }
     );
+
 
     console.log(
       "[AgentPerformance] REAL PERSISTED FOLLOW-UP METRICS:",
       {
+
         totalFollowUps,
 
         completedFollowUps,
@@ -1350,31 +4657,50 @@ export const getAgentPerformance = async (
         pendingFollowUps,
 
         overdueFollowUps,
+
       }
     );
+
 
     // =====================================================
     // VIEWING METRICS
     // =====================================================
-    //
-    // AUTHORITATIVE EXISTING LEAD FIELDS:
-    //
-    //   viewingStatus
-    //   nextViewingDate
-    //   viewingRequestCount
-    //   viewingCompleted
-    //
-    // We do NOT infer viewing activity from:
-    //
-    //   updatedAt
-    //   lastContact
-    //   status === "viewing" alone
-    //
-    // For legacy records with an explicit viewingStatus
-    // but no request count, one viewing activity is allowed
-    // as a backward-compatible persisted viewing record.
-    //
-    // =====================================================
+
+    const assignedLeadIds =
+      leads.map(
+        (
+          lead
+        ) =>
+          lead._id
+      );
+
+
+    let viewingDocuments = [];
+
+
+    if (
+      assignedLeadIds.length >
+      0
+    ) {
+
+      viewingDocuments =
+        await Viewing.find({
+
+          organizationId,
+
+          leadId: {
+            $in:
+              assignedLeadIds,
+          },
+
+        })
+          .sort({
+            createdAt:
+              -1,
+          })
+          .lean();
+    }
+
 
     let totalViewings = 0;
 
@@ -1384,7 +4710,11 @@ export const getAgentPerformance = async (
 
     let cancelledViewings = 0;
 
+    let rejectedViewings = 0;
+
     let requestedViewings = 0;
+
+    let pendingApprovalViewings = 0;
 
     let scheduledViewings = 0;
 
@@ -1392,148 +4722,149 @@ export const getAgentPerformance = async (
 
     let approvedViewings = 0;
 
-    leads.forEach(
-      (lead) => {
+
+    const now =
+      new Date();
+
+
+    viewingDocuments.forEach(
+      (
+        viewing
+      ) => {
+
         const viewingStatus =
-          String(
-            lead?.viewingStatus ||
-            "none"
-          )
-            .trim()
-            .toLowerCase();
-
-        const requestCount =
-          toNumber(
-            lead?.viewingRequestCount,
-            0
+          normalizeViewingStatus(
+            viewing?.status
           );
 
-        // -------------------------------------------------
-        // ACTUAL PERSISTED VIEWING ACTIVITY
-        // -------------------------------------------------
-
-        const hasExplicitViewingCount =
-          requestCount > 0;
-
-        const hasLegacyViewingState =
-          [
-            "requested",
-            "approved",
-            "scheduled",
-            "rescheduled",
-            "cancelled",
-            "completed",
-          ].includes(
-            viewingStatus
-          );
 
         if (
-          hasExplicitViewingCount
+          !viewingStatus
         ) {
-          totalViewings +=
-            requestCount;
-        } else if (
-          hasLegacyViewingState
-        ) {
-          totalViewings +=
-            1;
+
+          return;
         }
 
+
+        totalViewings +=
+          1;
+
+
+        switch (
+          viewingStatus
+        ) {
+
+          case "Requested":
+
+            requestedViewings +=
+              1;
+
+            break;
+
+
+          case "Pending Approval":
+
+            pendingApprovalViewings +=
+              1;
+
+            break;
+
+
+          case "Approved":
+
+            approvedViewings +=
+              1;
+
+            scheduledViewings +=
+              1;
+
+            break;
+
+
+          case "Rescheduled":
+
+            rescheduledViewings +=
+              1;
+
+            scheduledViewings +=
+              1;
+
+            break;
+
+
+          case "Rejected":
+
+            rejectedViewings +=
+              1;
+
+            break;
+
+
+          case "Cancelled":
+
+            cancelledViewings +=
+              1;
+
+            break;
+
+
+          case "Completed":
+
+            completedViewings +=
+              1;
+
+            break;
+
+
+          default:
+
+            break;
+        }
+
+
         // -------------------------------------------------
-        // STATUS BREAKDOWN
+        // UPCOMING SCHEDULED VIEWING
         // -------------------------------------------------
 
         if (
           viewingStatus ===
-          "requested"
-        ) {
-          requestedViewings +=
-            1;
-        }
-
-        if (
+            "Approved" ||
           viewingStatus ===
-          "approved"
+            "Rescheduled"
         ) {
-          approvedViewings +=
-            1;
-        }
 
-        if (
-          viewingStatus ===
-          "scheduled"
-        ) {
-          scheduledViewings +=
-            1;
-        }
-
-        if (
-          viewingStatus ===
-          "rescheduled"
-        ) {
-          rescheduledViewings +=
-            1;
-        }
-
-        if (
-          viewingStatus ===
-          "cancelled"
-        ) {
-          cancelledViewings +=
-            1;
-        }
-
-        // -------------------------------------------------
-        // COMPLETED
-        // -------------------------------------------------
-
-        if (
-          viewingStatus ===
-            "completed" ||
-          lead?.viewingCompleted ===
-            true
-        ) {
-          completedViewings +=
-            1;
-        }
-
-        // -------------------------------------------------
-        // UPCOMING
-        // -------------------------------------------------
-
-        if (
-          [
-            "approved",
-            "scheduled",
-            "rescheduled",
-          ].includes(
-            viewingStatus
-          ) &&
-          lead?.nextViewingDate
-        ) {
           const viewingDate =
             parseDate(
-              lead.nextViewingDate
+              viewing.startTime ||
+              viewing.date ||
+              viewing.viewingDate
             );
+
 
           if (
             viewingDate &&
             viewingDate >=
-              new Date()
+              now
           ) {
+
             upcomingViewings +=
               1;
           }
         }
+
       }
     );
+
 
     console.log(
       "[AgentPerformance] REAL VIEWING METRICS:",
       {
+
         totalViewings,
 
         requestedViewings,
+
+        pendingApprovalViewings,
 
         approvedViewings,
 
@@ -1546,60 +4877,49 @@ export const getAgentPerformance = async (
         upcomingViewings,
 
         cancelledViewings,
+
+        rejectedViewings,
+
       }
     );
 
+
     // =====================================================
     // CALL METRICS
-    // =====================================================
-    //
-    // IMPORTANT
-    // -----------------------------------------------------
-    // Calls are NOT inferred from:
-    //
-    //   lastContact
-    //   updatedAt
-    //   followUpUpdatedAt
-    //
-    // Those are timestamps, not proof of a call.
-    //
-    // The authoritative call activity is:
-    //
-    //   Lead.callHistory[]
-    //
-    // Only entries where:
-    //
-    //   call.agent === authenticatedAgentId
-    //
-    // are counted.
-    //
     // =====================================================
 
     let callsMade = 0;
 
     const agentCallActivity = [];
 
+
     leads.forEach(
-      (lead) => {
+      (
+        lead
+      ) => {
+
         if (
           !Array.isArray(
             lead?.callHistory
           )
         ) {
+
           return;
         }
 
+
         lead.callHistory.forEach(
-          (call) => {
+          (
+            call
+          ) => {
+
             if (
               !call
             ) {
+
               return;
             }
 
-            // -------------------------------------------------
-            // STRICT AGENT OWNERSHIP
-            // -------------------------------------------------
 
             if (
               !sameId(
@@ -1607,17 +4927,17 @@ export const getAgentPerformance = async (
                 authenticatedAgentId
               )
             ) {
+
               return;
             }
 
-            // -------------------------------------------------
-            // VALID CALL ACTIVITY
-            // -------------------------------------------------
 
             callsMade +=
               1;
 
+
             agentCallActivity.push({
+
               type:
                 "call",
 
@@ -1627,7 +4947,7 @@ export const getAgentPerformance = async (
                   lead._id
                 )}-${String(
                   call.calledAt ||
-                    ""
+                  ""
                 )}`,
 
               leadId:
@@ -1651,66 +4971,39 @@ export const getAgentPerformance = async (
 
               agent:
                 call.agent,
+
             });
+
           }
         );
+
       }
     );
+
 
     console.log(
       "[AgentPerformance] REAL CALL METRICS:",
       {
+
         callsMade,
 
         callRecords:
           agentCallActivity.length,
+
       }
     );
+
 
     // =====================================================
     // CONVERSATION / MESSAGE METRICS
     // =====================================================
-    //
-    // Conversation.js stores conversation metadata.
-    //
-    // Message.js stores the actual messages.
-    //
-    // Therefore:
-    //
-    // ❌ conversation.messageCount is NOT used.
-    //
-    // ❌ total conversation messages are NOT treated
-    //    as agent activity.
-    //
-    // We locate conversations belonging to this agent's
-    // organization and either:
-    //
-    //   assignedAgent === authenticatedAgentId
-    //
-    // OR:
-    //
-    //   leadId belongs to one of this agent's leads.
-    //
-    // Then we count ONLY messages where:
-    //
-    //   senderRole === "agent"
-    //
-    // AND:
-    //
-    //   senderId === authenticatedAgentId
-    //
-    // =====================================================
-
-    const assignedLeadIds =
-      leads.map(
-        (lead) =>
-          lead._id
-      );
 
     const conversationQuery = {
+
       organizationId,
 
       $or: [
+
         {
           assignedAgent:
             authenticatedAgentId,
@@ -1726,20 +5019,32 @@ export const getAgentPerformance = async (
               },
             ]
           : []),
+
       ],
     };
+
 
     const conversations =
       await Conversation.find(
         conversationQuery
       )
         .select({
-          _id: 1,
-          leadId: 1,
-          assignedAgent: 1,
-          organizationId: 1,
+
+          _id:
+            1,
+
+          leadId:
+            1,
+
+          assignedAgent:
+            1,
+
+          organizationId:
+            1,
+
         })
         .lean();
+
 
     const conversationIds =
       conversations.map(
@@ -1749,16 +5054,22 @@ export const getAgentPerformance = async (
           conversation._id
       );
 
+
     let messagesSent = 0;
 
     const agentMessageActivity = [];
+
 
     if (
       conversationIds.length >
       0
     ) {
+
       const agentMessages =
         await Message.find({
+
+          organizationId,
+
           conversationId: {
             $in:
               conversationIds,
@@ -1771,35 +5082,52 @@ export const getAgentPerformance = async (
             authenticatedAgentId,
 
           deleted: {
-            $ne: true,
+            $ne:
+              true,
           },
+
         })
           .select({
-            _id: 1,
 
-            conversationId: 1,
+            _id:
+              1,
 
-            senderId: 1,
+            conversationId:
+              1,
 
-            senderRole: 1,
+            senderId:
+              1,
 
-            text: 1,
+            senderRole:
+              1,
 
-            createdAt: 1,
+            text:
+              1,
+
+            createdAt:
+              1,
+
           })
           .sort({
-            createdAt: -1,
+
+            createdAt:
+              -1,
+
           })
           .lean();
 
+
       messagesSent =
         agentMessages.length;
+
 
       agentMessages.forEach(
         (
           message
         ) => {
+
           agentMessageActivity.push({
+
             type:
               "message",
 
@@ -1822,14 +5150,18 @@ export const getAgentPerformance = async (
             createdAt:
               message.createdAt ||
               null,
+
           });
+
         }
       );
     }
 
+
     console.log(
       "[AgentPerformance] REAL MESSAGE METRICS:",
       {
+
         conversations:
           conversations.length,
 
@@ -1840,8 +5172,10 @@ export const getAgentPerformance = async (
 
         agentMessageRecords:
           agentMessageActivity.length,
+
       }
     );
+
 
     // =====================================================
     // REAL AGENT COMMUNICATION SUMMARY
@@ -1851,16 +5185,20 @@ export const getAgentPerformance = async (
       callsMade +
       messagesSent;
 
+
     console.log(
       "[AgentPerformance] REAL AGENT COMMUNICATION:",
       {
+
         callsMade,
 
         messagesSent,
 
         totalAgentCommunication,
+
       }
     );
+
 
     // =====================================================
     // FOLLOW-UP COMPLETION RATE
@@ -1869,6 +5207,7 @@ export const getAgentPerformance = async (
     const followUpCompletionRate =
       totalFollowUps > 0
         ? Number(
+
             (
               (
                 completedFollowUps /
@@ -1878,8 +5217,10 @@ export const getAgentPerformance = async (
             ).toFixed(
               1
             )
+
           )
         : 0;
+
 
     // =====================================================
     // VIEWING COMPLETION RATE
@@ -1888,6 +5229,7 @@ export const getAgentPerformance = async (
     const viewingCompletionRate =
       totalViewings > 0
         ? Number(
+
             (
               (
                 completedViewings /
@@ -1897,8 +5239,10 @@ export const getAgentPerformance = async (
             ).toFixed(
               1
             )
+
           )
         : 0;
+
 
     // =====================================================
     // CONVERSION RATE
@@ -1907,6 +5251,7 @@ export const getAgentPerformance = async (
     const conversionRate =
       totalLeads > 0
         ? Number(
+
             (
               (
                 convertedLeads /
@@ -1916,32 +5261,22 @@ export const getAgentPerformance = async (
             ).toFixed(
               1
             )
+
           )
         : 0;
+
 
     // =====================================================
     // RECENT REAL ACTIVITY
     // =====================================================
-    //
-    // ONLY actual agent communication is included:
-    //
-    // ✓ calls
-    // ✓ messages
-    //
-    // Deliberately excluded:
-    //
-    // ❌ updatedAt
-    // ❌ lastContact
-    // ❌ followUpUpdatedAt
-    // ❌ generic lead status changes
-    //
-    // =====================================================
 
     const recentActivity = [
+
       ...agentCallActivity.map(
         (
           activity
         ) => ({
+
           id:
             activity.id,
 
@@ -1964,13 +5299,16 @@ export const getAgentPerformance = async (
           status:
             activity.outcome ||
             "",
+
         })
       ),
+
 
       ...agentMessageActivity.map(
         (
           activity
         ) => ({
+
           id:
             activity.id,
 
@@ -1992,20 +5330,24 @@ export const getAgentPerformance = async (
 
           status:
             "sent",
+
         })
       ),
+
     ]
       .sort(
         (
           first,
           second
         ) => {
+
           const firstDate =
             first?.date
               ? new Date(
                   first.date
                 ).getTime()
               : 0;
+
 
           const secondDate =
             second?.date
@@ -2014,10 +5356,12 @@ export const getAgentPerformance = async (
                 ).getTime()
               : 0;
 
+
           return (
             secondDate -
             firstDate
           );
+
         }
       )
       .slice(
@@ -2025,17 +5369,21 @@ export const getAgentPerformance = async (
         20
       );
 
+
     console.log(
       "[AgentPerformance] RECENT REAL ACTIVITY:",
       recentActivity
     );
+
 
     // =====================================================
     // PERFORMANCE OBJECT
     // =====================================================
 
     const performance = {
+
       agent: {
+
         id:
           authenticatedAgentId
             ? String(
@@ -2045,31 +5393,40 @@ export const getAgentPerformance = async (
 
         name:
           authenticatedAgentName,
+
       },
+
 
       // ---------------------------------------------------
       // LEADS
       // ---------------------------------------------------
 
       leads: {
+
         total:
           totalLeads,
 
         qualified:
           qualifiedLeads,
 
+        hot:
+          hotLeads,
+
         converted:
           convertedLeads,
 
         lost:
           lostLeads,
+
       },
+
 
       // ---------------------------------------------------
       // FOLLOW-UPS
       // ---------------------------------------------------
 
       followUps: {
+
         total:
           totalFollowUps,
 
@@ -2084,18 +5441,24 @@ export const getAgentPerformance = async (
 
         completionRate:
           followUpCompletionRate,
+
       },
+
 
       // ---------------------------------------------------
       // VIEWINGS
       // ---------------------------------------------------
 
       viewings: {
+
         total:
           totalViewings,
 
         requested:
           requestedViewings,
+
+        pendingApproval:
+          pendingApprovalViewings,
 
         approved:
           approvedViewings,
@@ -2105,6 +5468,9 @@ export const getAgentPerformance = async (
 
         rescheduled:
           rescheduledViewings,
+
+        rejected:
+          rejectedViewings,
 
         completed:
           completedViewings,
@@ -2117,20 +5483,25 @@ export const getAgentPerformance = async (
 
         completionRate:
           viewingCompletionRate,
+
       },
+
 
       // ---------------------------------------------------
       // COMMUNICATION
       // ---------------------------------------------------
 
       communication: {
+
         callsMade,
 
         messagesSent,
 
         total:
           totalAgentCommunication,
+
       },
+
 
       // ---------------------------------------------------
       // BACKWARD COMPATIBILITY
@@ -2140,14 +5511,18 @@ export const getAgentPerformance = async (
 
       messagesSent,
 
+
       // ---------------------------------------------------
       // CONVERSION
       // ---------------------------------------------------
 
       conversion: {
+
         rate:
           conversionRate,
+
       },
+
 
       // ---------------------------------------------------
       // RECENT ACTIVITY
@@ -2155,14 +5530,18 @@ export const getAgentPerformance = async (
 
       recentActivity,
 
+
       // ---------------------------------------------------
       // SUMMARY
       // ---------------------------------------------------
 
       summary: {
+
         totalLeads,
 
         qualifiedLeads,
+
+        hotLeads,
 
         convertedLeads,
 
@@ -2180,11 +5559,15 @@ export const getAgentPerformance = async (
 
         requestedViewings,
 
+        pendingApprovalViewings,
+
         approvedViewings,
 
         scheduledViewings,
 
         rescheduledViewings,
+
+        rejectedViewings,
 
         upcomingViewings,
 
@@ -2203,8 +5586,11 @@ export const getAgentPerformance = async (
         followUpCompletionRate,
 
         viewingCompletionRate,
+
       },
+
     };
+
 
     // =====================================================
     // DEBUG FINAL PERFORMANCE
@@ -2215,14 +5601,19 @@ export const getAgentPerformance = async (
       performance
     );
 
+
     console.log(
       "[AgentPerformance] FINAL REAL METRICS:",
       {
+
         assignedLeads:
           totalLeads,
 
         qualifiedLeads:
           qualifiedLeads,
+
+        hotLeads:
+          hotLeads,
 
         convertedLeads:
           convertedLeads,
@@ -2248,6 +5639,9 @@ export const getAgentPerformance = async (
         requestedViewings:
           requestedViewings,
 
+        pendingApprovalViewings:
+          pendingApprovalViewings,
+
         approvedViewings:
           approvedViewings,
 
@@ -2256,6 +5650,9 @@ export const getAgentPerformance = async (
 
         rescheduledViewings:
           rescheduledViewings,
+
+        rejectedViewings:
+          rejectedViewings,
 
         completedViewings:
           completedViewings,
@@ -2274,30 +5671,73 @@ export const getAgentPerformance = async (
 
         totalAgentCommunication:
           totalAgentCommunication,
+
       }
     );
+
 
     // =====================================================
     // RESPONSE
     // =====================================================
 
     return res.status(200).json({
-      success: true,
+
+      success:
+        true,
 
       data:
         performance,
+
     });
 
-  } catch (error) {
+
+  } catch (
+    error
+  ) {
+
     console.error(
       "[AgentController] GET AGENT PERFORMANCE ERROR:",
       error
     );
 
+
     return res.status(500).json({
-      success: false,
+
+      success:
+        false,
+
       message:
         "Failed to load agent performance.",
+
     });
   }
+};
+
+
+// =====================================================
+// DEFAULT EXPORT
+// =====================================================
+
+export default {
+
+  updateLeadStatus,
+
+  addLeadNote,
+
+  scheduleViewing,
+
+  approveAgentViewing,
+
+  rejectAgentViewing,
+
+  rescheduleAgentViewing,
+
+  cancelAgentViewing,
+
+  completeAgentViewing,
+
+  submitViewingFeedback,
+
+  getAgentPerformance,
+
 };

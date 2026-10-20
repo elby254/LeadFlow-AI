@@ -1,5 +1,3 @@
-// ======================================================
-//
 // Purpose
 // ------------------------------------------------------
 // Handles all API operations related to property-viewing
@@ -74,6 +72,10 @@ import mongoose from "mongoose";
 
 import ViewingReminder from "../models/viewingReminder.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 // ======================================================
 // HELPERS
 // ======================================================
@@ -103,28 +105,45 @@ const isValidObjectId = (id) => {
 };
 
 /**
- * Return the organization ID if one exists.
+ * Resolve the authenticated organization through the
+ * centralized organization resolver.
  *
- * This supports installations where organizationId is attached
- * either to req.user or directly to req.
+ * IMPORTANT:
+ * Controllers must not independently trust or resolve
+ * organization membership from request fields.
  */
-const getOrganizationId = (req) => {
-  return req.user?.organizationId || req.organizationId || null;
+const getOrganizationId = async (req) => {
+  const organization =
+    await resolveFromRequest(req);
+
+  if (!organization) {
+    return null;
+  }
+
+  return organization._id || null;
 };
 
 /**
- * Add organization filtering when organization information
- * exists.
+ * Add organization filtering using the centralized
+ * organization resolver.
  *
- * This prevents accidentally mixing reminder records between
- * organizations in a multi-tenant installation.
+ * Returns:
+ *   object → organization-scoped filter
+ *   null   → no valid active organization
  */
-const addOrganizationFilter = (filter, req) => {
-  const organizationId = getOrganizationId(req);
+const addOrganizationFilter = async (
+  filter,
+  req
+) => {
+  const organizationId =
+    await getOrganizationId(req);
 
-  if (organizationId) {
-    filter.organizationId = organizationId;
+  if (!organizationId) {
+    return null;
   }
+
+  filter.organizationId =
+    organizationId;
 
   return filter;
 };
@@ -149,10 +168,10 @@ const addOrganizationFilter = (filter, req) => {
  * Can access reminders belonging to them.
  *
  * Returns:
- *   null → authentication missing
+ *   null → authentication or organization missing
  *   object → MongoDB access filter
  */
-const buildRoleFilter = (req) => {
+const buildRoleFilter = async (req) => {
   const userId = getUserId(req);
   const role = getUserRole(req);
 
@@ -169,7 +188,10 @@ const buildRoleFilter = (req) => {
   // ----------------------------------------------------
 
   if (role === "admin") {
-    return addOrganizationFilter({}, req);
+    return await addOrganizationFilter(
+      {},
+      req
+    );
   }
 
   // ----------------------------------------------------
@@ -177,7 +199,7 @@ const buildRoleFilter = (req) => {
   // ----------------------------------------------------
 
   if (role === "agent") {
-    return addOrganizationFilter(
+    return await addOrganizationFilter(
       {
         agent: userId,
       },
@@ -189,7 +211,7 @@ const buildRoleFilter = (req) => {
   // VIEWER / CUSTOMER
   // ----------------------------------------------------
 
-  return addOrganizationFilter(
+  return await addOrganizationFilter(
     {
       viewer: userId,
     },
@@ -215,12 +237,14 @@ const buildRoleFilter = (req) => {
 
 export const getAllReminders = async (req, res) => {
   try {
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -258,7 +282,8 @@ export const getAllReminders = async (req, res) => {
     // --------------------------------------------------
 
     if (reminderType) {
-      filter.reminderType = reminderType;
+      filter.reminderType =
+        reminderType;
     }
 
     // --------------------------------------------------
@@ -361,7 +386,10 @@ export const getAllReminders = async (req, res) => {
 //
 // ======================================================
 
-export const getReminderById = async (req, res) => {
+export const getReminderById = async (
+  req,
+  res
+) => {
   try {
     const { id } = req.params;
 
@@ -372,7 +400,8 @@ export const getReminderById = async (req, res) => {
     if (!isValidObjectId(id)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid reminder ID.",
+        message:
+          "Invalid reminder ID.",
       });
     }
 
@@ -380,12 +409,14 @@ export const getReminderById = async (req, res) => {
     // AUTH / ROLE FILTER
     // --------------------------------------------------
 
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -473,14 +504,16 @@ export const getRemindersByViewing = async (
     if (!viewingId) {
       return res.status(400).json({
         success: false,
-        message: "Viewing ID is required.",
+        message:
+          "Viewing ID is required.",
       });
     }
 
     if (!isValidObjectId(viewingId)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid viewing ID.",
+        message:
+          "Invalid viewing ID.",
       });
     }
 
@@ -488,12 +521,14 @@ export const getRemindersByViewing = async (
     // ROLE FILTER
     // --------------------------------------------------
 
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -577,14 +612,16 @@ export const getRemindersByViewer = async (
     if (!viewerId) {
       return res.status(400).json({
         success: false,
-        message: "Viewer ID is required.",
+        message:
+          "Viewer ID is required.",
       });
     }
 
     if (!isValidObjectId(viewerId)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid viewer ID.",
+        message:
+          "Invalid viewer ID.",
       });
     }
 
@@ -598,24 +635,13 @@ export const getRemindersByViewer = async (
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
     // --------------------------------------------------
     // ACCESS CONTROL
-    // --------------------------------------------------
-    //
-    // Admin:
-    // Can inspect any viewer's reminders.
-    //
-    // Agent:
-    // Can inspect viewer reminders connected to
-    // their assigned workflow.
-    //
-    // Viewer:
-    // Can only inspect their own reminders.
-    //
     // --------------------------------------------------
 
     if (
@@ -647,14 +673,28 @@ export const getRemindersByViewer = async (
       filter.agent = userId;
     }
 
-    addOrganizationFilter(filter, req);
+    const organizationFilter =
+      await addOrganizationFilter(
+        filter,
+        req
+      );
+
+    if (!organizationFilter) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Authentication required.",
+      });
+    }
 
     // --------------------------------------------------
     // QUERY
     // --------------------------------------------------
 
     const reminders =
-      await ViewingReminder.find(filter)
+      await ViewingReminder.find(
+        filter
+      )
         .populate(
           "viewing",
           "scheduledAt status"
@@ -732,14 +772,16 @@ export const getRemindersByAgent = async (
     if (!agentId) {
       return res.status(400).json({
         success: false,
-        message: "Agent ID is required.",
+        message:
+          "Agent ID is required.",
       });
     }
 
     if (!isValidObjectId(agentId)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid agent ID.",
+        message:
+          "Invalid agent ID.",
       });
     }
 
@@ -753,7 +795,8 @@ export const getRemindersByAgent = async (
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -797,7 +840,19 @@ export const getRemindersByAgent = async (
       agent: agentId,
     };
 
-    addOrganizationFilter(filter, req);
+    const organizationFilter =
+      await addOrganizationFilter(
+        filter,
+        req
+      );
+
+    if (!organizationFilter) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Authentication required.",
+      });
+    }
 
     // --------------------------------------------------
     // ARCHIVED FILTER
@@ -906,12 +961,14 @@ export const getFailedReminders = async (
   res
 ) => {
   try {
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -980,12 +1037,14 @@ export const getPendingReminders = async (
   res
 ) => {
   try {
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1062,12 +1121,14 @@ export const getQueuedReminders = async (
       page = 1,
     } = req.query;
 
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1162,12 +1223,14 @@ export const getUpcomingReminders = async (
   res
 ) => {
   try {
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1245,12 +1308,14 @@ export const getTodayReminders = async (
   res
 ) => {
   try {
-    const roleFilter = buildRoleFilter(req);
+    const roleFilter =
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1348,7 +1413,8 @@ export const createReminder = async (
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1364,6 +1430,21 @@ export const createReminder = async (
         success: false,
         message:
           "You are not authorized to create viewing reminders.",
+      });
+    }
+
+    // --------------------------------------------------
+    // ORGANIZATION
+    // --------------------------------------------------
+
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1472,6 +1553,7 @@ export const createReminder = async (
     // --------------------------------------------------
 
     const reminderData = {
+      organizationId,
       viewing,
       lead,
       property,
@@ -1492,11 +1574,6 @@ export const createReminder = async (
       isAutomated,
       isArchived: false,
     };
-
-    addOrganizationFilter(
-      reminderData,
-      req
-    );
 
     // --------------------------------------------------
     // CREATE
@@ -1551,17 +1628,19 @@ export const updateReminder = async (
     if (!isValidObjectId(id)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid reminder ID.",
+        message:
+          "Invalid reminder ID.",
       });
     }
 
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
         success: false,
-        message: "Authentication required.",
+        message:
+          "Authentication required.",
       });
     }
 
@@ -1758,7 +1837,7 @@ export const updateReminderStatus = async (
     // --------------------------------------------------
 
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
@@ -1986,7 +2065,7 @@ export const retryReminder = async (
     // --------------------------------------------------
 
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
@@ -2113,7 +2192,7 @@ export const cancelReminder = async (
     }
 
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
@@ -2208,7 +2287,7 @@ export const archiveReminder = async (
     }
 
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
@@ -2314,18 +2393,29 @@ export const restoreReminder = async (
     }
 
     // --------------------------------------------------
+    // ORGANIZATION
+    // --------------------------------------------------
+
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Authentication required.",
+      });
+    }
+
+    // --------------------------------------------------
     // FILTER
     // --------------------------------------------------
 
     const filter = {
       _id: id,
       isArchived: true,
+      organizationId,
     };
-
-    addOrganizationFilter(
-      filter,
-      req
-    );
 
     // --------------------------------------------------
     // FIND
@@ -2387,7 +2477,7 @@ export const getReminderStatistics = async (
 ) => {
   try {
     const roleFilter =
-      buildRoleFilter(req);
+      await buildRoleFilter(req);
 
     if (!roleFilter) {
       return res.status(401).json({
@@ -2531,17 +2621,28 @@ export const deleteArchivedReminders = async (
     }
 
     // --------------------------------------------------
+    // ORGANIZATION
+    // --------------------------------------------------
+
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Authentication required.",
+      });
+    }
+
+    // --------------------------------------------------
     // FILTER
     // --------------------------------------------------
 
     const filter = {
       isArchived: true,
+      organizationId,
     };
-
-    addOrganizationFilter(
-      filter,
-      req
-    );
 
     // --------------------------------------------------
     // DELETE

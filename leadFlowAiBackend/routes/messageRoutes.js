@@ -9,8 +9,7 @@
  * ✓ Send Message
  * ✓ Read Receipts
  * ✓ Typing Indicator
- * ✓ Retry Failed Messages
- * ✓ Message Search
+ * ✓ Voice Notes
  *
  * Used By
  * ----------------------------------------------------------
@@ -27,7 +26,23 @@ import express from "express";
 
 import messageController from "../controllers/messageController.js";
 
-const router = express.Router();
+import {
+  protect,
+} from "../middleware/authMiddleware.js";
+
+import {
+  authenticatedUser,
+} from "../middleware/roleMiddleware.js";
+
+const router =
+  express.Router();
+
+/* ==========================================================
+   PROTECT ALL MESSAGE ROUTES
+========================================================== */
+
+router.use(protect);
+router.use(authenticatedUser);
 
 /* ==========================================================
    MESSAGE HISTORY
@@ -41,11 +56,9 @@ const router = express.Router();
  */
 
 router.get(
-
   "/conversation/:conversationId",
 
   messageController.getConversationMessages
-
 );
 
 /* ==========================================================
@@ -60,11 +73,9 @@ router.get(
  */
 
 router.post(
-
   "/conversation/:conversationId",
 
   messageController.sendMessage
-
 );
 
 /* ==========================================================
@@ -77,45 +88,9 @@ router.post(
  */
 
 router.patch(
-
   "/:messageId/read",
 
   messageController.markMessageRead
-
-);
-
-/* ==========================================================
-   SEARCH MESSAGES
-========================================================== */
-
-/**
- * GET
- * /api/messages/search
- */
-
-router.get(
-
-  "/search",
-
-  messageController.searchMessages
-
-);
-
-/* ==========================================================
-   RETRY FAILED MESSAGE
-========================================================== */
-
-/**
- * POST
- * /api/messages/:messageId/retry
- */
-
-router.post(
-
-  "/:messageId/retry",
-
-  messageController.retryMessage
-
 );
 
 /* ==========================================================
@@ -128,11 +103,9 @@ router.post(
  */
 
 router.get(
-
   "/conversation/:conversationId/typing",
 
   messageController.getTypingStatus
-
 );
 
 /**
@@ -141,11 +114,24 @@ router.get(
  */
 
 router.post(
-
   "/conversation/:conversationId/typing",
 
   messageController.sendTypingStatus
+);
 
+/* ==========================================================
+   VOICE MESSAGE
+========================================================== */
+
+/**
+ * POST
+ * /api/messages/conversation/:conversationId/voice
+ */
+
+router.post(
+  "/conversation/:conversationId/voice",
+
+  messageController.uploadVoiceMessage
 );
 
 /* ==========================================================

@@ -5,16 +5,77 @@
  *
  * ============================================================
  *
+ * PURPOSE
+ * ------------------------------------------------------------
  * Central service responsible for:
  *
  * ✓ Persisting lead intent
  * ✓ Preventing empty intent overwrite
- * ✓ Normalizing intent
- * ✓ Recalculating score
- * ✓ Persisting lifecycle category
+ * ✓ Normalizing intent aliases
+ * ✓ Recalculating the canonical lead score
+ * ✓ Returning the canonical score category
+ * ✓ Preserving organization isolation
+ * ✓ Verifying database persistence
+ *
+ * ============================================================
+ *
+ * IMPORTANT ARCHITECTURE
+ * ============================================================
+ *
+ * THIS SERVICE DOES NOT DETERMINE CUSTOMER INTENT.
+ *
+ * Intent is detected by the extraction / ingestion layer.
+ *
+ * This service ONLY:
+ *
+ *   detected intent
+ *        ↓
+ *   normalize
+ *        ↓
+ *   validate
+ *        ↓
+ *   persist
+ *
+ * ============================================================
+ *
+ * CANONICAL LEAD INTENT
+ * ============================================================
+ *
+ *   property_search
+ *   rent
+ *   buy
+ *
+ * No other value may be persisted.
+ *
+ * ============================================================
+ *
+ * CANONICAL SCORE
+ * ============================================================
+ *
+ * Score:
+ *
+ *   0–49   → new
+ *   50–79  → qualified
+ *   80–100 → hot
+ *
+ * IMPORTANT:
+ *
+ * "hot" is NOT Lead.status.
+ *
+ * Lead.status remains:
+ *
+ *   new
+ *   contacted
+ *   qualified
+ *   viewing
+ *   negotiation
+ *   won
+ *   lost
  *
  * ============================================================
  */
+
+import mongoose from "mongoose";
 
 import Lead from "../models/lead.js";
 
@@ -23,47 +84,42 @@ import {
   getLeadCategory,
 } from "./leadScoringRulesEngine.js";
 
-// ============================================================
-// NORMALIZE INTENT
-// ============================================================
-//
-// IMPORTANT
-// ------------------------------------------------------------
-//
-// This service does NOT determine customer intent.
-//
-// Intent has already been detected by the extraction layer.
-//
-// This function only normalizes equivalent intent values into
-// the canonical LeadFlow AI intent vocabulary.
-//
-// Canonical intent values:
-//
-//     property_search
-//     rent
-//     buy
-//
-// Supported aliases:
-//
-//     lease
-//     rental
-//     property_rental
-//         -> rent
-//
-//     purchase
-//     property_purchase
-//         -> buy
-//
-// Generic property search:
-//
-//     property_search
-//         -> property_search
-//
-// Empty / unknown values are rejected and MUST NOT overwrite
-// an existing Lead.intent.
-//
-// ============================================================
+/* ============================================================
+   CANONICAL INTENTS
+============================================================ */
 
+const CANONICAL_INTENTS =
+  Object.freeze([
+    "property_search",
+    "rent",
+    "buy",
+  ]);
+
+/* ============================================================
+   NORMALIZE INTENT
+============================================================ */
+
+/**
+ * Converts supported aliases into canonical LeadFlow AI
+ * transaction intents.
+ *
+ * IMPORTANT:
+ * ------------------------------------------------------------
+ *
+ * Unknown values return an empty string.
+ *
+ * They are NEVER passed through unchanged.
+ *
+ * That prevents unsupported values such as:
+ *
+ *   sell
+ *   invest
+ *   viewing
+ *   inquiry
+ *   unknown
+ *
+ * from accidentally reaching Lead.intent.
+ */
 const normalizeIntent = (
   value
 ) => {
@@ -77,7 +133,11 @@ const normalizeIntent = (
   const normalized =
     String(value)
       .trim()
-      .toLowerCase();
+      .toLowerCase()
+      .replace(
+        /\s+/g,
+        " "
+      );
 
   if (
     !normalized
@@ -85,15 +145,19 @@ const normalizeIntent = (
     return "";
   }
 
-  // ==========================================================
-  // RENT INTENT
-  // ==========================================================
+  /* ========================================================
+     RENT
+  ======================================================== */
 
   if (
     [
       "rent",
       "rental",
+      "renting",
       "lease",
+      "leasing",
+      "let",
+      "letting",
       "property_rental",
       "property-rental",
     ].includes(
@@ -103,14 +167,20 @@ const normalizeIntent = (
     return "rent";
   }
 
-  // ==========================================================
-  // BUY INTENT
-  // ==========================================================
+  /* ========================================================
+     BUY
+  ======================================================== */
 
   if (
     [
       "buy",
+      "buying",
       "purchase",
+      "purchasing",
+      "own",
+      "ownership",
+      "acquire",
+      "acquiring",
       "property_purchase",
       "property-purchase",
     ].includes(
@@ -120,18 +190,23 @@ const normalizeIntent = (
     return "buy";
   }
 
-  // ==========================================================
-  // GENERIC PROPERTY SEARCH
-  // ==========================================================
+  /* ========================================================
+     GENERIC PROPERTY SEARCH
+  ======================================================== */
 
   if (
     [
       "property_search",
       "property-search",
+      "property search",
       "search",
-      "property",
+      "looking",
+      "looking for property",
       "looking_for_property",
       "looking-for-property",
+      "property inquiry",
+      "property_inquiry",
+      "property-inquiry",
     ].includes(
       normalized
     )
@@ -139,81 +214,131 @@ const normalizeIntent = (
     return "property_search";
   }
 
-  // ==========================================================
-  // OTHER INTENTS
-  // ==========================================================
-  //
-  // These are intentionally not converted into rent/buy.
-  //
-  // The persistence service should not guess.
-  //
-  // For example:
-  //
-  //     viewing
-  //     inquiry
-  //     sell
-  //     invest
-  //     unknown
-  //
-  // are not silently converted into:
-  //
-  //     rent
-  //     buy
-  //     property_search
-  //
-  // ==========================================================
+  /* ========================================================
+     UNKNOWN / UNSUPPORTED
+  ======================================================== */
 
-  return normalized;
+  return "";
 };
 
-// ============================================================
-// VALID INTENT
-// ============================================================
+/* ============================================================
+   VALID INTENT
+============================================================ */
 
 const hasIntent = (
   value
 ) => {
-  return (
-    normalizeIntent(value) !== ""
+  const normalized =
+    normalizeIntent(
+      value
+    );
+
+  return CANONICAL_INTENTS.includes(
+    normalized
   );
 };
 
-// ============================================================
-// VALID LEAD ID
-// ============================================================
+/* ============================================================
+   VALID OBJECT ID
+============================================================ */
+
+const isValidObjectId = (
+  value
+) => {
+  return Boolean(
+    value &&
+      mongoose.Types.ObjectId.isValid(
+        value
+      )
+  );
+};
+
+/* ============================================================
+   VALID LEAD ID
+============================================================ */
 
 const isValidLeadId = (
   leadId
 ) => {
-  if (
-    leadId === null ||
-    leadId === undefined
-  ) {
-    return false;
-  }
-
-  const value =
-    String(leadId).trim();
-
-  return /^[a-fA-F0-9]{24}$/.test(
-    value
+  return isValidObjectId(
+    leadId
   );
 };
 
-// ============================================================
-// PERSIST LEAD INTENT
-// ============================================================
+/* ============================================================
+   VALID ORGANIZATION ID
+============================================================ */
+
+const isValidOrganizationId = (
+  organizationId
+) => {
+  return isValidObjectId(
+    organizationId
+  );
+};
+
+/* ============================================================
+   SCHEMA FIELD SUPPORT
+============================================================ */
+
+/**
+ * Detect whether the Lead schema actually contains a field.
+ *
+ * We use schema.path() instead of checking toObject() so that
+ * schema support is determined directly from the model
+ * definition.
+ */
+const hasLeadField = (
+  fieldName
+) => {
+  return Boolean(
+    Lead.schema?.path?.(
+      fieldName
+    )
+  );
+};
+
+/* ============================================================
+   PERSIST LEAD INTENT
+============================================================ */
 
 export const persistLeadIntent =
   async (
     leadId,
-    intent
+    intent,
+    organizationId
   ) => {
     try {
+      console.log(
+        "================================================"
+      );
 
-      // ========================================================
-      // VALIDATE ID
-      // ========================================================
+      console.log(
+        "🧠 LEAD INTENT PERSISTENCE"
+      );
+
+      console.log(
+        "================================================"
+      );
+
+      console.log(
+        "Lead ID:",
+        leadId
+      );
+
+      console.log(
+        "Organization ID:",
+        organizationId
+      );
+
+      console.log(
+        "Incoming Intent:",
+        intent || "(empty)"
+      );
+
+      /* ======================================================
+         1. VALIDATE LEAD ID
+      ====================================================== */
 
       if (
         !isValidLeadId(
@@ -226,17 +351,51 @@ export const persistLeadIntent =
         );
 
         return {
-          success: false,
-          updated: false,
-          intent: null,
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
           error:
             "Invalid lead ID.",
         };
       }
 
-      // ========================================================
-      // NORMALIZE
-      // ========================================================
+      /* ======================================================
+         2. VALIDATE ORGANIZATION ID
+      ====================================================== */
+
+      if (
+        !isValidOrganizationId(
+          organizationId
+        )
+      ) {
+        console.error(
+          "❌ Lead intent persistence aborted: invalid or missing organizationId."
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Valid organization ID is required.",
+        };
+      }
+
+      /* ======================================================
+         3. NORMALIZE
+      ====================================================== */
 
       const normalizedIntent =
         normalizeIntent(
@@ -245,7 +404,7 @@ export const persistLeadIntent =
 
       console.log(
         "🧠 LEAD INTENT PERSISTENCE - INCOMING INTENT:",
-        intent
+        intent || "(empty)"
       );
 
       console.log(
@@ -254,9 +413,9 @@ export const persistLeadIntent =
           "(empty)"
       );
 
-      // ========================================================
-      // NEVER WRITE EMPTY INTENT
-      // ========================================================
+      /* ======================================================
+         4. NEVER WRITE INVALID / EMPTY INTENT
+      ====================================================== */
 
       if (
         !hasIntent(
@@ -264,45 +423,145 @@ export const persistLeadIntent =
         )
       ) {
         console.log(
-          "ℹ️ Lead intent persistence skipped: no valid intent extracted."
+          "ℹ️ Lead intent persistence skipped: no valid canonical intent supplied."
         );
 
         return {
-          success: true,
-          updated: false,
-          intent: null,
+          success:
+            true,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
           reason:
-            "No valid intent supplied.",
+            "No valid canonical intent supplied.",
         };
       }
 
-      // ========================================================
-      // FIND LEAD
-      // ========================================================
+      /* ======================================================
+         5. FIND LEAD
+      ====================================================== */
 
+      /**
+       * IMPORTANT:
+       *
+       * Lead ID alone is NEVER sufficient.
+       *
+       * Tenant scope is mandatory.
+       */
       const lead =
-        await Lead.findById(
-          leadId
-        );
+        await Lead.findOne({
+          _id:
+            leadId,
+
+          organizationId,
+        });
 
       if (!lead) {
         console.error(
-          "❌ Lead intent persistence failed: lead not found:",
-          leadId
+          "❌ Lead intent persistence failed: lead not found in organization:",
+          {
+            leadId,
+            organizationId,
+          }
         );
 
         return {
-          success: false,
-          updated: false,
-          intent: null,
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
           error:
             "Lead not found.",
         };
       }
 
-      // ========================================================
-      // EXISTING INTENT
-      // ========================================================
+      /* ======================================================
+         6. DEFENSE-IN-DEPTH ORGANIZATION CHECK
+      ====================================================== */
+
+      if (
+        !lead.organizationId
+      ) {
+        console.error(
+          "🛑 Lead intent persistence blocked: lead has no organization.",
+          {
+            leadId:
+              String(
+                lead._id
+              ),
+          }
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Lead has no organization.",
+        };
+      }
+
+      if (
+        String(
+          lead.organizationId
+        ) !==
+        String(
+          organizationId
+        )
+      ) {
+        console.error(
+          "🛑 CROSS-ORGANIZATION LEAD ACCESS BLOCKED:",
+          {
+            leadId:
+              String(
+                lead._id
+              ),
+
+            leadOrganization:
+              String(
+                lead.organizationId
+              ),
+
+            requestedOrganization:
+              String(
+                organizationId
+              ),
+          }
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Lead organization mismatch.",
+        };
+      }
+
+      /* ======================================================
+         7. EXISTING INTENT
+      ====================================================== */
 
       const previousIntent =
         normalizeIntent(
@@ -315,37 +574,16 @@ export const persistLeadIntent =
           "(none)"
       );
 
-      // ========================================================
-      // WRITE INTENT
-      // ========================================================
-      //
-      // IMPORTANT:
-      //
-      // The persistence layer does NOT reinterpret the customer's
-      // conversation.
-      //
-      // It only persists the already-detected intent after
-      // normalization.
-      //
-      // Examples:
-      //
-      //     lease
-      //         -> rent
-      //
-      //     property_rental
-      //         -> rent
-      //
-      //     purchase
-      //         -> buy
-      //
-      //     property_purchase
-      //         -> buy
-      //
-      //     property_search
-      //         -> property_search
-      //
-      // ========================================================
+      /* ======================================================
+         8. WRITE CANONICAL INTENT
+      ====================================================== */
 
+      /**
+       * The persistence layer does NOT interpret customer
+       * language.
+       *
+       * It only persists the already-detected canonical intent.
+       */
       lead.intent =
         normalizedIntent;
 
@@ -354,10 +592,17 @@ export const persistLeadIntent =
         lead.intent
       );
 
-      // ========================================================
-      // RECALCULATE SCORE
-      // ========================================================
+      /* ======================================================
+         9. RECALCULATE CANONICAL SCORE
+      ====================================================== */
 
+      /**
+       * Score authority remains:
+       *
+       *   leadScoringRulesEngine.js
+       *
+       * This service does not invent or modify scoring rules.
+       */
       const score =
         calculateLeadScore(
           lead
@@ -374,24 +619,37 @@ export const persistLeadIntent =
       );
 
       console.log(
-        "🏷️ LEAD CATEGORY AFTER INTENT:",
+        "🏷️ LEAD SCORE CATEGORY AFTER INTENT:",
         category
       );
 
-      // ========================================================
-      // PERSIST SCORE
-      // ========================================================
+      /* ======================================================
+         10. PERSIST SCORE
+      ====================================================== */
 
       lead.score =
         score;
 
-      // ========================================================
-      // PERSIST CATEGORY WHEN SUPPORTED
-      // ========================================================
+      /* ======================================================
+         11. OPTIONAL SCORE CATEGORY
+      ====================================================== */
 
+      /**
+       * Some older Lead schemas may contain a category field.
+       *
+       * If it exists, it represents the SCORE CATEGORY only.
+       *
+       * It does NOT represent lifecycle state.
+       *
+       * We intentionally DO NOT write:
+       *
+       *   lead.stage = category
+       *
+       * because "stage" can be confused with Lead.status and
+       * would violate the canonical lifecycle semantics.
+       */
       if (
-        Object.prototype.hasOwnProperty.call(
-          lead.toObject(),
+        hasLeadField(
           "category"
         )
       ) {
@@ -399,63 +657,132 @@ export const persistLeadIntent =
           category;
       }
 
-      // ========================================================
-      // PERSIST STAGE WHEN SUPPORTED
-      // ========================================================
-      //
-      // This remains compatible with projects where stage is
-      // available on the Lead model.
-      //
-      // It does NOT replace Lead.status.
-      //
-      // Lead.status must continue using the existing Lead enum:
-      //
-      //     new
-      //     contacted
-      //     qualified
-      //     viewing
-      //     negotiation
-      //     won
-      //     lost
-      //
-      // ========================================================
-
-      if (
-        Object.prototype.hasOwnProperty.call(
-          lead.toObject(),
-          "stage"
-        )
-      ) {
-        lead.stage =
-          category;
-      }
-
-      // ========================================================
-      // SAVE
-      // ========================================================
+      /* ======================================================
+         12. SAVE
+      ====================================================== */
 
       await lead.save();
 
-      // ========================================================
-      // RELOAD FROM DATABASE
-      // ========================================================
-      //
-      // This is deliberate.
-      //
-      // It verifies that Mongoose actually persisted the field.
-      //
-      // ========================================================
+      console.log(
+        "✅ LEAD INTENT + SCORE SAVED"
+      );
 
+      /* ======================================================
+         13. RELOAD FROM DATABASE
+      ====================================================== */
+
+      /**
+       * IMPORTANT:
+       *
+       * organizationId MUST be selected here because the
+       * verification layer performs a second tenant check.
+       */
       const persistedLead =
-        await Lead.findById(
-          lead._id
-        ).select(
-          "intent score category stage"
+        await Lead.findOne({
+          _id:
+            lead._id,
+
+          organizationId,
+        }).select(
+          "organizationId intent score category"
         );
+
+      if (!persistedLead) {
+        console.error(
+          "❌ Lead intent persistence verification failed: persisted lead could not be reloaded."
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Lead could not be reloaded after persistence.",
+        };
+      }
+
+      /* ======================================================
+         14. DEFENSE-IN-DEPTH VERIFICATION
+      ====================================================== */
+
+      if (
+        !persistedLead.organizationId
+      ) {
+        console.error(
+          "🛑 Persistence verification failed: persisted lead has no organization."
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Persisted lead has no organization.",
+        };
+      }
+
+      if (
+        String(
+          persistedLead.organizationId
+        ) !==
+        String(
+          organizationId
+        )
+      ) {
+        console.error(
+          "🛑 CROSS-ORGANIZATION PERSISTENCE VERIFICATION BLOCKED:",
+          {
+            leadId:
+              String(
+                persistedLead._id
+              ),
+
+            leadOrganization:
+              String(
+                persistedLead.organizationId
+              ),
+
+            requestedOrganization:
+              String(
+                organizationId
+              ),
+          }
+        );
+
+        return {
+          success:
+            false,
+
+          updated:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Persisted lead organization mismatch.",
+        };
+      }
+
+      /* ======================================================
+         15. VERIFY PERSISTED INTENT
+      ====================================================== */
 
       const persistedIntent =
         normalizeIntent(
-          persistedLead?.intent
+          persistedLead.intent
         );
 
       console.log(
@@ -469,6 +796,11 @@ export const persistLeadIntent =
       console.log(
         "Lead ID:",
         lead._id
+      );
+
+      console.log(
+        "Organization ID:",
+        organizationId
       );
 
       console.log(
@@ -494,12 +826,23 @@ export const persistLeadIntent =
       );
 
       console.log(
+        "Persisted Score:",
+        persistedLead.score
+      );
+
+      console.log(
+        "Persisted Score Category:",
+        persistedLead.category ||
+          category
+      );
+
+      console.log(
         "================================================"
       );
 
-      // ========================================================
-      // VERIFY PERSISTENCE
-      // ========================================================
+      /* ======================================================
+         16. VERIFY INTENT PERSISTENCE
+      ====================================================== */
 
       if (
         persistedIntent !==
@@ -510,28 +853,45 @@ export const persistLeadIntent =
         );
 
         return {
-          success: false,
-          updated: false,
+          success:
+            false,
+
+          updated:
+            false,
+
           intent:
             persistedIntent ||
             null,
+
+          score:
+            persistedLead.score ??
+            0,
+
+          category:
+            persistedLead.category ||
+            category,
+
           error:
             "Intent was not persisted correctly.",
+
           lead:
             persistedLead,
         };
       }
 
-      // ========================================================
-      // SUCCESS
-      // ========================================================
+      /* ======================================================
+         17. SUCCESS
+      ====================================================== */
+
+      const updated =
+        previousIntent !==
+        persistedIntent;
 
       return {
-        success: true,
+        success:
+          true,
 
-        updated:
-          previousIntent !==
-          persistedIntent,
+        updated,
 
         leadId:
           persistedLead._id,
@@ -544,29 +904,43 @@ export const persistLeadIntent =
           persistedIntent,
 
         score:
-          persistedLead.score ??
-          0,
+          Number(
+            persistedLead.score ||
+              0
+          ),
 
+        /**
+         * Score category only.
+         *
+         * This is NOT Lead.status.
+         */
         category:
           persistedLead.category ||
-          persistedLead.stage ||
-          "new",
+          category,
 
         lead:
           persistedLead,
       };
-
     } catch (error) {
-
       console.error(
         "❌ Lead intent persistence error:",
         error
       );
 
+      console.error(
+        error?.stack
+      );
+
       return {
-        success: false,
-        updated: false,
-        intent: null,
+        success:
+          false,
+
+        updated:
+          false,
+
+        intent:
+          null,
+
         error:
           error?.message ||
           "Failed to persist lead intent.",
@@ -574,19 +948,19 @@ export const persistLeadIntent =
     }
   };
 
-// ============================================================
-// GET PERSISTED INTENT
-// ============================================================
+/* ============================================================
+   GET PERSISTED INTENT
+============================================================ */
 
 export const getPersistedLeadIntent =
   async (
-    leadId
+    leadId,
+    organizationId
   ) => {
     try {
-
-      // ========================================================
-      // VALIDATE ID
-      // ========================================================
+      /* ======================================================
+         1. VALIDATE LEAD ID
+      ====================================================== */
 
       if (
         !isValidLeadId(
@@ -594,69 +968,194 @@ export const getPersistedLeadIntent =
         )
       ) {
         return {
-          success: false,
-          intent: null,
+          success:
+            false,
+
+          intent:
+            null,
+
           error:
             "Invalid lead ID.",
         };
       }
 
-      // ========================================================
-      // FIND LEAD
-      // ========================================================
+      /* ======================================================
+         2. VALIDATE ORGANIZATION ID
+      ====================================================== */
 
+      if (
+        !isValidOrganizationId(
+          organizationId
+        )
+      ) {
+        console.error(
+          "❌ Cannot retrieve lead intent: invalid or missing organizationId."
+        );
+
+        return {
+          success:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Valid organization ID is required.",
+        };
+      }
+
+      /* ======================================================
+         3. FIND LEAD — TENANT SCOPED
+      ====================================================== */
+
+      /**
+       * organizationId is intentionally selected because the
+       * defense-in-depth check below depends on it.
+       */
       const lead =
-        await Lead.findById(
-          leadId
-        ).select(
-          "intent score category stage"
+        await Lead.findOne({
+          _id:
+            leadId,
+
+          organizationId,
+        }).select(
+          "organizationId intent score category"
         );
 
       if (!lead) {
         return {
-          success: false,
-          intent: null,
+          success:
+            false,
+
+          intent:
+            null,
+
           error:
             "Lead not found.",
         };
       }
 
-      // ========================================================
-      // NORMALIZE PERSISTED INTENT
-      // ========================================================
+      /* ======================================================
+         4. DEFENSE-IN-DEPTH ORGANIZATION CHECK
+      ====================================================== */
+
+      if (
+        !lead.organizationId
+      ) {
+        console.error(
+          "🛑 Cannot retrieve lead intent: lead has no organization."
+        );
+
+        return {
+          success:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Lead has no organization.",
+        };
+      }
+
+      if (
+        String(
+          lead.organizationId
+        ) !==
+        String(
+          organizationId
+        )
+      ) {
+        console.error(
+          "🛑 CROSS-ORGANIZATION LEAD INTENT ACCESS BLOCKED:",
+          {
+            leadId:
+              String(
+                lead._id
+              ),
+
+            leadOrganization:
+              String(
+                lead.organizationId
+              ),
+
+            requestedOrganization:
+              String(
+                organizationId
+              ),
+          }
+        );
+
+        return {
+          success:
+            false,
+
+          intent:
+            null,
+
+          error:
+            "Lead organization mismatch.",
+        };
+      }
+
+      /* ======================================================
+         5. NORMALIZE PERSISTED INTENT
+      ====================================================== */
 
       const persistedIntent =
         normalizeIntent(
           lead.intent
         );
 
+      /* ======================================================
+         6. RETURN
+      ====================================================== */
+
       return {
-        success: true,
+        success:
+          true,
 
         intent:
           persistedIntent ||
           null,
 
         score:
-          lead.score ??
-          0,
+          Number(
+            lead.score ||
+              0
+          ),
 
+        /**
+         * Score category.
+         *
+         * NOT Lead.status.
+         */
         category:
           lead.category ||
-          lead.stage ||
-          "new",
+          getLeadCategory(
+            Number(
+              lead.score ||
+                0
+            )
+          ),
       };
-
     } catch (error) {
-
       console.error(
         "❌ Get persisted lead intent error:",
         error
       );
 
+      console.error(
+        error?.stack
+      );
+
       return {
-        success: false,
-        intent: null,
+        success:
+          false,
+
+        intent:
+          null,
+
         error:
           error?.message ||
           "Failed to retrieve lead intent.",
@@ -664,27 +1163,55 @@ export const getPersistedLeadIntent =
     }
   };
 
-// ============================================================
-// UPDATE INTENT ONLY
-// ============================================================
+/* ============================================================
+   UPDATE INTENT ONLY
+============================================================ */
 
+/**
+ * Compatibility wrapper.
+ *
+ * The actual implementation remains centralized in
+ * persistLeadIntent().
+ */
 export const updateLeadIntent =
   async (
     leadId,
-    intent
+    intent,
+    organizationId
   ) => {
     return persistLeadIntent(
       leadId,
-      intent
+      intent,
+      organizationId
     );
   };
 
-// ============================================================
-// DEFAULT EXPORT
-// ============================================================
+/* ============================================================
+   OPTIONAL NORMALIZER EXPORT
+============================================================ */
+
+/**
+ * Exporting this utility makes it possible for other
+ * persistence-facing services to use exactly the same
+ * canonical normalization without importing the AI reply
+ * service.
+ *
+ * It still does NOT detect intent.
+ */
+export {
+  normalizeIntent,
+};
+
+/* ============================================================
+   DEFAULT EXPORT
+============================================================ */
 
 export default {
   persistLeadIntent,
+
   getPersistedLeadIntent,
+
   updateLeadIntent,
+
+  normalizeIntent,
 };

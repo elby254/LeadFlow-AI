@@ -16,21 +16,23 @@
  *     ↓
  * authenticatedUser
  *     ↓
- * adminOnly / agentOnly
+ * role-specific middleware
  *
- * Assignment authority
- * ------------------------------------------------------------
  * ADMIN
  *   → assign
  *   → reassign
  *   → view unassigned
+ *   → perform administrative lead/viewing actions
  *
  * AGENT
  *   → view own assigned leads
  *   → view own assigned lead by ID
+ *   → perform CRM/viewing actions
  *
  * VIEWER
- *   → no assignment access
+ *   → read-only
+ *   → no assignment
+ *   → no lead mutation
  *
  * ============================================================
  */
@@ -88,6 +90,7 @@ import {
   authenticatedUser,
   adminOnly,
   agentOnly,
+  allowRoles,
 } from "../middleware/roleMiddleware.js";
 
 const router = express.Router();
@@ -107,9 +110,15 @@ router.use(authenticatedUser);
 // LEAD RETRIEVAL
 // ============================================================
 //
-// GET /api/lead
+// These are read operations.
+//
+// Authenticated users may retrieve lead collections,
+// subject to the tenant and role filtering performed
+// by the controllers.
 //
 // ============================================================
+
+// GET /api/lead
 
 router.get(
   "/",
@@ -127,6 +136,8 @@ router.get(
 // NEVER from:
 //
 //     req.body.agentId
+//     req.query.agentId
+//     req.params.agentId
 //
 // ============================================================
 
@@ -155,8 +166,6 @@ router.get(
 //
 // GET /api/lead/my-leads
 //
-// This allows older frontend code to continue working.
-//
 // ------------------------------------------------------------
 
 router.get(
@@ -169,9 +178,6 @@ router.get(
 // GET ONE OF MY ASSIGNED LEADS
 //
 // GET /api/lead/my/:id
-//
-// IMPORTANT:
-// This is also placed before /:id.
 //
 // ------------------------------------------------------------
 
@@ -203,6 +209,8 @@ router.get(
 //
 // GET /api/lead/new
 //
+// Read-only.
+//
 // ------------------------------------------------------------
 
 router.get(
@@ -215,6 +223,8 @@ router.get(
 //
 // GET /api/lead/hot
 //
+// Read-only.
+//
 // ------------------------------------------------------------
 
 router.get(
@@ -226,6 +236,8 @@ router.get(
 // FOLLOW-UP LEADS
 //
 // GET /api/lead/follow-up
+//
+// Read-only.
 //
 // ------------------------------------------------------------
 
@@ -286,97 +298,27 @@ router.patch(
 );
 
 // ============================================================
-// FOLLOW-UP
+// CRM MUTATIONS
 // ============================================================
+//
+// Viewer is read-only.
+//
+// Only admin and agent may modify CRM lead data.
+//
+// ============================================================
+
+// ------------------------------------------------------------
+// FOLLOW-UP
 //
 // PATCH /api/lead/:id/followup
 //
-// ============================================================
+// ------------------------------------------------------------
 
 router.patch(
   "/:id/followup",
+  allowRoles(["admin", "agent"]),
   updateFollowUp
 );
-
-// ============================================================
-// VIEWING WORKFLOW
-// ============================================================
-
-// ------------------------------------------------------------
-// REQUEST VIEWING
-//
-// POST /api/lead/:id/viewing/request
-//
-// ------------------------------------------------------------
-
-router.post(
-  "/:id/viewing/request",
-  requestViewing
-);
-
-// ------------------------------------------------------------
-// APPROVE VIEWING
-//
-// PATCH /api/lead/:id/viewing/approve
-//
-// ------------------------------------------------------------
-
-router.patch(
-  "/:id/viewing/approve",
-  approveViewing
-);
-
-// ------------------------------------------------------------
-// RESCHEDULE VIEWING
-//
-// PATCH /api/lead/:id/viewing/reschedule
-//
-// ------------------------------------------------------------
-
-router.patch(
-  "/:id/viewing/reschedule",
-  rescheduleViewing
-);
-
-// ------------------------------------------------------------
-// CANCEL VIEWING
-//
-// PATCH /api/lead/:id/viewing/cancel
-//
-// ------------------------------------------------------------
-
-router.patch(
-  "/:id/viewing/cancel",
-  cancelViewing
-);
-
-// ------------------------------------------------------------
-// COMPLETE VIEWING
-//
-// PATCH /api/lead/:id/viewing/complete
-//
-// ------------------------------------------------------------
-
-router.patch(
-  "/:id/viewing/complete",
-  completeViewing
-);
-
-// ------------------------------------------------------------
-// VIEWING FEEDBACK
-//
-// POST /api/lead/:id/viewing/feedback
-//
-// ------------------------------------------------------------
-
-router.post(
-  "/:id/viewing/feedback",
-  submitViewingFeedback
-);
-
-// ============================================================
-// CRM
-// ============================================================
 
 // ------------------------------------------------------------
 // CALL HISTORY
@@ -387,6 +329,7 @@ router.post(
 
 router.post(
   "/:id/call-history",
+  allowRoles(["admin", "agent"]),
   addCallHistory
 );
 
@@ -399,7 +342,99 @@ router.post(
 
 router.post(
   "/:id/notes",
+  allowRoles(["admin", "agent"]),
   addAgentNote
+);
+
+// ============================================================
+// VIEWING WORKFLOW
+// ============================================================
+//
+// Viewer is read-only.
+//
+// Admin and agent may perform viewing workflow mutations.
+//
+// Tenant authorization is still enforced inside the
+// controllers/services.
+//
+// ============================================================
+
+// ------------------------------------------------------------
+// REQUEST VIEWING
+//
+// POST /api/lead/:id/viewing/request
+//
+// ------------------------------------------------------------
+
+router.post(
+  "/:id/viewing/request",
+  allowRoles(["admin", "agent"]),
+  requestViewing
+);
+
+// ------------------------------------------------------------
+// APPROVE VIEWING
+//
+// PATCH /api/lead/:id/viewing/approve
+//
+// ------------------------------------------------------------
+
+router.patch(
+  "/:id/viewing/approve",
+  allowRoles(["admin", "agent"]),
+  approveViewing
+);
+
+// ------------------------------------------------------------
+// RESCHEDULE VIEWING
+//
+// PATCH /api/lead/:id/viewing/reschedule
+//
+// ------------------------------------------------------------
+
+router.patch(
+  "/:id/viewing/reschedule",
+  allowRoles(["admin", "agent"]),
+  rescheduleViewing
+);
+
+// ------------------------------------------------------------
+// CANCEL VIEWING
+//
+// PATCH /api/lead/:id/viewing/cancel
+//
+// ------------------------------------------------------------
+
+router.patch(
+  "/:id/viewing/cancel",
+  allowRoles(["admin", "agent"]),
+  cancelViewing
+);
+
+// ------------------------------------------------------------
+// COMPLETE VIEWING
+//
+// PATCH /api/lead/:id/viewing/complete
+//
+// ------------------------------------------------------------
+
+router.patch(
+  "/:id/viewing/complete",
+  allowRoles(["admin", "agent"]),
+  completeViewing
+);
+
+// ------------------------------------------------------------
+// VIEWING FEEDBACK
+//
+// POST /api/lead/:id/viewing/feedback
+//
+// ------------------------------------------------------------
+
+router.post(
+  "/:id/viewing/feedback",
+  allowRoles(["admin", "agent"]),
+  submitViewingFeedback
 );
 
 // ============================================================
@@ -407,6 +442,8 @@ router.post(
 // ============================================================
 //
 // GET /api/lead/:id
+//
+// Read-only.
 //
 // MUST ALWAYS REMAIN LAST.
 //

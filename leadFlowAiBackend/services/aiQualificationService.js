@@ -1701,6 +1701,94 @@ export const generateSuggestedReplies = (
 export const analyzeMessage = (
   message = ""
 ) => {
+  
+
+  // ==========================================================
+  // TEST FAILURE INJECTION — ANALYSIS SERVICE FAILURE
+  // ==========================================================
+
+   if (process.env.TEST_FORCE_ANALYSIS_FAILURE === "true") {
+    throw new Error(
+      "TEST: Qualification analysis service unavailable."
+    );
+  }
+
+  // ==========================================================
+  // TEST FAILURE INJECTION — MALFORMED ANALYSIS
+  // ==========================================================
+
+  if (process.env.TEST_FORCE_MALFORMED_ANALYSIS === "true") {
+    console.warn(
+      "⚠️ TEST: Returning malformed AI analysis result."
+    );
+
+    return {
+      extracted: null,
+      extractedData: null,
+      insights: null,
+      score: "NOT_A_NUMBER",
+      priority: null,
+      isQualified: "INVALID",
+      isHot: "INVALID",
+    };
+  }
+
+
+// ==========================================================
+// TEST FAILURE INJECTION — INCOMPLETE ANALYSIS
+// ==========================================================
+
+if (process.env.TEST_FORCE_INCOMPLETE_ANALYSIS === "true") {
+  console.warn(
+    "⚠️ TEST: Returning incomplete AI analysis result."
+  );
+
+  return {
+    extracted: {
+      bedrooms: 3,
+      budget: null,
+      location: null,
+      propertyType: null,
+      moveDate: null,
+      financing: null,
+      intent: null,
+      phone: null,
+    },
+
+    extractedData: null,
+
+    insights: {
+      buyingIntent: 0,
+      urgency: "Low",
+      budgetConfidence: 0,
+      locationConfidence: 0,
+      propertyTypeConfidence: 0,
+      timelineConfidence: 0,
+      missingInformation: [
+        "budget",
+        "location",
+        "moveDate",
+        "intent",
+      ],
+      recommendedAction:
+        "Ask the customer for the missing property requirements.",
+    },
+
+    score: 20,
+    priority: "Low",
+    isQualified: false,
+    isHot: false,
+
+    missingInformation: [
+      "budget",
+      "location",
+      "moveDate",
+      "intent",
+    ],
+  };
+}
+
+
   const cleanMessage =
     String(message || "")
       .trim();

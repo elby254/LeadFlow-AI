@@ -19,8 +19,25 @@
  * ✓ Notifications
  * ✓ Dashboard updates
  *
+ * TENANT ISOLATION
+ * ------------------------------------------------------------
+ * Socket.IO has its own tenant boundary.
+ *
+ * REST authorization does NOT automatically protect socket rooms.
+ *
+ * Therefore:
+ *
+ * ✓ Users are verified against their organization
+ * ✓ Conversation rooms are verified against organizationId
+ * ✓ Organization broadcasts use the authenticated socket org
+ * ✓ User/agent broadcasts cannot cross organizations
+ * ✓ Conversation events require tenant ownership
+ *
  * ============================================================
  */
+
+import Conversation from "../models/conversation.js";
+import User from "../models/user.js";
 
 const onlineUsers = new Map();
 
@@ -36,6 +53,165 @@ const conversationRoom = (conversationId) =>
 
 const userRoom = (userId) =>
   `user:${userId}`;
+
+/* ============================================================
+   TENANT HELPERS
+============================================================ */
+
+/**
+ * ------------------------------------------------------------
+ * GET SOCKET ORGANIZATION
+ * ------------------------------------------------------------
+ *
+ * socket.data.organizationId becomes the trusted organization
+ * context after register_user has successfully verified the user.
+ *
+ * Never trust organizationId supplied inside arbitrary event
+ * payloads as the source of tenant authorization.
+ */
+const getSocketOrganizationId = (socket) =>
+  socket.data?.organizationId || null;
+
+/**
+ * ------------------------------------------------------------
+ * VERIFY CONVERSATION TENANT
+ * ------------------------------------------------------------
+ *
+ * Ensures the conversation belongs to the organization attached
+ * to the current socket.
+ *
+ * This is the critical protection preventing:
+ *
+ * Organization A
+ *     ↓
+ * conversationId belonging to Organization B
+ *     ↓
+ * joining / reading / broadcasting into B's room
+ */
+const getAuthorizedConversation = async (
+  socket,
+  conversationId
+) => {
+  if (!conversationId) {
+    return null;
+  }
+
+  const organizationId =
+    getSocketOrganizationId(socket);
+
+  if (!organizationId) {
+    console.warn(
+      "🛑 Socket conversation access rejected: organization missing.",
+      {
+        socketId: socket.id,
+        conversationId,
+      }
+    );
+
+    return null;
+  }
+
+  try {
+    const conversation =
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
+
+    if (!conversation) {
+      console.warn(
+        "🛑 Socket conversation access rejected: tenant mismatch or conversation not found.",
+        {
+          socketId: socket.id,
+          conversationId,
+          organizationId,
+        }
+      );
+
+      return null;
+    }
+
+    return conversation;
+  } catch (error) {
+    console.error(
+      "❌ Socket conversation authorization error:",
+      error
+    );
+
+    return null;
+  }
+};
+
+/**
+ * ------------------------------------------------------------
+ * VERIFY ORGANIZATION PAYLOAD
+ * ------------------------------------------------------------
+ *
+ * Payload organizationId values are NOT trusted.
+ *
+ * An event may only target the organization represented by the
+ * authenticated socket.
+ */
+const isAuthorizedOrganization = (
+  socket,
+  organizationId
+) => {
+  const socketOrganizationId =
+    getSocketOrganizationId(socket);
+
+  if (
+    !socketOrganizationId ||
+    !organizationId
+  ) {
+    return false;
+  }
+
+  return (
+    String(socketOrganizationId) ===
+    String(organizationId)
+  );
+};
+
+/**
+ * ------------------------------------------------------------
+ * VERIFY TARGET USER TENANT
+ * ------------------------------------------------------------
+ *
+ * Prevents a socket from sending notification/assignment events
+ * into another organization's user room.
+ *
+ * Only online users are relevant because user rooms are only
+ * populated while their sockets are connected.
+ */
+const isAuthorizedTargetUser = (
+  socket,
+  userId
+) => {
+  if (!userId) {
+    return false;
+  }
+
+  const organizationId =
+    getSocketOrganizationId(socket);
+
+  if (!organizationId) {
+    return false;
+  }
+
+  const targetUser =
+    onlineUsers.get(
+      String(userId)
+    );
+
+  if (!targetUser) {
+    return false;
+  }
+
+  return (
+    String(targetUser.organizationId) ===
+    String(organizationId)
+  );
+};
 
 /* ============================================================
    BROADCAST HELPERS
@@ -92,7 +268,7 @@ const registerConversationSocket = (
 
   socket.on(
     "register_user",
-    ({
+    async ({
       userId,
       organizationId,
       name,
@@ -104,57 +280,152 @@ const registerConversationSocket = (
       )
         return;
 
-      socket.data.userId =
-        userId;
+      try {
+        /**
+         * ----------------------------------------------------
+         * VERIFY USER TENANT
+         * ----------------------------------------------------
+         *
+         * Do NOT trust the organizationId supplied by the
+         * client.
+         *
+         * Resolve the user from the database and verify that
+         * the user actually belongs to that organization.
+         */
+        const user =
+          await User.findOne({
+            _id: userId,
+            organizationId,
+          }).select(
+            "_id organizationId name role isActive"
+          );
 
-      socket.data.organizationId =
-        organizationId;
+        if (!user) {
+          console.warn(
+            "🛑 Socket registration rejected: user does not belong to organization.",
+            {
+              socketId: socket.id,
+              userId,
+              organizationId,
+            }
+          );
 
-      socket.data.name =
-        name;
+          socket.emit(
+            "socket_registration_rejected",
+            {
+              reason:
+                "organization_mismatch",
+            }
+          );
 
-      socket.data.role =
-        role;
-
-      socket.join(
-        organizationRoom(
-          organizationId
-        )
-      );
-
-      socket.join(
-        userRoom(userId)
-      );
-
-      onlineUsers.set(
-        userId,
-        {
-          socketId:
-            socket.id,
-          organizationId,
-          name,
-          role,
-          lastSeen:
-            new Date(),
+          return;
         }
-      );
 
-      emitToOrganization(
-        io,
-        organizationId,
-        "presence_update",
-        {
-          userId,
-          name,
-          role,
-          status:
-            "online",
+        if (
+          user.isActive === false
+        ) {
+          console.warn(
+            "🛑 Socket registration rejected: inactive user.",
+            {
+              socketId: socket.id,
+              userId,
+            }
+          );
+
+          socket.emit(
+            "socket_registration_rejected",
+            {
+              reason:
+                "inactive_user",
+            }
+          );
+
+          return;
         }
-      );
 
-      console.log(
-        `${name} registered`
-      );
+        /**
+         * ----------------------------------------------------
+         * STORE VERIFIED TENANT CONTEXT
+         * ----------------------------------------------------
+         */
+        socket.data.userId =
+          String(user._id);
+
+        socket.data.organizationId =
+          String(user.organizationId);
+
+        socket.data.name =
+          user.name || name;
+
+        socket.data.role =
+          user.role || role;
+
+        /**
+         * ----------------------------------------------------
+         * JOIN VERIFIED ORGANIZATION + USER ROOMS
+         * ----------------------------------------------------
+         */
+        socket.join(
+          organizationRoom(
+            socket.data.organizationId
+          )
+        );
+
+        socket.join(
+          userRoom(
+            socket.data.userId
+          )
+        );
+
+        onlineUsers.set(
+          socket.data.userId,
+          {
+            socketId:
+              socket.id,
+            organizationId:
+              socket.data.organizationId,
+            name:
+              socket.data.name,
+            role:
+              socket.data.role,
+            lastSeen:
+              new Date(),
+          }
+        );
+
+        emitToOrganization(
+          io,
+          socket.data.organizationId,
+          "presence_update",
+          {
+            userId:
+              socket.data.userId,
+            name:
+              socket.data.name,
+            role:
+              socket.data.role,
+            status:
+              "online",
+          }
+        );
+
+        console.log(
+          `${socket.data.name} registered`
+        );
+      } catch (error) {
+        console.error(
+          "❌ Socket registration error:",
+          error
+        );
+
+        socket.emit(
+          "socket_registration_rejected",
+          {
+            reason:
+              "registration_failed",
+          }
+        );
+      }
     }
   );
 
@@ -164,13 +435,38 @@ const registerConversationSocket = (
 
   socket.on(
     "join_conversation",
-    ({
+    async ({
       conversationId,
     }) => {
       if (
         !conversationId
       )
         return;
+
+      /**
+       * ------------------------------------------------------
+       * CRITICAL TENANT CHECK
+       * ------------------------------------------------------
+       *
+       * A socket cannot join a conversation room simply by
+       * knowing the conversationId.
+       */
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        socket.emit(
+          "conversation_access_denied",
+          {
+            conversationId,
+          }
+        );
+
+        return;
+      }
 
       socket.join(
         conversationRoom(
@@ -190,13 +486,23 @@ const registerConversationSocket = (
 
   socket.on(
     "leave_conversation",
-    ({
+    async ({
       conversationId,
     }) => {
       if (
         !conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       socket.leave(
         conversationRoom(
@@ -210,17 +516,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   SEND MESSAGE
-======================================================== */
+  /* ========================================================
+     SEND MESSAGE
+  ======================================================== */
 
   socket.on(
     "message_send",
-    (message) => {
+    async (message) => {
       if (
         !message?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          message.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -228,6 +544,8 @@ const registerConversationSocket = (
         "message_received",
         {
           ...message,
+          organizationId:
+            socket.data.organizationId,
           deliveredAt:
             new Date().toISOString(),
         }
@@ -255,13 +573,13 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   MESSAGE DELIVERED
-======================================================== */
+  /* ========================================================
+     MESSAGE DELIVERED
+  ======================================================== */
 
   socket.on(
     "message_delivered",
-    ({
+    async ({
       conversationId,
       messageId,
     }) => {
@@ -270,6 +588,16 @@ const registerConversationSocket = (
         !messageId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -284,13 +612,13 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   MESSAGE READ
-======================================================== */
+  /* ========================================================
+     MESSAGE READ
+  ======================================================== */
 
   socket.on(
     "message_read",
-    ({
+    async ({
       conversationId,
       messageId,
       userId,
@@ -301,6 +629,16 @@ const registerConversationSocket = (
       )
         return;
 
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
+
       emitToConversation(
         io,
         conversationId,
@@ -308,7 +646,8 @@ const registerConversationSocket = (
         {
           conversationId,
           messageId,
-          userId,
+          userId:
+            socket.data.userId,
           readAt:
             new Date().toISOString(),
         }
@@ -316,13 +655,13 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   ENTIRE CONVERSATION READ
-======================================================== */
+  /* ========================================================
+     ENTIRE CONVERSATION READ
+  ======================================================== */
 
   socket.on(
     "conversation_read",
-    ({
+    async ({
       conversationId,
       userId,
     }) => {
@@ -331,13 +670,24 @@ const registerConversationSocket = (
       )
         return;
 
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
+
       emitToConversation(
         io,
         conversationId,
         "conversation_read",
         {
           conversationId,
-          userId,
+          userId:
+            socket.data.userId,
           readAt:
             new Date().toISOString(),
         }
@@ -345,18 +695,28 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   MESSAGE EDITED
-======================================================== */
+  /* ========================================================
+     MESSAGE EDITED
+  ======================================================== */
 
   socket.on(
     "message_edited",
-    (payload) => {
+    async (payload) => {
       if (
         !payload
           ?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -365,6 +725,8 @@ const registerConversationSocket = (
         "message_edited",
         {
           ...payload,
+          organizationId:
+            socket.data.organizationId,
           editedAt:
             new Date().toISOString(),
         }
@@ -372,13 +734,13 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   MESSAGE DELETED
-======================================================== */
+  /* ========================================================
+     MESSAGE DELETED
+  ======================================================== */
 
   socket.on(
     "message_deleted",
-    ({
+    async ({
       conversationId,
       messageId,
     }) => {
@@ -386,6 +748,16 @@ const registerConversationSocket = (
         !conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -399,25 +771,39 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   CONVERSATION UPDATED
-======================================================== */
+  /* ========================================================
+     CONVERSATION UPDATED
+  ======================================================== */
 
   socket.on(
     "conversation_updated",
-    (conversation) => {
+    async (conversation) => {
       if (
         !conversation
           ?.conversationId
       )
         return;
 
+      const authorizedConversation =
+        await getAuthorizedConversation(
+          socket,
+          conversation.conversationId
+        );
+
+      if (!authorizedConversation) {
+        return;
+      }
+
       emitToConversation(
         io,
         conversation
           .conversationId,
         "conversation_updated",
-        conversation
+        {
+          ...conversation,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
 
       if (
@@ -429,23 +815,37 @@ const registerConversationSocket = (
           socket.data
             .organizationId,
           "conversation_list_refresh",
-          conversation
+          {
+            ...conversation,
+            organizationId:
+              socket.data.organizationId,
+          }
         );
       }
     }
   );
 
-/* ========================================================
-   TYPING START
-======================================================== */
+  /* ========================================================
+     TYPING START
+  ======================================================== */
 
   socket.on(
     "typing_start",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       socket.to(
         conversationRoom(
@@ -467,17 +867,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   TYPING STOP
-======================================================== */
+  /* ========================================================
+     TYPING STOP
+  ======================================================== */
 
   socket.on(
     "typing_stop",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       socket.to(
         conversationRoom(
@@ -495,9 +905,9 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   USER PRESENCE UPDATE
-======================================================== */
+  /* ========================================================
+     USER PRESENCE UPDATE
+  ======================================================== */
 
   socket.on(
     "presence_ping",
@@ -524,17 +934,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VOICE MESSAGE READY
-======================================================== */
+  /* ========================================================
+     VOICE MESSAGE READY
+  ======================================================== */
 
   socket.on(
     "voice_message_uploaded",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -545,17 +965,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   ATTACHMENT UPLOADED
-======================================================== */
+  /* ========================================================
+     ATTACHMENT UPLOADED
+  ======================================================== */
 
   socket.on(
     "attachment_uploaded",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -566,13 +996,13 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   ATTACHMENT REMOVED
-======================================================== */
+  /* ========================================================
+     ATTACHMENT REMOVED
+  ======================================================== */
 
   socket.on(
     "attachment_removed",
-    ({
+    async ({
       conversationId,
       attachmentId,
     }) => {
@@ -580,6 +1010,16 @@ const registerConversationSocket = (
         !conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -593,17 +1033,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   AI REPLY GENERATED
-======================================================== */
+  /* ========================================================
+     AI REPLY GENERATED
+  ======================================================== */
 
   socket.on(
     "ai_reply_generated",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -614,17 +1064,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   AI SUGGESTIONS UPDATED
-======================================================== */
+  /* ========================================================
+     AI SUGGESTIONS UPDATED
+  ======================================================== */
 
   socket.on(
     "ai_suggestions_updated",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -635,17 +1095,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   AI CONVERSATION SUMMARY UPDATED
-======================================================== */
+  /* ========================================================
+     AI CONVERSATION SUMMARY UPDATED
+  ======================================================== */
 
   socket.on(
     "conversation_summary_updated",
-    (payload) => {
+    async (payload) => {
       if (
         !payload?.conversationId
       )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -656,43 +1126,80 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING REQUESTED
-======================================================== */
+  /* ========================================================
+     VIEWING REQUESTED
+  ======================================================== */
 
   socket.on(
     "viewing_requested",
     (payload) => {
-      if (!payload?.organizationId)
+      if (
+        !payload?.organizationId
+      )
         return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "viewing_requested",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
 
-      if (payload.agentId) {
+      if (
+        payload.agentId &&
+        isAuthorizedTargetUser(
+          socket,
+          payload.agentId
+        )
+      ) {
         io.to(
           `user:${payload.agentId}`
         ).emit(
           "agent_new_viewing_request",
-          payload
+          {
+            ...payload,
+            organizationId:
+              socket.data.organizationId,
+          }
         );
       }
     }
   );
 
-/* ========================================================
-   VIEWING APPROVED
-======================================================== */
+  /* ========================================================
+     VIEWING APPROVED
+  ======================================================== */
 
   socket.on(
     "viewing_approved",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -701,10 +1208,16 @@ const registerConversationSocket = (
         payload
       );
 
-      if (payload.organizationId) {
+      if (
+        payload.organizationId &&
+        isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
         emitToOrganization(
           io,
-          payload.organizationId,
+          socket.data.organizationId,
           "dashboard_refresh",
           {
             reason:
@@ -715,15 +1228,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING REJECTED
-======================================================== */
+  /* ========================================================
+     VIEWING REJECTED
+  ======================================================== */
 
   socket.on(
     "viewing_rejected",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -734,15 +1259,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING RESCHEDULED
-======================================================== */
+  /* ========================================================
+     VIEWING RESCHEDULED
+  ======================================================== */
 
   socket.on(
     "viewing_rescheduled",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -751,10 +1288,16 @@ const registerConversationSocket = (
         payload
       );
 
-      if (payload.organizationId) {
+      if (
+        payload.organizationId &&
+        isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
         emitToOrganization(
           io,
-          payload.organizationId,
+          socket.data.organizationId,
           "calendar_refresh",
           payload
         );
@@ -762,15 +1305,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING CANCELLED
-======================================================== */
+  /* ========================================================
+     VIEWING CANCELLED
+  ======================================================== */
 
   socket.on(
     "viewing_cancelled",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -781,15 +1336,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING COMPLETED
-======================================================== */
+  /* ========================================================
+     VIEWING COMPLETED
+  ======================================================== */
 
   socket.on(
     "viewing_completed",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -798,10 +1365,16 @@ const registerConversationSocket = (
         payload
       );
 
-      if (payload.organizationId) {
+      if (
+        payload.organizationId &&
+        isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
         emitToOrganization(
           io,
-          payload.organizationId,
+          socket.data.organizationId,
           "dashboard_refresh",
           {
             reason:
@@ -812,15 +1385,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   VIEWING FEEDBACK SUBMITTED
-======================================================== */
+  /* ========================================================
+     VIEWING FEEDBACK SUBMITTED
+  ======================================================== */
 
   socket.on(
     "viewing_feedback_submitted",
-    (payload) => {
-      if (!payload?.conversationId)
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
         return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -831,33 +1416,60 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   CALENDAR UPDATED
-======================================================== */
+  /* ========================================================
+     CALENDAR UPDATED
+  ======================================================== */
 
   socket.on(
     "calendar_updated",
     (payload) => {
-      if (!payload?.organizationId)
+      if (
+        !payload?.organizationId
+      )
         return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "calendar_updated",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   NOTIFICATION CREATED
-======================================================== */
+  /* ========================================================
+     NOTIFICATION CREATED
+  ======================================================== */
 
   socket.on(
     "notification_created",
     (payload) => {
-      if (!payload?.userId) return;
+      if (
+        !payload?.userId
+      )
+        return;
+
+      if (
+        !isAuthorizedTargetUser(
+          socket,
+          payload.userId
+        )
+      ) {
+        return;
+      }
 
       emitToUser(
         io,
@@ -868,14 +1480,26 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   NOTIFICATION READ
-======================================================== */
+  /* ========================================================
+     NOTIFICATION READ
+  ======================================================== */
 
   socket.on(
     "notification_read",
     (payload) => {
-      if (!payload?.userId) return;
+      if (
+        !payload?.userId
+      )
+        return;
+
+      if (
+        !isAuthorizedTargetUser(
+          socket,
+          payload.userId
+        )
+      ) {
+        return;
+      }
 
       emitToUser(
         io,
@@ -886,50 +1510,94 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   QUICK ACTION EXECUTED
-======================================================== */
+  /* ========================================================
+     QUICK ACTION EXECUTED
+  ======================================================== */
 
   socket.on(
     "quick_action",
     (payload) => {
-      if (!payload?.organizationId) return;
+      if (
+        !payload?.organizationId
+      )
+        return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "quick_action",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   LEAD UPDATED
-======================================================== */
+  /* ========================================================
+     LEAD UPDATED
+  ======================================================== */
 
   socket.on(
     "lead_updated",
     (payload) => {
-      if (!payload?.organizationId) return;
+      if (
+        !payload?.organizationId
+      )
+        return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "lead_updated",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   LEAD ASSIGNED
-======================================================== */
+  /* ========================================================
+     LEAD ASSIGNED
+  ======================================================== */
 
   socket.on(
     "lead_assigned",
     (payload) => {
-      if (!payload?.agentId) return;
+      if (
+        !payload?.agentId
+      )
+        return;
+
+      if (
+        !isAuthorizedTargetUser(
+          socket,
+          payload.agentId
+        )
+      ) {
+        return;
+      }
 
       emitToUser(
         io,
@@ -938,27 +1606,47 @@ const registerConversationSocket = (
         payload
       );
 
-      if (payload.organizationId) {
+      if (
+        payload.organizationId &&
+        isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
         emitToOrganization(
           io,
-          payload.organizationId,
+          socket.data.organizationId,
           "dashboard_refresh",
           {
-            reason: "lead_assigned",
+            reason:
+              "lead_assigned",
           }
         );
       }
     }
   );
 
-/* ========================================================
-   AI QUALIFICATION UPDATED
-======================================================== */
+  /* ========================================================
+     AI QUALIFICATION UPDATED
+  ======================================================== */
 
   socket.on(
     "qualification_updated",
-    (payload) => {
-      if (!payload?.conversationId) return;
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
+        return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -969,14 +1657,27 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   PROPERTY MATCH FOUND
-======================================================== */
+  /* ========================================================
+     PROPERTY MATCH FOUND
+  ======================================================== */
 
   socket.on(
     "property_match_found",
-    (payload) => {
-      if (!payload?.conversationId) return;
+    async (payload) => {
+      if (
+        !payload?.conversationId
+      )
+        return;
+
+      const conversation =
+        await getAuthorizedConversation(
+          socket,
+          payload.conversationId
+        );
+
+      if (!conversation) {
+        return;
+      }
 
       emitToConversation(
         io,
@@ -987,63 +1688,111 @@ const registerConversationSocket = (
     }
   );
 
-/* ========================================================
-   PROPERTY UPDATED
-======================================================== */
+  /* ========================================================
+     PROPERTY UPDATED
+  ======================================================== */
 
   socket.on(
     "property_updated",
     (payload) => {
-      if (!payload?.organizationId) return;
+      if (
+        !payload?.organizationId
+      )
+        return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "property_updated",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   DASHBOARD SUMMARY REFRESH
-======================================================== */
+  /* ========================================================
+     DASHBOARD SUMMARY REFRESH
+  ======================================================== */
 
   socket.on(
     "dashboard_summary_updated",
     (payload) => {
-      if (!payload?.organizationId) return;
+      if (
+        !payload?.organizationId
+      )
+        return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "dashboard_summary_updated",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   PIPELINE UPDATED
-======================================================== */
+  /* ========================================================
+     PIPELINE UPDATED
+  ======================================================== */
 
   socket.on(
     "pipeline_updated",
     (payload) => {
-      if (!payload?.organizationId) return;
+      if (
+        !payload?.organizationId
+      )
+        return;
+
+      if (
+        !isAuthorizedOrganization(
+          socket,
+          payload.organizationId
+        )
+      ) {
+        return;
+      }
 
       emitToOrganization(
         io,
-        payload.organizationId,
+        socket.data.organizationId,
         "pipeline_updated",
-        payload
+        {
+          ...payload,
+          organizationId:
+            socket.data.organizationId,
+        }
       );
     }
   );
 
-/* ========================================================
-   DISCONNECT
-======================================================== */
+  /* ========================================================
+     DISCONNECT
+  ======================================================== */
 
   socket.on(
     "disconnect",

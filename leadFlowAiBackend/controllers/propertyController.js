@@ -63,15 +63,26 @@
 import propertyService from "../services/propertyService.js";
 import Property from "../models/property.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    HELPERS
 ========================================================== */
 
 /**
- * Get authenticated organization.
+ * Get authenticated organization through the centralized
+ * organization resolver.
  */
-const getOrganizationId = (req) => {
-  return req.user?.organizationId;
+const getOrganizationId = async (req) => {
+  const organization = await resolveFromRequest(req);
+
+  if (!organization) {
+    return null;
+  }
+
+  return organization._id || null;
 };
 
 /**
@@ -84,8 +95,9 @@ const getUserId = (req) => {
 /**
  * Require organization context.
  */
-const requireOrganization = (req, res) => {
-  const organizationId = getOrganizationId(req);
+const requireOrganization = async (req, res) => {
+  const organizationId =
+    await getOrganizationId(req);
 
   if (!organizationId) {
     res.status(401).json({
@@ -108,7 +120,7 @@ const requireOrganization = (req, res) => {
 export const getAllProperties = async (req, res) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -221,7 +233,7 @@ export const getAllProperties = async (req, res) => {
 export const getMyProperties = async (req, res) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -343,7 +355,7 @@ export const getPropertyById = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -393,7 +405,7 @@ export const createProperty = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -450,7 +462,7 @@ export const updateProperty = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -523,7 +535,7 @@ export const archiveProperty = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -584,7 +596,7 @@ export const restoreProperty = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -642,7 +654,7 @@ export const deleteProperty = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -698,7 +710,7 @@ export const searchProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -745,7 +757,7 @@ export const getAvailableProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -823,7 +835,7 @@ export const getReservedProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -901,7 +913,7 @@ export const getOccupiedProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -979,7 +991,7 @@ export const getInactiveProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1057,7 +1069,7 @@ export const getSoldProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1135,7 +1147,7 @@ export const getFeaturedProperties = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1176,7 +1188,7 @@ export const getNewListings = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1221,7 +1233,7 @@ export const getPropertyDashboard = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1261,7 +1273,7 @@ export const getInventoryStatus = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1301,7 +1313,7 @@ export const getPropertyStatistics = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1341,7 +1353,7 @@ export const getPriceHistory = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1396,7 +1408,7 @@ export const getLatestPrice = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1450,7 +1462,7 @@ export const getRecommendations = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1515,7 +1527,7 @@ export const getLeadRecommendations = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1581,7 +1593,7 @@ export const getPropertyMatches = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;
@@ -1650,7 +1662,7 @@ export const getArchivedPropertyCount = async (
 ) => {
   try {
     const organizationId =
-      requireOrganization(req, res);
+      await requireOrganization(req, res);
 
     if (!organizationId) {
       return;

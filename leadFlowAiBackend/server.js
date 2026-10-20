@@ -79,6 +79,50 @@ import { initSocketServer } from "./realtime/socketServer.js";
 import { initRealtimeEngine } from "./services/realtimeEngine.js";
 
 /* ==========================================================
+   DELIVERY WORKER
+========================================================== */
+
+/*
+ * Durable outbound AI message delivery.
+ *
+ * Architecture:
+ *
+ * AI Auto Reply
+ *      ↓
+ * Message
+ *      ↓
+ * DeliveryJob
+ *      ↓
+ * deliveryWorker
+ *      ↓
+ * messageTransportService
+ *      ↓
+ * SMS / WhatsApp / Website / Facebook
+ *
+ * IMPORTANT:
+ *
+ * The worker is started only AFTER MongoDB connects.
+ *
+ * server.js is responsible for starting the worker.
+ *
+ * The worker itself is responsible for:
+ *
+ *   • claiming DeliveryJobs
+ *   • retrying failed deliveries
+ *   • calling messageTransportService
+ *   • updating Message status
+ *   • recovering stale jobs
+ */
+
+import {
+  startDeliveryWorker,
+} from "./workers/deliveryWorker.js";
+
+import {
+  startOutboxWorkerWhenReady,
+} from "./workers/outboxWorker.js";
+
+/* ==========================================================
    APP
 ========================================================== */
 
@@ -188,7 +232,14 @@ app.use(
       );
     },
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+      "OPTIONS",
+    ],
 
     allowedHeaders: [
       "Content-Type",
@@ -201,11 +252,32 @@ app.use(
 );
 
 /* ==========================================================
-   BODY PARSERS
+   JSON BODY PARSER
 ========================================================== */
 
+/*
+ * Preserve the exact incoming JSON bytes for Meta webhook
+ * signature verification.
+ *
+ * IMPORTANT:
+ * - Keep the existing global JSON parser.
+ * - Do not re-serialize req.body to calculate signatures.
+ * - Other JSON routes continue to receive parsed request bodies.
+ */
+
 app.use(
-  express.json()
+  express.json({
+    verify: (req, res, buffer) => {
+      if (
+        req.originalUrl === "/api/webhooks/whatsapp" ||
+        req.originalUrl.startsWith(
+          "/api/webhooks/whatsapp?"
+        )
+      ) {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
 );
 
 /*
@@ -796,10 +868,178 @@ app.use(
 ========================================================== */
 
 connectDB()
-  .then(() => {
+  .then(async () => {
+
     console.log(
       "✅ MongoDB connected successfully"
     );
+
+
+    /* ========================================================
+       START DURABLE DELIVERY WORKER
+    ======================================================== */
+
+    /*
+     * IMPORTANT
+     * --------------------------------------------------------
+     *
+     * MongoDB MUST be connected before the delivery worker
+     * starts.
+     *
+     * The worker immediately:
+     *
+     *   • checks for stale DeliveryJobs
+     *   • queries pending DeliveryJobs
+     *   • claims jobs
+     *
+     * Therefore starting it before connectDB() would create
+     * unnecessary database race conditions.
+     */
+
+    try {
+
+      const deliveryWorkerStatus =
+        await startDeliveryWorker();
+
+      console.log(
+        "=================================================="
+      );
+
+      console.log(
+        "📨 DELIVERY WORKER STARTED"
+      );
+
+      console.log(
+        "👷 Worker:",
+        deliveryWorkerStatus?.workerName
+      );
+
+      console.log(
+        "📦 Batch size:",
+        deliveryWorkerStatus
+          ?.configuration
+          ?.batchSize
+      );
+
+      console.log(
+        "⏱️ Poll interval:",
+        deliveryWorkerStatus
+          ?.configuration
+          ?.pollIntervalMs,
+        "ms"
+      );
+
+      console.log(
+        "🔄 Stale recovery interval:",
+        deliveryWorkerStatus
+          ?.configuration
+          ?.staleRecoveryIntervalMs,
+        "ms"
+      );
+
+      console.log(
+        "=================================================="
+      );
+
+    } catch (deliveryWorkerError) {
+
+      /*
+       * Do not silently ignore worker startup failures.
+       *
+       * The API can still start, but outbound AI delivery
+       * will remain queued until the worker is available.
+       */
+
+      console.error(
+        "=================================================="
+      );
+
+      console.error(
+        "❌ DELIVERY WORKER FAILED TO START"
+      );
+
+      console.error(
+        deliveryWorkerError
+      );
+
+      console.error(
+        "⚠️ API SERVER WILL CONTINUE STARTING."
+      );
+
+      console.error(
+        "⚠️ Pending DeliveryJobs will remain durable."
+      );
+
+      console.error(
+        "=================================================="
+      );
+    }
+
+/* ========================================================
+   START DURABLE OUTBOX WORKER
+======================================================== */
+
+try {
+  const outboxWorkerStatus =
+    await startOutboxWorkerWhenReady();
+
+  if (outboxWorkerStatus?.started) {
+    console.log(
+      "=================================================="
+    );
+
+    console.log(
+      "🚀 LEADFLOW AI OUTBOX WORKER STARTED"
+    );
+
+    console.log(
+      "📦 Worker:",
+      outboxWorkerStatus?.workerName ||
+        "leadflow-outbox-worker"
+    );
+
+    console.log(
+      "=================================================="
+    );
+  } else {
+    console.error(
+      "❌ OUTBOX WORKER DID NOT START"
+    );
+
+    console.error(
+      "⚠️ Durable outbox events may remain pending."
+    );
+
+    console.error(
+      outboxWorkerStatus
+    );
+  }
+} catch (outboxWorkerError) {
+  console.error(
+    "=================================================="
+  );
+
+  console.error(
+    "❌ OUTBOX WORKER FAILED TO START"
+  );
+
+  console.error(
+    outboxWorkerError
+  );
+
+  console.error(
+    "⚠️ Durable outbox events may remain pending."
+  );
+
+  console.error(
+    "=================================================="
+  );
+}
+
+
+    /* ========================================================
+       START HTTP SERVER
+    ======================================================== */
 
     const PORT =
       process.env.PORT ||
@@ -849,6 +1089,7 @@ connectDB()
         );
       }
     );
+
   })
   .catch(
     (error) => {

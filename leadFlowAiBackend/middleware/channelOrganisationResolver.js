@@ -1,26 +1,44 @@
-import Organization from "../models/organization.js";
-
 /**
  * ==========================================================
  *
- * CHANNEL ORGANISATION RESOLVER
+ * CHANNEL ORGANIZATION RESOLVER
+ * LeadFlow AI
  *
  * ==========================================================
  *
+ * PURPOSE
+ * ----------------------------------------------------------
  * Resolves the LeadFlow AI organization from trusted
  * channel/provider metadata.
  *
  * IMPORTANT
  * ----------------------------------------------------------
+ *
+ * Organization resolution is centralized through:
+ *
+ * services/organizationResolverService.js
+ *
+ * This middleware MUST NOT independently query the
+ * Organization model.
+ *
  * Organization must NEVER be selected from:
  *
  * req.body.organizationId
  *
- * The organization is resolved from provider-controlled
- * channel identifiers.
+ * The organization is resolved from trusted provider
+ * metadata or authenticated server-side context.
  *
  * ==========================================================
  */
+
+import {
+  resolveByWhatsApp,
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
+/* ==========================================================
+   CHANNEL ORGANIZATION RESOLVER
+========================================================== */
 
 export const resolveChannelOrganization =
   async (
@@ -34,9 +52,9 @@ export const resolveChannelOrganization =
       const source =
         req.source;
 
-      // ======================================================
-      // SOURCE VALIDATION
-      // ======================================================
+      /* ====================================================
+         SOURCE VALIDATION
+      ==================================================== */
 
       if (!source) {
 
@@ -49,13 +67,11 @@ export const resolveChannelOrganization =
 
       }
 
-
       let organization = null;
 
-
-      // ======================================================
-      // WHATSAPP
-      // ======================================================
+      /* ====================================================
+         WHATSAPP
+      ==================================================== */
 
       if (
         source === "whatsapp"
@@ -64,7 +80,6 @@ export const resolveChannelOrganization =
         const phoneNumberId =
           req.channelMetadata
             ?.phoneNumberId;
-
 
         console.log(
           "\n=========================================================="
@@ -83,10 +98,9 @@ export const resolveChannelOrganization =
           phoneNumberId
         );
 
-
-        // ----------------------------------------------------
-        // META PHONE NUMBER ID IS REQUIRED
-        // ----------------------------------------------------
+        /* ----------------------------------------------------
+           META PHONE NUMBER ID IS REQUIRED
+        ---------------------------------------------------- */
 
         if (!phoneNumberId) {
 
@@ -103,38 +117,27 @@ export const resolveChannelOrganization =
 
         }
 
+        /* ----------------------------------------------------
+           SHARED ORGANIZATION RESOLUTION
+        ----------------------------------------------------
 
-        // ----------------------------------------------------
-        // ORGANIZATION LOOKUP
-        // ----------------------------------------------------
-        //
-        // Organization schema uses TOP-LEVEL WhatsApp fields:
-        //
-        // whatsappPhoneNumberId
-        // whatsappEnabled
-        // isActive
-        //
-        // DO NOT use:
-        //
-        // whatsapp.phoneNumberId
-        // whatsapp.enabled
-        //
-        // ----------------------------------------------------
+        Organization resolution is centralized through:
+
+        resolveByWhatsApp()
+
+        The resolver is responsible for checking:
+
+        - whatsappPhoneNumberId
+        - whatsappEnabled
+        - isActive
+
+        Do NOT perform Organization.findOne() here.
+        ---------------------------------------------------- */
 
         organization =
-          await Organization.findOne({
-
-            whatsappPhoneNumberId:
-              phoneNumberId,
-
-            whatsappEnabled:
-              true,
-
-            isActive:
-              true,
-
-          });
-
+          await resolveByWhatsApp(
+            phoneNumberId
+          );
 
         console.log(
           "🏢 Organization resolved:",
@@ -156,52 +159,44 @@ export const resolveChannelOrganization =
 
       }
 
-
-      // ======================================================
-      // WEBSITE
-      // ======================================================
+      /* ====================================================
+         WEBSITE
+      ==================================================== */
 
       /**
        * Website organization resolution is intentionally
-       * not guessed here.
+       * delegated to the shared organization resolver.
        *
-       * A website request must provide a trusted server-side
-       * organization context through authentication/session
-       * or a configured website identifier.
+       * The resolver uses trusted authenticated/server-side
+       * organization context.
        *
-       * Do NOT use req.body.organizationId.
+       * DO NOT use:
+       *
+       * req.body.organizationId
+       *
+       * req.params.organizationId
+       *
+       * req.query.organizationId
        */
 
       if (
         source === "website"
       ) {
 
-        const websiteOrganizationId =
-          req.user?.organizationId ||
-          req.websiteOrganizationId;
-
-
-        if (
-          websiteOrganizationId
-        ) {
-
-          organization =
-            await Organization.findById(
-              websiteOrganizationId
-            );
-
-        }
+        organization =
+          await resolveFromRequest(
+            req
+          );
 
       }
 
-
-      // ======================================================
-      // FACEBOOK
-      // ======================================================
+      /* ====================================================
+         FACEBOOK
+      ==================================================== */
 
       /**
-       * Facebook requires a trusted Page ID → Organization
-       * mapping.
+       * Facebook requires a trusted Page ID →
+       * Organization mapping.
        *
        * The current Organization schema does not yet contain
        * a dedicated Facebook Page ID field.
@@ -218,7 +213,6 @@ export const resolveChannelOrganization =
           req.channelMetadata
             ?.pageId;
 
-
         if (!pageId) {
 
           return res.status(400).json({
@@ -230,7 +224,6 @@ export const resolveChannelOrganization =
 
         }
 
-
         console.warn(
           "⚠️ Facebook organization mapping is not configured.",
           {
@@ -240,14 +233,13 @@ export const resolveChannelOrganization =
 
       }
 
-
-      // ======================================================
-      // SMS
-      // ======================================================
+      /* ====================================================
+         SMS
+      ==================================================== */
 
       /**
-       * SMS requires a trusted receiving/business number or
-       * provider account mapping.
+       * SMS requires a trusted receiving/business number
+       * or provider account mapping.
        *
        * The current Organization schema does not yet contain
        * a dedicated SMS configuration field.
@@ -264,7 +256,6 @@ export const resolveChannelOrganization =
           req.channelMetadata
             ?.receivingNumber;
 
-
         if (
           !receivingNumber
         ) {
@@ -278,7 +269,6 @@ export const resolveChannelOrganization =
 
         }
 
-
         console.warn(
           "⚠️ SMS organization mapping is not configured.",
           {
@@ -288,10 +278,9 @@ export const resolveChannelOrganization =
 
       }
 
-
-      // ======================================================
-      // FINAL ORGANIZATION VALIDATION
-      // ======================================================
+      /* ====================================================
+         FINAL ORGANIZATION VALIDATION
+      ==================================================== */
 
       if (
         !organization
@@ -304,7 +293,6 @@ export const resolveChannelOrganization =
           }
         );
 
-
         return res.status(404).json({
           success: false,
 
@@ -316,18 +304,15 @@ export const resolveChannelOrganization =
 
       }
 
-
-      // ======================================================
-      // TRUSTED ORGANIZATION CONTEXT
-      // ======================================================
+      /* ====================================================
+         TRUSTED ORGANIZATION CONTEXT
+      ==================================================== */
 
       req.organization =
         organization;
 
-
       req.organizationId =
         organization._id;
-
 
       console.log(
         "\n=========================================================="
@@ -339,8 +324,10 @@ export const resolveChannelOrganization =
 
       console.log({
         source,
+
         organizationId:
           organization._id,
+
         organizationName:
           organization.name,
       });
@@ -349,10 +336,9 @@ export const resolveChannelOrganization =
         "==========================================================\n"
       );
 
-
-      // ======================================================
-      // CONTINUE
-      // ======================================================
+      /* ====================================================
+         CONTINUE
+      ==================================================== */
 
       next();
 
@@ -371,5 +357,8 @@ export const resolveChannelOrganization =
 
   };
 
+/* ==========================================================
+   EXPORT
+========================================================== */
 
 export default resolveChannelOrganization;

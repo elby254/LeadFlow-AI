@@ -16,7 +16,8 @@
  *
  * This service SELECTS.
  *
- * assignmentConflictResolver.js DECIDES + MUTATES.
+ * assignmentConflictResolver.js DECIDES + MUTATES + PERSISTS
+ * the canonical assignment event atomically.
  *
  * Therefore this file MUST NOT directly mutate:
  *
@@ -48,16 +49,17 @@
  *   ↓
  * Conflict resolver
  *   ↓
- * ┌────────────────────────────────────┐
- * │ accepted = false                   │
- * │ → stop                             │
- * │ → no workload                      │
- * │ → no realtime event                │
- * │                                    │
- * │ accepted = true                    │
- * │ → workload increment               │
- * │ → realtime event                   │
- * └────────────────────────────────────┘
+ * ┌─────────────────────────────────────────────┐
+ * │ accepted = false                            │
+ * │ → stop                                      │
+ * │ → no workload                               │
+ * │ → no assignment event                      │
+ * │                                             │
+ * │ accepted = true                             │
+ * │ → assignment already persisted atomically   │
+ * │ → assignment event already persisted        │
+ * │ → workload increment                        │
+ * └─────────────────────────────────────────────┘
  *
  * ==========================================================
  */
@@ -67,51 +69,38 @@ import mongoose from "mongoose";
 import User from "../models/user.js";
 
 import {
-  emitLeadAssigned,
-} from "./realtimeEngine.js";
+  HOT_SCORE_THRESHOLD,
+  QUALIFIED_SCORE_MIN,
+  MAX_LEAD_SCORE,
+} from "./leadScoringRulesEngine.js";
 
 import {
   resolveAssignmentConflict,
 } from "./assignmentConflictResolver.js";
 
+/* ==========================================================
+   ROUND-ROBIN MEMORY
+========================================================== */
 
-// ==========================================================
-// ROUND-ROBIN MEMORY
-// ==========================================================
-//
-// organizationId → next agent index
-//
-// ==========================================================
+/**
+ * organizationId → next agent index
+ */
+const orgRoundRobinIndex = new Map();
 
-const orgRoundRobinIndex =
-  new Map();
-
-
-// ==========================================================
-// GET ACTIVE AGENTS
-// ==========================================================
-//
-// IMPORTANT:
-// Organization isolation happens here AND again inside
-// the conflict resolver.
-//
-// Defense in depth.
-//
-// ==========================================================
+/* ==========================================================
+   GET ACTIVE AGENTS
+========================================================== */
 
 const getAgents = async (
   organizationId
 ) => {
-
   if (
     !organizationId
   ) {
     return [];
   }
 
-
   return User.find({
-
     organizationId,
 
     role:
@@ -119,25 +108,20 @@ const getAgents = async (
 
     isActive:
       true,
-
   }).sort({
-
     createdAt:
       1,
-
   });
 };
 
-
-// ==========================================================
-// ROUND-ROBIN ASSIGNMENT
-// ==========================================================
+/* ==========================================================
+   ROUND-ROBIN ASSIGNMENT
+========================================================== */
 
 const roundRobinAssign = (
   organizationId,
   agents
 ) => {
-
   if (
     !organizationId ||
     !Array.isArray(
@@ -145,29 +129,24 @@ const roundRobinAssign = (
     ) ||
     !agents.length
   ) {
-
     return null;
   }
-
 
   const organizationKey =
     String(
       organizationId
     );
 
-
   const currentIndex =
     orgRoundRobinIndex.get(
       organizationKey
     ) ?? 0;
-
 
   const selectedAgent =
     agents[
       currentIndex %
       agents.length
     ];
-
 
   const nextIndex =
     (
@@ -176,50 +155,42 @@ const roundRobinAssign = (
     ) %
     agents.length;
 
-
   orgRoundRobinIndex.set(
     organizationKey,
     nextIndex
   );
 
-
   return selectedAgent;
 };
 
-
-// ==========================================================
-// LEAST BUSY AGENT
-// ==========================================================
+/* ==========================================================
+   LEAST BUSY AGENT
+========================================================== */
 
 const leastBusyAgent = (
   agents
 ) => {
-
   if (
     !Array.isArray(
       agents
     ) ||
     !agents.length
   ) {
-
     return null;
   }
 
-
   return [
-    ...agents
+    ...agents,
   ].sort(
     (
       a,
       b
     ) => {
-
       const workloadA =
         Number(
           a?.assignedLeadCount ||
           0
         );
-
 
       const workloadB =
         Number(
@@ -227,20 +198,15 @@ const leastBusyAgent = (
           0
         );
 
-
       if (
         workloadA !==
         workloadB
       ) {
-
         return (
           workloadA -
           workloadB
         );
       }
-
-
-      // Stable tie-breaker.
 
       return String(
         a?._id ||
@@ -255,70 +221,52 @@ const leastBusyAgent = (
   )[0];
 };
 
-
-// ==========================================================
-// BEST PERFORMING AGENT
-// ==========================================================
-//
-// Primary:
-// closedLeadCount DESC
-//
-// Secondary:
-// assignedLeadCount ASC
-//
-// Tertiary:
-// _id ASC
-//
-// ==========================================================
+/* ==========================================================
+   BEST PERFORMING AGENT
+========================================================== */
 
 const bestPerformingAgent = (
   agents
 ) => {
-
   if (
     !Array.isArray(
       agents
     ) ||
     !agents.length
   ) {
-
     return null;
   }
 
-
   return [
-    ...agents
+    ...agents,
   ].sort(
     (
       a,
       b
     ) => {
-
-      const closedA =
+      const wonA =
         Number(
-          a?.closedLeadCount ||
+          a?.wonLeadCount ??
+          a?.closedLeadCount ??
           0
         );
 
-
-      const closedB =
+      const wonB =
         Number(
-          b?.closedLeadCount ||
+          b?.wonLeadCount ??
+          b?.closedLeadCount ??
           0
         );
-
 
       if (
-        closedA !==
-        closedB
+        wonA !==
+        wonB
       ) {
-
         return (
-          closedB -
-          closedA
+          wonB -
+          wonA
         );
       }
-
 
       const workloadA =
         Number(
@@ -326,25 +274,21 @@ const bestPerformingAgent = (
           0
         );
 
-
       const workloadB =
         Number(
           b?.assignedLeadCount ||
           0
         );
 
-
       if (
         workloadA !==
         workloadB
       ) {
-
         return (
           workloadA -
           workloadB
         );
       }
-
 
       return String(
         a?._id ||
@@ -359,160 +303,234 @@ const bestPerformingAgent = (
   )[0];
 };
 
+/* ==========================================================
+   NORMALIZE ROUTING SCORE
+========================================================== */
 
-// ==========================================================
-// SCORE-BASED ASSIGNMENT
-// ==========================================================
-//
-// 80+
-// → best performing agent
-//
-// 50–79
-// → least busy agent
-//
-// <50
-// → null → round-robin fallback
-//
-// ==========================================================
+const normalizeRoutingScore = (
+  value
+) => {
+  const numericScore =
+    Number(
+      value
+    );
+
+  if (
+    !Number.isFinite(
+      numericScore
+    )
+  ) {
+    return 0;
+  }
+
+  return Math.min(
+    MAX_LEAD_SCORE,
+    Math.max(
+      0,
+      numericScore
+    )
+  );
+};
+
+/* ==========================================================
+   SCORE-BASED ASSIGNMENT
+========================================================== */
 
 const scoreBasedAssign = (
   agents,
   leadScore
 ) => {
-
   if (
     !Array.isArray(
       agents
     ) ||
     !agents.length
   ) {
-
     return null;
   }
 
-
-  const numericScore =
-    Number(
+  const score =
+    normalizeRoutingScore(
       leadScore
     );
 
-
-  const score =
-    Number.isFinite(
-      numericScore
-    )
-      ? numericScore
-      : 0;
-
-
   if (
-    score >= 80
+    score >=
+    HOT_SCORE_THRESHOLD
   ) {
-
     return bestPerformingAgent(
       agents
     );
   }
 
-
   if (
-    score >= 50
+    score >=
+    QUALIFIED_SCORE_MIN
   ) {
-
     return leastBusyAgent(
       agents
     );
   }
 
-
   return null;
 };
 
-
-// ==========================================================
-// CHECK EXISTING ASSIGNMENT
-// ==========================================================
+/* ==========================================================
+   CHECK EXISTING ASSIGNMENT
+========================================================== */
 
 const hasExistingAssignment = (
   lead
 ) => {
-
   return Boolean(
     lead?.assignedTo
   );
 };
 
-
-// ==========================================================
-// VALIDATE ORGANIZATION ID
-// ==========================================================
+/* ==========================================================
+   VALIDATE ORGANIZATION ID
+========================================================== */
 
 const isValidOrganizationId = (
   organizationId
 ) => {
-
   return Boolean(
     organizationId &&
-    mongoose.Types.ObjectId.isValid(
-      organizationId
-    )
+      mongoose.Types.ObjectId.isValid(
+        organizationId
+      )
   );
 };
 
-
-// ==========================================================
-// NORMALIZE ASSIGNMENT ID
-// ==========================================================
+/* ==========================================================
+   NORMALIZE ASSIGNMENT ID
+========================================================== */
 
 const getAssignmentId = (
   assignment
 ) => {
-
   if (
     !assignment
   ) {
-
     return null;
   }
-
 
   if (
     typeof assignment ===
       "object" &&
     assignment._id
   ) {
-
     return String(
       assignment._id
     );
   }
-
 
   return String(
     assignment
   );
 };
 
+/* ==========================================================
+   UPDATE AGENT WORKLOAD
+========================================================== */
 
-// ==========================================================
-// MAIN AUTO ASSIGNMENT FUNCTION
-// ==========================================================
+const updateAgentWorkload = async (
+  previousAgentId,
+  newAgentId,
+  organizationId
+) => {
+  if (
+    !newAgentId
+  ) {
+    return null;
+  }
+
+  if (
+    previousAgentId &&
+    String(
+      previousAgentId
+    ) ===
+      String(
+        newAgentId
+      )
+  ) {
+    return null;
+  }
+
+  if (
+    previousAgentId
+  ) {
+    await User.findOneAndUpdate(
+      {
+        _id:
+          previousAgentId,
+
+        organizationId,
+
+        role:
+          "agent",
+
+        assignedLeadCount: {
+          $gt:
+            0,
+        },
+      },
+
+      {
+        $inc: {
+          assignedLeadCount:
+            -1,
+        },
+      },
+
+      { returnDocument: "after" }
+    );
+  }
+
+  const updatedAgent =
+    await User.findOneAndUpdate(
+      {
+        _id:
+          newAgentId,
+
+        organizationId,
+
+        role:
+          "agent",
+
+        isActive:
+          true,
+      },
+
+      {
+        $inc: {
+          assignedLeadCount:
+            1,
+        },
+      },
+
+      { returnDocument: "after" }
+    );
+
+  return updatedAgent;
+};
+
+/* ==========================================================
+   MAIN AUTO ASSIGNMENT FUNCTION
+========================================================== */
 
 export const autoAssignLead =
   async (
     lead
   ) => {
-
     try {
-
-      // ====================================================
-      // 1. VALIDATE LEAD
-      // ====================================================
+      /* ====================================================
+         1. VALIDATE LEAD
+      ==================================================== */
 
       if (
         !lead
       ) {
-
         console.log(
           "⚠️ Auto assignment skipped: lead is missing."
         );
@@ -520,19 +538,16 @@ export const autoAssignLead =
         return null;
       }
 
-
-      // ====================================================
-      // 2. VALIDATE LEAD ID
-      // ====================================================
+      /* ====================================================
+         2. VALIDATE LEAD ID
+      ==================================================== */
 
       const leadId =
         lead._id;
 
-
       if (
         !leadId
       ) {
-
         console.log(
           "⚠️ Auto assignment skipped: lead ID is missing."
         );
@@ -540,21 +555,18 @@ export const autoAssignLead =
         return null;
       }
 
-
-      // ====================================================
-      // 3. VALIDATE ORGANIZATION
-      // ====================================================
+      /* ====================================================
+         3. VALIDATE ORGANIZATION
+      ==================================================== */
 
       const organizationId =
         lead.organizationId;
-
 
       if (
         !isValidOrganizationId(
           organizationId
         )
       ) {
-
         console.log(
           "⚠️ Auto assignment skipped: invalid organization ID."
         );
@@ -562,28 +574,18 @@ export const autoAssignLead =
         return null;
       }
 
-
-      // ====================================================
-      // 4. EXISTING ASSIGNMENT PROTECTION
-      // ====================================================
-      //
-      // Automatic assignment should never compete with an
-      // already assigned lead.
-      //
-      // Manual and AI assignment therefore remain protected.
-      //
-      // ====================================================
+      /* ====================================================
+         4. EXISTING ASSIGNMENT PROTECTION
+      ==================================================== */
 
       if (
         hasExistingAssignment(
           lead
         )
       ) {
-
         console.log(
           `ℹ️ Lead ${leadId} is already assigned. Auto assignment skipped.`
         );
-
 
         return {
           accepted:
@@ -596,28 +598,27 @@ export const autoAssignLead =
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            false,
         };
       }
 
-
-      // ====================================================
-      // 5. GET ACTIVE AGENTS
-      // ====================================================
+      /* ====================================================
+         5. GET ACTIVE AGENTS
+      ==================================================== */
 
       const agents =
         await getAgents(
           organizationId
         );
 
-
       if (
         !agents.length
       ) {
-
         console.log(
           `⚠️ No active agents found for organization ${organizationId}.`
         );
-
 
         return {
           accepted:
@@ -630,49 +631,41 @@ export const autoAssignLead =
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            false,
         };
       }
-
 
       console.log(
         `👥 ${agents.length} active agent(s) available for lead ${leadId}.`
       );
 
+      /* ====================================================
+         6. NORMALIZE LEAD SCORE
+      ==================================================== */
 
-      // ====================================================
-      // 6. DETERMINE LEAD SCORE
-      // ====================================================
-
-      const rawScore =
-        Number(
+      const leadScore =
+        normalizeRoutingScore(
           lead.score
         );
 
+      console.log(
+        "🎯 Lead routing score:",
+        leadScore
+      );
 
-      const leadScore =
-        Number.isFinite(
-          rawScore
-        )
-          ? rawScore
-          : 0;
-
-
-      // ====================================================
-      // 7. SELECT CANDIDATE AGENT
-      // ====================================================
+      /* ====================================================
+         7. SELECT CANDIDATE AGENT
+      ==================================================== */
 
       let candidateAgent =
         null;
 
-
-      // ----------------------------------------------------
-      // SCORE-BASED ROUTING
-      // ----------------------------------------------------
-
       if (
-        leadScore >= 50
+        leadScore >=
+        QUALIFIED_SCORE_MIN
       ) {
-
         candidateAgent =
           scoreBasedAssign(
             agents,
@@ -680,15 +673,9 @@ export const autoAssignLead =
           );
       }
 
-
-      // ----------------------------------------------------
-      // ROUND-ROBIN FALLBACK
-      // ----------------------------------------------------
-
       if (
         !candidateAgent
       ) {
-
         candidateAgent =
           roundRobinAssign(
             organizationId,
@@ -696,19 +683,16 @@ export const autoAssignLead =
           );
       }
 
-
-      // ====================================================
-      // 8. VALIDATE CANDIDATE
-      // ====================================================
+      /* ====================================================
+         8. VALIDATE CANDIDATE
+      ==================================================== */
 
       if (
         !candidateAgent
       ) {
-
         console.log(
           `⚠️ No agent could be selected for lead ${leadId}.`
         );
-
 
         return {
           accepted:
@@ -721,13 +705,15 @@ export const autoAssignLead =
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            false,
         };
       }
 
-
-      // ====================================================
-      // 9. DEFENSE-IN-DEPTH ORGANIZATION CHECK
-      // ====================================================
+      /* ====================================================
+         9. DEFENSE-IN-DEPTH ORGANIZATION CHECK
+      ==================================================== */
 
       if (
         String(
@@ -737,11 +723,9 @@ export const autoAssignLead =
           organizationId
         )
       ) {
-
         console.error(
           "❌ SECURITY: Candidate agent belongs to another organization."
         );
-
 
         return {
           accepted:
@@ -754,20 +738,20 @@ export const autoAssignLead =
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            false,
         };
       }
 
-
-      // ====================================================
-      // 10. BUILD PROPOSED ASSIGNMENT
-      // ====================================================
+      /* ====================================================
+         10. BUILD PROPOSED ASSIGNMENT
+      ==================================================== */
 
       const assignedAt =
         new Date();
 
-
       const proposedAssignment = {
-
         assignedTo:
           candidateAgent._id,
 
@@ -778,9 +762,7 @@ export const autoAssignLead =
           "ai",
 
         assignedAt,
-
       };
-
 
       console.log(
         "🎯 PROPOSED ASSIGNMENT:",
@@ -808,49 +790,34 @@ export const autoAssignLead =
         }
       );
 
+      /* ====================================================
+         11. CONFLICT RESOLUTION
+      ==================================================== */
 
-      // ====================================================
-      // 11. CONFLICT RESOLUTION
-      // ====================================================
-      //
-      // IMPORTANT:
-      //
-      // The resolver is now the ONLY assignment mutation
-      // authority.
-      //
-      // This service does NOT mutate the lead before or
-      // after this call.
-      //
-      // ====================================================
-
+      /**
+       * assignmentConflictResolver.js owns:
+       *
+       * ✓ authoritative assignment mutation
+       * ✓ concurrency guard
+       * ✓ LEAD_ASSIGNED Outbox event
+       * ✓ atomic assignment + event transaction
+       */
       const resolution =
         await resolveAssignmentConflict(
           leadId,
-          proposedAssignment
+
+          proposedAssignment,
+
+          organizationId
         );
 
-
-      // ====================================================
-      // 12. RESOLUTION REJECTED
-      // ====================================================
-      //
-      // CRITICAL:
-      //
-      // A rejected assignment MUST stop here.
-      //
-      // DO NOT:
-      //
-      // ✗ modify lead
-      // ✗ save lead
-      // ✗ increment workload
-      // ✗ emit realtime event
-      //
-      // ====================================================
+      /* ====================================================
+         12. RESOLUTION REJECTED
+      ==================================================== */
 
       if (
         !resolution?.accepted
       ) {
-
         console.log(
           "🛑 AUTO ASSIGNMENT NOT ACCEPTED:",
           {
@@ -865,9 +832,8 @@ export const autoAssignLead =
           }
         );
 
-
-        return resolution ||
-          {
+        return (
+          resolution || {
             accepted:
               false,
 
@@ -878,26 +844,26 @@ export const autoAssignLead =
 
             assignedAgent:
               null,
-          };
+
+            assignmentEventQueued:
+              false,
+          }
+        );
       }
 
-
-      // ====================================================
-      // 13. RESOLUTION MUST CONTAIN AGENT
-      // ====================================================
+      /* ====================================================
+         13. RESOLUTION MUST CONTAIN AGENT
+      ==================================================== */
 
       const assignedAgent =
         resolution.assignedAgent;
 
-
       if (
         !assignedAgent
       ) {
-
         console.error(
           "❌ Resolver accepted assignment but returned no assigned agent."
         );
-
 
         return {
           accepted:
@@ -906,38 +872,43 @@ export const autoAssignLead =
           reason:
             "resolver_missing_agent",
 
-          lead,
+          lead:
+            resolution.lead ||
+            lead,
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            resolution.assignmentEventQueued ===
+            true,
         };
       }
 
+      /* ====================================================
+         14. VERIFY FINAL ASSIGNMENT
+      ==================================================== */
 
-      // ====================================================
-      // 14. VERIFY FINAL ASSIGNMENT
-      // ====================================================
+      const resolvedLead =
+        resolution.lead ||
+        lead;
 
       const finalAssignedTo =
         getAssignmentId(
-          resolution.lead?.assignedTo
+          resolvedLead.assignedTo
         );
-
 
       const resolvedAgentId =
         getAssignmentId(
           assignedAgent
         );
 
-
       if (
         !finalAssignedTo
       ) {
-
         console.error(
           "❌ Assignment verification failed: lead has no assignedTo after resolver."
         );
-
 
         return {
           accepted:
@@ -947,20 +918,21 @@ export const autoAssignLead =
             "assignment_verification_failed",
 
           lead:
-            resolution.lead ||
-            lead,
+            resolvedLead,
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            resolution.assignmentEventQueued ===
+            true,
         };
       }
-
 
       if (
         finalAssignedTo !==
         resolvedAgentId
       ) {
-
         console.error(
           "❌ Assignment verification failed: resolver result and lead assignment disagree.",
           {
@@ -972,7 +944,6 @@ export const autoAssignLead =
           }
         );
 
-
         return {
           accepted:
             false,
@@ -981,26 +952,36 @@ export const autoAssignLead =
             "assignment_agent_mismatch",
 
           lead:
-            resolution.lead ||
-            lead,
+            resolvedLead,
 
           assignedAgent:
             null,
+
+          assignmentEventQueued:
+            resolution.assignmentEventQueued ===
+            true,
         };
       }
 
+      /* ====================================================
+         15. GET PREVIOUS AGENT
+      ==================================================== */
 
-      // ====================================================
-      // 15. IMPORTANT
-      // ====================================================
-      //
-      // DO NOT SAVE THE LEAD HERE.
-      //
-      // The resolver already performed the authoritative
-      // assignment mutation and save.
-      //
-      // ====================================================
+      const previousAgentId =
+        resolution.previousAgentId ||
+        null;
 
+      /* ====================================================
+         16. IMPORTANT
+      ==================================================== */
+
+      /**
+       * DO NOT SAVE THE LEAD HERE.
+       *
+       * The resolver already performed the authoritative
+       * assignment mutation and atomically persisted the
+       * canonical assignment Outbox event.
+       */
       console.log(
         "✅ Resolver confirmed final assignment:",
         {
@@ -1015,113 +996,89 @@ export const autoAssignLead =
             ),
 
           source:
-            resolution.assignedSource,
+            resolution.assignedSource ||
+            "ai",
+
+          assignmentEventQueued:
+            resolution.assignmentEventQueued ===
+            true,
         }
       );
 
+      /* ====================================================
+         17. UPDATE AGENT WORKLOAD
+      ==================================================== */
 
-      // ====================================================
-      // 16. UPDATE AGENT WORKLOAD
-      // ====================================================
-      //
-      // This happens ONLY after:
-      //
-      // ✓ resolver accepted assignment
-      // ✓ assignment was persisted
-      // ✓ assignment was verified
-      //
-      // ====================================================
-
-      const updatedAgent =
-        await User.findOneAndUpdate(
-
-          {
-            _id:
-              assignedAgent._id,
-
-            organizationId,
-
-            role:
-              "agent",
-
-            isActive:
-              true,
-          },
-
-          {
-            $inc: {
-              assignedLeadCount:
-                1,
-            },
-          },
-
-          { returnDocument: 'after' }
-        );
-
-
-      if (
-        !updatedAgent
-      ) {
-
-        console.error(
-          "⚠️ Agent workload could not be updated after successful assignment.",
-          {
-            agentId:
-              assignedAgent._id,
-
-            leadId,
-          }
-        );
-
-      } else {
-
-        console.log(
-          "📈 Agent workload incremented:",
-          {
-            agent:
-              updatedAgent.name,
-
-            agentId:
-              updatedAgent._id,
-
-            assignedLeadCount:
-              updatedAgent.assignedLeadCount,
-          }
-        );
-      }
-
-
-      // ====================================================
-      // 17. REALTIME ASSIGNMENT EVENT
-      // ====================================================
-      //
-      // Realtime failure MUST NOT undo the persisted
-      // assignment.
-      //
-      // ====================================================
+      let updatedAgent =
+        null;
 
       try {
+        updatedAgent =
+          await updateAgentWorkload(
+            previousAgentId,
 
-        emitLeadAssigned(
-          resolution.lead,
-          updatedAgent ||
-          assignedAgent
-        );
+            assignedAgent._id,
 
+            organizationId
+          );
+
+        if (
+          updatedAgent
+        ) {
+          console.log(
+            "📈 Agent workload incremented:",
+            {
+              agent:
+                updatedAgent.name,
+
+              agentId:
+                updatedAgent._id,
+
+              assignedLeadCount:
+                updatedAgent.assignedLeadCount,
+            }
+          );
+        } else {
+          console.warn(
+            "⚠️ Agent workload was not updated.",
+            {
+              agentId:
+                assignedAgent._id,
+
+              leadId,
+            }
+          );
+        }
       } catch (
-        realtimeError
+        workloadError
       ) {
-
         console.error(
-          "⚠️ Lead assignment realtime event failed:",
-          realtimeError?.message
+          "⚠️ Agent workload update failed after successful assignment:",
+          workloadError
         );
       }
 
+      /* ====================================================
+         18. CANONICAL ASSIGNMENT EVENT RESULT
+      ==================================================== */
 
-      // ====================================================
-      // 18. FINAL LOGGING
-      // ====================================================
+      /**
+       * The resolver already persisted the event atomically.
+       *
+       * No second Outbox transaction occurs here.
+       */
+      const assignmentEventQueued =
+        resolution.assignmentEventQueued ===
+        true;
+
+      console.log(
+        "📦 Canonical lead.assigned event persisted atomically:",
+        assignmentEventQueued
+      );
+
+      /* ====================================================
+         19. FINAL LOGGING
+      ==================================================== */
 
       console.log(
         `📦 Auto-assigned lead ${leadId} → ${
@@ -1132,37 +1089,36 @@ export const autoAssignLead =
         }`
       );
 
-
       console.log(
         "📌 Assignment source:",
         resolution.assignedSource
       );
-
 
       console.log(
         "📌 Lead score:",
         leadScore
       );
 
-
       console.log(
         "📌 Organization:",
         organizationId
       );
-
 
       console.log(
         "📌 Final agent:",
         assignedAgent._id
       );
 
+      console.log(
+        "📌 Assignment event queued:",
+        assignmentEventQueued
+      );
 
-      // ====================================================
-      // 19. RETURN FINAL RESULT
-      // ====================================================
+      /* ====================================================
+         20. RETURN FINAL RESULT
+      ==================================================== */
 
       return {
-
         accepted:
           true,
 
@@ -1171,15 +1127,14 @@ export const autoAssignLead =
           "assignment_created",
 
         lead:
-          resolution.lead,
+          resolvedLead,
 
         assignedAgent:
           updatedAgent ||
           assignedAgent,
 
         previousAgentId:
-          resolution.previousAgentId ||
-          null,
+          previousAgentId,
 
         previousSource:
           resolution.previousSource ||
@@ -1188,17 +1143,11 @@ export const autoAssignLead =
         assignedSource:
           resolution.assignedSource,
 
+        assignmentEventQueued,
       };
-
-
     } catch (
       error
     ) {
-
-      // ====================================================
-      // ERROR HANDLING
-      // ====================================================
-
       console.error(
         "❌ AUTO ASSIGNMENT ERROR:"
       );
@@ -1211,15 +1160,13 @@ export const autoAssignLead =
         error?.stack
       );
 
-
       return null;
     }
   };
 
-
-// ==========================================================
-// EXPORT HELPERS
-// ==========================================================
+/* ==========================================================
+   EXPORT HELPERS
+========================================================== */
 
 export {
   getAgents,

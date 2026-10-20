@@ -23,6 +23,12 @@
  *        ↓
  * AI Response Engine
  *        ↓
+ * AI Message
+ *        ↓
+ * DeliveryJob
+ *        ↓
+ * deliveryWorker
+ *        ↓
  * Channel-aware outbound transport
  *
  * ============================================================
@@ -62,31 +68,34 @@
  *
  * ============================================================
  *
- * OUTBOUND TRANSPORT
+ * OUTBOUND DELIVERY
  * ------------------------------------------------------------
  *
- * WhatsApp inbound
+ * AI response
  *      ↓
- * WhatsApp outbound
- *
- * SMS inbound
+ * AI Message
  *      ↓
- * Africa's Talking SMS outbound
+ * DeliveryJob
+ *      ↓
+ * deliveryWorker
+ *      ↓
+ * messageTransportService
+ *      ↓
+ * Provider
  *
- * The controller does NOT guess a transport.
+ * IMPORTANT
+ * ------------------------------------------------------------
  *
- * If the inbound channel is explicitly available as:
+ * This controller NO LONGER calls sendOutboundMessage()
+ * directly.
  *
- *     whatsapp
+ * It creates the canonical AI Message and durable
+ * DeliveryJob instead.
  *
- * WhatsApp is used.
+ * The deliveryWorker owns actual provider delivery.
  *
  * ============================================================
  */
-
-import {
-  sendOutboundMessage,
-} from "../services/messageTransportService.js";
 
 import {
   generateAIResponse,
@@ -99,6 +108,13 @@ import {
 import {
   updateConversationState,
 } from "../services/conversationStateEngine.js";
+
+import Message from "../models/message.js";
+
+import {
+  createDeliveryJob,
+  resolveDeliveryProvider,
+} from "../services/deliveryJobService.js";
 
 
 /* ============================================================
@@ -332,7 +348,8 @@ const normalizeAIResult = (
 const persistExtractedLeadIntent =
   async (
     lead,
-    intent
+    intent,
+    organizationId
   ) => {
 
     try {
@@ -343,6 +360,20 @@ const persistExtractedLeadIntent =
 
         console.warn(
           "⚠️ Intent persistence skipped: lead._id is missing."
+        );
+
+        return null;
+      }
+
+
+      if (
+        !hasValue(
+          organizationId
+        )
+      ) {
+
+        console.warn(
+          "⚠️ Intent persistence skipped: organizationId is missing."
         );
 
         return null;
@@ -392,7 +423,8 @@ const persistExtractedLeadIntent =
 
       await persistLeadIntent(
         lead._id,
-        normalizedIntent
+        normalizedIntent,
+        organizationId
       );
 
 
@@ -466,37 +498,10 @@ const buildMergedSummary = (
         extracted?.bedrooms
       ),
 
-    propertyType:
-      mergeIfPresent(
-        existing?.propertyType,
-        extracted?.propertyType
-      ),
-
-    moveDate:
-      mergeIfPresent(
-        existing?.moveDate,
-        extracted?.moveDate
-      ),
-
-    financing:
-      mergeIfPresent(
-        existing?.financing ??
-          null,
-
-        extracted?.financing ??
-          null
-      ) ?? null,
-
     intent:
       mergeIfPresent(
         existing?.intent,
         normalizedIntent
-      ),
-
-    phone:
-      mergeIfPresent(
-        existing?.phone,
-        extracted?.phone
       ),
 
   };
@@ -946,6 +951,34 @@ export const sendAutoReply =
 
 
       /* ------------------------------------------------------
+         Validate organization context
+      ------------------------------------------------------ */
+
+      const outboundOrganizationId =
+        normalizedExtractedData?.organizationId ||
+        lead?.organizationId ||
+        null;
+
+      if (
+        !hasValue(
+          outboundOrganizationId
+        )
+      ) {
+
+        console.warn(
+          "⚠️ Auto reply skipped: organizationId is missing."
+        );
+
+        return;
+      }
+
+      console.log(
+        "🏢 AUTO REPLY ORGANIZATION ID:",
+        outboundOrganizationId
+      );
+
+
+      /* ------------------------------------------------------
          EFFECTIVE INTENT
       ------------------------------------------------------ */
 
@@ -994,7 +1027,8 @@ export const sendAutoReply =
       const persistedIntent =
         await persistExtractedLeadIntent(
           lead,
-          effectiveIntent
+          effectiveIntent,
+          outboundOrganizationId
         );
 
       if (
@@ -1255,7 +1289,7 @@ export const sendAutoReply =
       ------------------------------------------------------ */
 
       console.log(
-        "📤 SENDING AUTO REPLY TO:",
+        "📤 QUEUING AUTO REPLY TO:",
         lead.phone
       );
 
@@ -1266,7 +1300,7 @@ export const sendAutoReply =
 
 
       /* ======================================================
-         CENTRALIZED OUTBOUND TRANSPORT
+         CHANNEL / SOURCE RESOLUTION
       ====================================================== */
 
       /**
@@ -1313,121 +1347,600 @@ export const sendAutoReply =
 
 
       /* ------------------------------------------------------
-         Validate organization context
+         Validate outbound source
       ------------------------------------------------------ */
 
-      const outboundOrganizationId =
-        normalizedExtractedData?.organizationId ||
-        lead?.organizationId ||
-        null;
+      const validOutboundSources = [
+        "sms",
+        "whatsapp",
+        "website",
+        "facebook",
+      ];
 
-      console.log(
-        "🏢 AUTO REPLY ORGANIZATION ID:",
-        outboundOrganizationId ||
-          "(missing)"
-      );
+      if (
+        !validOutboundSources.includes(
+          outboundSource
+        )
+      ) {
+
+        console.error(
+          "❌ AUTO REPLY QUEUE FAILED: Unsupported outbound source.",
+          {
+            outboundSource,
+            leadId:
+              lead?._id ||
+              null,
+            organizationId:
+              outboundOrganizationId,
+          }
+        );
+
+        return {
+          success: false,
+          queued: false,
+          reason:
+            "Unsupported or missing outbound source.",
+          source:
+            outboundSource ||
+            null,
+        };
+      }
 
 
       /* ------------------------------------------------------
-         Send through centralized transport
+         Resolve conversation ID
       ------------------------------------------------------ */
 
-      const transportResult =
-        await sendOutboundMessage({
+      const outboundConversationId =
+        effectiveConversation?._id ||
+        conversation?._id ||
+        null;
 
-          source:
-            outboundSource,
 
-          phone:
-            lead.phone,
+      if (
+        !outboundConversationId
+      ) {
 
-          message:
-            finalMessage,
-
-          context: {
+        console.error(
+          "❌ AUTO REPLY QUEUE FAILED: conversationId is missing.",
+          {
+            leadId:
+              lead?._id ||
+              null,
 
             organizationId:
               outboundOrganizationId,
+          }
+        );
+
+        return {
+          success: false,
+          queued: false,
+          reason:
+            "Conversation ID is required to create AI Message.",
+        };
+      }
+
+
+      /* ------------------------------------------------------
+         Resolve provider
+      ------------------------------------------------------ */
+
+      const outboundProvider =
+        resolveDeliveryProvider(
+          outboundSource
+        );
+
+
+      console.log(
+        "🚚 AUTO REPLY DELIVERY PROVIDER:",
+        outboundProvider ||
+          "(none)"
+      );
+
+
+      /* ======================================================
+         CREATE CANONICAL AI MESSAGE + DELIVERY JOB ATOMICALLY
+      ====================================================== */
+
+      /**
+       * ATOMICITY INVARIANT
+       * -------------------
+       * Message and DeliveryJob must commit together.
+       *
+       * If either write fails, the transaction aborts and
+       * neither new record is persisted.
+       *
+       * No provider calls or other external side effects belong
+       * inside this transaction. The delivery worker remains
+       * responsible for actual delivery and retries.
+       */
+
+      /**
+       * Allocate the Message ID before entering withTransaction().
+       * MongoDB may retry the transaction callback; keeping the ID
+       * stable ensures callback retries represent the same Message.
+       */
+      const aiMessageId =
+        new Message()._id;
+
+      const aiMessageData = {
+        _id:
+          aiMessageId,
+
+        organizationId:
+          outboundOrganizationId,
+
+        conversationId:
+          outboundConversationId,
+
+        leadId:
+          lead?._id ||
+          null,
+
+        source:
+          outboundSource,
+
+        externalMessageId:
+          null,
+
+        senderId:
+          null,
+
+        senderRole:
+          "ai",
+
+        senderName:
+          "AI Assistant",
+
+        text:
+          finalMessage,
+
+        status:
+          "sending",
+
+        aiGenerated:
+          true,
+
+        aiConfidence:
+          typeof normalizedAIResult?.score ===
+            "number" &&
+          normalizedAIResult.score >= 0 &&
+          normalizedAIResult.score <= 100
+            ? normalizedAIResult.score / 100
+            : undefined,
+      };
+
+      /**
+       * Keep the idempotency key stable for this logical Message.
+       * This controller currently uses the "ai-message:" prefix.
+       */
+      const deliveryIdempotencyKey =
+        `ai-message:${String(aiMessageId)}`;
+
+      let aiMessage = null;
+      let deliveryJob = null;
+      let transactionCommitted = false;
+
+      const session =
+        await Message.db.startSession();
+
+      try {
+        await session.withTransaction(
+          async () => {
+            /* ================================================
+               CREATE CANONICAL AI MESSAGE
+            ================================================ */
+
+            const createdMessages =
+              await Message.create(
+                [aiMessageData],
+                { session }
+              );
+
+            const transactionMessage =
+              createdMessages[0];
+
+            if (
+              !transactionMessage ||
+              String(transactionMessage._id) !==
+                String(aiMessageId)
+            ) {
+              throw new Error(
+                "Atomic outbound creation failed: AI Message was not created correctly."
+              );
+            }
+
+            /* ================================================
+               CREATE DURABLE DELIVERY JOB
+            ================================================ */
+
+            const deliveryJobResult =
+              await createDeliveryJob({
+                organizationId:
+                  outboundOrganizationId,
+
+                messageId:
+                  transactionMessage._id,
+
+                conversationId:
+                  outboundConversationId,
+
+                leadId:
+                  lead?._id ||
+                  null,
+
+                source:
+                  outboundSource,
+
+                recipient:
+                  lead.phone,
+
+                provider:
+                  outboundProvider,
+
+                idempotencyKey:
+                  deliveryIdempotencyKey,
+
+                channelMetadata:
+                  normalizedExtractedData?.channelMetadata ||
+                  {},
+
+                metadata: {
+                  aiGenerated: true,
+
+                  leadId:
+                    lead?._id ||
+                    null,
+
+                  conversationId:
+                    outboundConversationId,
+
+                  organizationId:
+                    outboundOrganizationId,
+                },
+
+                // The job write must use the same transaction
+                // session as the Message write.
+                session,
+              });
+
+            const transactionDeliveryJob =
+              deliveryJobResult?.job ||
+              null;
+
+            if (!transactionDeliveryJob) {
+              throw new Error(
+                "Atomic outbound creation failed: DeliveryJob was not created."
+              );
+            }
+
+            /* ================================================
+               VALIDATE MESSAGE/JOB RELATIONSHIP
+            ================================================ */
+
+            if (
+              String(transactionDeliveryJob.messageId) !==
+              String(transactionMessage._id)
+            ) {
+              throw new Error(
+                "Atomic outbound creation failed: DeliveryJob references a different Message."
+              );
+            }
+
+            if (
+              String(transactionDeliveryJob.organizationId) !==
+              String(transactionMessage.organizationId)
+            ) {
+              throw new Error(
+                "Atomic outbound creation failed: Message and DeliveryJob organizations do not match."
+              );
+            }
+
+            if (
+              deliveryJobResult.created !== true ||
+              deliveryJobResult.duplicate !== false
+            ) {
+              throw new Error(
+                "Atomic outbound creation failed: expected a newly created DeliveryJob."
+              );
+            }
+
+            /**
+             * Store callback results for use only after
+             * withTransaction() resolves successfully.
+             *
+             * These assignments have no external side effects.
+             */
+            aiMessage =
+              transactionMessage;
+
+            deliveryJob =
+              transactionDeliveryJob;
+          }
+        );
+
+        // withTransaction resolves after successful commit.
+        transactionCommitted = true;
+
+        if (!aiMessage || !deliveryJob) {
+          throw new Error(
+            "Outbound transaction completed without valid Message and DeliveryJob results."
+          );
+        }
+
+        console.log(
+          "✅ AI MESSAGE CREATED:",
+          {
+            messageId:
+              aiMessage._id,
+
+            organizationId:
+              outboundOrganizationId,
+
+            conversationId:
+              outboundConversationId,
 
             leadId:
               lead?._id ||
               null,
 
-            conversationId:
-              effectiveConversation
-                ?._id ||
-              conversation?._id ||
-              null,
+            source:
+              outboundSource,
 
-            channelMetadata:
-              normalizedExtractedData
-                ?.channelMetadata ||
-              {},
-
-          },
-
-        });
-
-
-      /* ------------------------------------------------------
-         Transport result
-      ------------------------------------------------------ */
-
-      console.log(
-        "📨 AUTO REPLY TRANSPORT RESULT:",
-        transportResult
-      );
-
-
-      /* ------------------------------------------------------
-         Delivery result
-      ------------------------------------------------------ */
-
-      if (
-        transportResult?.success
-      ) {
-
-        console.log(
-          "✅ AUTO REPLY DELIVERED:",
-          {
-
-            transport:
-              transportResult
-                ?.transport,
-
-            provider:
-              transportResult
-                ?.provider,
-
-            recipient:
-              lead.phone,
-
+            status:
+              aiMessage.status,
           }
         );
 
-      } else {
-
-        console.error(
-          "❌ AUTO REPLY DELIVERY FAILED:",
+        console.log(
+          "✅ DELIVERY JOB CREATED:",
           {
+            deliveryJobId:
+              deliveryJob._id,
+
+            messageId:
+              aiMessage._id,
+
+            organizationId:
+              outboundOrganizationId,
 
             source:
               outboundSource,
 
-            recipient:
-              lead.phone,
+            provider:
+              deliveryJob.provider ||
+              outboundProvider,
 
-            reason:
-              transportResult
-                ?.reason ||
-              "Unknown transport failure.",
+            status:
+              deliveryJob.status,
+
+            attempts:
+              deliveryJob.attempts,
+          }
+        );
+
+        console.log(
+          "🔒 ATOMIC OUTBOUND CREATION COMMITTED:",
+          {
+            messageId:
+              aiMessage._id,
+
+            deliveryJobId:
+              deliveryJob._id,
+
+            idempotencyKey:
+              deliveryIdempotencyKey,
+
+            transactionCommitted,
+          }
+        );
+      } catch (transactionError) {
+        /**
+         * Rethrow so the existing outer sendAutoReply() catch
+         * returns success:false and queued:false.
+         *
+         * A failure in either write causes withTransaction()
+         * to abort the transaction.
+         */
+        console.error(
+          "❌ ATOMIC OUTBOUND CREATION FAILED:",
+          {
+            messageId:
+              aiMessageId,
+
+            organizationId:
+              outboundOrganizationId,
+
+            conversationId:
+              outboundConversationId,
+
+            transactionCommitted,
+
+            error:
+              transactionError?.message,
+          }
+        );
+
+        throw transactionError;
+      } finally {
+        await session.endSession();
+      }
+
+      /* ======================================================
+         UPDATE CONVERSATION MESSAGE STATE
+      ====================================================== */
+
+      /**
+       * The AI Message is now a real conversation message.
+       *
+       * We update the in-memory conversation object when
+       * possible so callers receive the latest conversation
+       * state.
+       *
+       * We intentionally DO NOT increment unreadCount here.
+       *
+       * Customer inbound messages increment unreadCount.
+       *
+       * AI outbound messages should not create an unread
+       * customer notification.
+       */
+
+      try {
+
+        if (
+          conversation &&
+          typeof conversation ===
+            "object"
+        ) {
+
+          if (
+            typeof conversation.messageCount ===
+              "number"
+          ) {
+
+            conversation.messageCount += 1;
+
+          } else {
+
+            conversation.messageCount =
+              1;
+          }
+
+
+          conversation.lastMessage = {
+
+            text:
+              finalMessage,
+
+            senderRole:
+              "ai",
+
+            senderId:
+              null,
+
+            timestamp:
+              new Date(),
+
+          };
+
+
+          conversation.lastUpdated =
+            new Date();
+
+
+          /**
+           * If this is a Mongoose document, persist the
+           * conversation update.
+           *
+           * updateConversationState() may already have
+           * persisted other state, so save only the
+           * conversation message metadata here.
+           */
+
+          if (
+            typeof conversation.save ===
+            "function"
+          ) {
+
+            await conversation.save();
 
           }
+
+        }
+
+      } catch (
+        conversationUpdateError
+      ) {
+
+        /**
+         * The Message and DeliveryJob already exist.
+         *
+         * Therefore a conversation metadata failure must
+         * NOT destroy the durable outbound job.
+         *
+         * The delivery pipeline remains recoverable.
+         */
+
+        console.error(
+          "⚠️ AI conversation message metadata update failed:",
+          conversationUpdateError
         );
       }
 
 
-      return transportResult;
+      /* ======================================================
+         QUEUED RESULT
+      ====================================================== */
+
+      console.log(
+        "📨 AUTO REPLY QUEUED FOR DELIVERY:",
+        {
+
+          messageId:
+            aiMessage?._id,
+
+          deliveryJobId:
+            deliveryJob?._id,
+
+          recipient:
+            lead.phone,
+
+          source:
+            outboundSource,
+
+          provider:
+            deliveryJob?.provider ||
+            outboundProvider,
+
+        }
+      );
+
+
+      return {
+
+        success:
+          true,
+
+        queued:
+          true,
+
+        delivered:
+          false,
+
+        messageId:
+          aiMessage?._id,
+
+        deliveryJobId:
+          deliveryJob?._id,
+
+        organizationId:
+          outboundOrganizationId,
+
+        conversationId:
+          outboundConversationId,
+
+        leadId:
+          lead?._id ||
+          null,
+
+        source:
+          outboundSource,
+
+        provider:
+          deliveryJob?.provider ||
+          outboundProvider ||
+          null,
+
+        status:
+          deliveryJob?.status ||
+          "pending",
+
+        message:
+          finalMessage,
+
+      };
+
 
     } catch (
       error
@@ -1437,6 +1950,23 @@ export const sendAutoReply =
         "❌ Auto reply failed:",
         error
       );
+
+      return {
+
+        success:
+          false,
+
+        queued:
+          false,
+
+        delivered:
+          false,
+
+        error:
+          error?.message ||
+          "Auto reply failed.",
+
+      };
     }
   };
 

@@ -59,7 +59,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 
-import MainLayout from "../../components/layout/mainlayout";
+
 import PageHeader from "../../components/common/pageHeader";
 import LoadingSpinner from "../../components/common/loadingSpinner";
 import EmptyState from "../../components/common/emptyState";
@@ -139,65 +139,67 @@ const normalizeStatus = (status) => {
 };
 
 /**
- * Resolve an assigned agent name from the different
- * possible backend shapes.
+ * Safely resolve the assigned agent's display name.
  *
- * This allows the page to work with:
- *
- * assignedAgent: "John"
- *
- * OR
- *
- * assignedTo: {
- *   name: "John"
- * }
- *
- * OR
- *
- * assignedTo: "John"
+ * Supports:
+ * - assignedAgent: "Jayden Mwangi"
+ * - assignedTo: { name: "Jayden Mwangi" }
+ * - assignedTo: "Jayden Mwangi"
+ * - agent: "Jayden Mwangi"
+ * - agent: { name: "Jayden Mwangi" }
+ * - agentName: "Jayden Mwangi"
  */
 const getAssignedAgentName = (lead) => {
   if (!lead) {
     return "Unassigned";
   }
 
+  // Explicit assigned-agent display name.
   if (
     typeof lead.assignedAgent === "string" &&
     lead.assignedAgent.trim()
   ) {
-    return lead.assignedAgent;
+    return lead.assignedAgent.trim();
   }
 
+  // Populated assignedTo object.
   if (
     lead.assignedTo &&
     typeof lead.assignedTo === "object" &&
-    lead.assignedTo.name
+    typeof lead.assignedTo.name === "string" &&
+    lead.assignedTo.name.trim()
   ) {
-    return lead.assignedTo.name;
+    return lead.assignedTo.name.trim();
   }
 
+  // Direct agent name stored on the lead.
+  // Your current MongoDB record uses this format.
   if (
-    typeof lead.assignedTo === "string" &&
-    lead.assignedTo.trim()
+    typeof lead.agent === "string" &&
+    lead.agent.trim()
   ) {
-    return lead.assignedTo;
+    return lead.agent.trim();
   }
 
+  // Populated agent object.
   if (
     lead.agent &&
     typeof lead.agent === "object" &&
-    lead.agent.name
+    typeof lead.agent.name === "string" &&
+    lead.agent.name.trim()
   ) {
-    return lead.agent.name;
+    return lead.agent.name.trim();
   }
 
+  // Alternative display-name property.
   if (
     typeof lead.agentName === "string" &&
     lead.agentName.trim()
   ) {
-    return lead.agentName;
+    return lead.agentName.trim();
   }
 
+  // A raw MongoDB ObjectId is not a display name.
   return "Unassigned";
 };
 
@@ -371,84 +373,73 @@ const Leads = () => {
     };
   }, [safeLeads]);
 
-  /* ========================================================
-     NAVIGATION
-  ======================================================== */
+ /* ========================================================
+   NAVIGATION
+======================================================== */
 
-  const openLead = (id) => {
-    if (!id) {
-      console.error(
-        "❌ Cannot open lead: missing lead ID."
-      );
-
-      return;
-    }
-
-    navigate(`/leads/${id}`);
-  };
-
-  const openQualification = (id) => {
-    if (!id) {
-      console.error(
-        "❌ Cannot open qualification: missing lead ID."
-      );
-
-      return;
-    }
-
-    navigate(
-      `/leads/${id}/qualification`
+const openLead = (id) => {
+  if (!id) {
+    console.error(
+      "Cannot open lead: missing lead ID."
     );
-  };
 
-  const contactLead = (id) => {
-    if (!id) {
-      console.error(
-        "❌ Cannot contact lead: missing lead ID."
-      );
+    return;
+  }
 
-      return;
-    }
+  navigate(`/admin/leads/${id}`);
+};
 
-    navigate(
-      `/conversations/contact/${id}`
+const openQualification = (id) => {
+  if (!id) {
+    console.error(
+      "Cannot open AI qualification: missing lead ID."
     );
-  };
+
+    return;
+  }
+
+  navigate(`/admin/leads/${id}/qualification`);
+};
+
+const contactLead = (id) => {
+  if (!id) {
+    console.error(
+      "Cannot open contact workspace: missing lead ID."
+    );
+
+    return;
+  }
+
+  navigate(`/admin/leads/${id}/contact`);
+};
 
   /* ========================================================
      LOADING
   ======================================================== */
 
   if (loading) {
-    return (
-      <MainLayout>
-        <LoadingSpinner />
-      </MainLayout>
-    );
-  }
+  return <LoadingSpinner />;
+}
 
   /* ========================================================
      ERROR
   ======================================================== */
 
   if (error) {
-    return (
-      <MainLayout>
-        <ErrorCard
-          message={error}
-          onRetry={refreshLeads}
-        />
-      </MainLayout>
-    );
-  }
+  return (
+    <ErrorCard
+      message={error}
+      onRetry={refreshLeads}
+    />
+  );
+}
 
   /* ========================================================
      RENDER
   ======================================================== */
 
   return (
-    <MainLayout>
-      <div className="space-y-8">
+  <div className="space-y-8">
 
         {/* ==================================================
             PAGE HEADER
@@ -1143,8 +1134,7 @@ const Leads = () => {
 
           )}
 
-      </div>
-    </MainLayout>
+        </div>
   );
 };
 

@@ -51,6 +51,10 @@ import Property from "../models/property.js";
 import Lead from "../models/lead.js";
 import User from "../models/user.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    HELPERS
 ========================================================== */
@@ -58,15 +62,24 @@ import User from "../models/user.js";
 /**
  * Resolve organization from authenticated request.
  *
- * Authentication middleware is expected to populate
- * req.organizationId and/or req.user.organizationId.
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Organization resolution is centralized through:
+ *
+ *   organizationResolverService.js
+ *
+ * This controller must NOT independently resolve the
+ * organization from req.user or req.organizationId.
+ *
+ * The centralized resolver is responsible for determining
+ * the authenticated organization consistently across the
+ * application.
  */
-const getOrganizationId = (req) => {
-  return (
-    req.organizationId ||
-    req.user?.organizationId ||
-    null
-  );
+const getOrganizationId = async (req) => {
+  const organization =
+    await resolveFromRequest(req);
+
+  return organization?._id || null;
 };
 
 /**
@@ -240,7 +253,7 @@ export const getDashboardAnalytics = async (
       normalize(req.user?.role);
 
     const organizationId =
-      getOrganizationId(req);
+      await getOrganizationId(req);
 
     console.log(
       "📊 Analytics authenticated context:",

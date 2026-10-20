@@ -135,11 +135,16 @@ class PropertyImageService {
 
     );
 
-    const image = await PropertyImage.findById(imageId);
+    const image =
+      await PropertyImage.findById(
+        imageId
+      );
 
     if (!image) {
 
-      throw new Error("Image not found.");
+      throw new Error(
+        "Image not found."
+      );
 
     }
 
@@ -157,28 +162,44 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async reorderGallery(propertyId, imageOrder) {
+  async reorderGallery(
+    propertyId,
+    imageOrder
+  ) {
 
-    const updates = imageOrder.map(
-      ({ imageId, displayOrder }) =>
+    const updates =
+      imageOrder.map(
+        ({
+          imageId,
+          displayOrder
+        }) =>
 
-        PropertyImage.findOneAndUpdate(
+          PropertyImage.findOneAndUpdate(
 
-          {
-            _id: imageId,
-            property: propertyId,
-          },
+            {
+              _id: imageId,
 
-          {
-            displayOrder,
-          },
+              property: propertyId,
 
-          { returnDocument: 'after' }
+            },
 
-        )
+            {
+
+              displayOrder,
+
+            },
+
+            {
+              returnDocument: "after"
+            }
+
+          )
+
+      );
+
+    await Promise.all(
+      updates
     );
-
-    await Promise.all(updates);
 
     return true;
 
@@ -190,13 +211,18 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async softDeleteImage(image, userId) {
+  async softDeleteImage(
+    image,
+    userId
+  ) {
 
     image.isDeleted = true;
 
-    image.deletedAt = new Date();
+    image.deletedAt =
+      new Date();
 
-    image.deletedBy = userId;
+    image.deletedBy =
+      userId;
 
     await image.save();
 
@@ -210,7 +236,9 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async restoreImage(image) {
+  async restoreImage(
+    image
+  ) {
 
     image.isDeleted = false;
 
@@ -230,7 +258,9 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async permanentlyDeleteImage(image) {
+  async permanentlyDeleteImage(
+    image
+  ) {
 
     await image.deleteOne();
 
@@ -244,7 +274,9 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async getImageCount(propertyId) {
+  async getImageCount(
+    propertyId
+  ) {
 
     return await PropertyImage.countDocuments({
 
@@ -262,11 +294,21 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async updatePropertyCover(propertyId, imagePath) {
+  async updatePropertyCover(
+    propertyId,
+    imagePath,
+    organizationId
+  ) {
 
-    return await Property.findByIdAndUpdate(
+    return await Property.findOneAndUpdate(
 
-      propertyId,
+      {
+
+        _id: propertyId,
+
+        organizationId,
+
+      },
 
       {
 
@@ -274,7 +316,11 @@ class PropertyImageService {
 
       },
 
-      { returnDocument: 'after' }
+      {
+
+        returnDocument: "after",
+
+      }
 
     );
 
@@ -286,19 +332,33 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async removePropertyCover(propertyId) {
+  async removePropertyCover(
+    propertyId,
+    organizationId
+  ) {
 
-    return await Property.findByIdAndUpdate(
-
-      propertyId,
+    return await Property.findOneAndUpdate(
 
       {
 
-        coverImage: "/placeholder-property.jpg",
+        _id: propertyId,
+
+        organizationId,
 
       },
 
-      { returnDocument: 'after' }
+      {
+
+        coverImage:
+          "/placeholder-property.jpg",
+
+      },
+
+      {
+
+        returnDocument: "after",
+
+      }
 
     );
 
@@ -310,7 +370,9 @@ class PropertyImageService {
   ==========================================================
   */
 
-  async getGalleryStatistics(propertyId) {
+  async getGalleryStatistics(
+    propertyId
+  ) {
 
     const totalImages =
       await PropertyImage.countDocuments({
@@ -437,7 +499,9 @@ class PropertyImageService {
 
       if (!property) {
 
-        orphanImages.push(image);
+        orphanImages.push(
+          image
+        );
 
       }
 
@@ -458,7 +522,9 @@ class PropertyImageService {
     const orphanImages =
       await this.findOrphanImages();
 
-    for (const image of orphanImages) {
+    for (
+      const image of orphanImages
+    ) {
 
       await image.deleteOne();
 
@@ -466,7 +532,8 @@ class PropertyImageService {
 
     return {
 
-      removed: orphanImages.length,
+      removed:
+        orphanImages.length,
 
     };
 

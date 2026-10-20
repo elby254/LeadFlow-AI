@@ -12,27 +12,30 @@
  * ✓ Voice notes
  * ✓ Socket.io events
  *
- * Matches conversationRoutes.js
+ * Matches messageRoutes.js
  *
  * Routes
  * ----------------------------------------------------------
- * GET    /api/conversations/:id/messages
- * POST   /api/conversations/:id/messages
+ * GET    /api/messages/conversation/:conversationId
+ * POST   /api/messages/conversation/:conversationId
  *
- * PATCH  /api/conversations/messages/:messageId
- * DELETE /api/conversations/messages/:messageId
- * PATCH  /api/conversations/messages/:messageId/read
+ * PATCH  /api/messages/:messageId
+ * DELETE /api/messages/:messageId
+ * PATCH  /api/messages/:messageId/read
  *
- * GET    /api/conversations/:id/typing
- * POST   /api/conversations/:id/typing
+ * GET    /api/messages/conversation/:conversationId/typing
+ * POST   /api/messages/conversation/:conversationId/typing
  *
- * POST   /api/conversations/:id/voice
+ * POST   /api/messages/conversation/:conversationId/voice
  *
  * ==========================================================
  */
 
 import Message from "../models/message.js";
 import Conversation from "../models/conversation.js";
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
 
 /* ==========================================================
    CONSTANTS
@@ -44,12 +47,16 @@ const MAX_LIMIT = 100;
 
 /* ==========================================================
    GET CONVERSATION MESSAGES
-   GET /api/conversations/:id/messages
+   GET /api/messages/conversation/:conversationId
 ========================================================== */
 
-export const getConversationMessages = async (req, res) => {
+export const getConversationMessages = async (
+  req,
+  res
+) => {
   try {
-    const conversationId = req.params.id;
+    const conversationId =
+      req.params.conversationId;
 
     const page = Math.max(
       Number(req.query.page) || DEFAULT_PAGE,
@@ -65,50 +72,84 @@ export const getConversationMessages = async (req, res) => {
     );
 
     /* ------------------------------------------------------
-       Verify conversation
+       Resolve authenticated organization
     ------------------------------------------------------ */
 
-    const conversation = await Conversation.findById(
-      conversationId
-    );
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
+       Verify conversation
+       TENANT-SCOPED
+    ------------------------------------------------------ */
+
+    const conversation =
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
 
     if (!conversation) {
       return res.status(404).json({
         success: false,
-        message: "Conversation not found.",
+        message:
+          "Conversation not found.",
       });
     }
 
     /* ------------------------------------------------------
        Fetch messages
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
-    const messages = await Message.find({
-      conversationId,
-      deleted: {
-        $ne: true,
-      },
-    })
-      .sort({
-        createdAt: -1,
+    const messages =
+      await Message.find({
+        conversationId,
+        organizationId,
+        deleted: {
+          $ne: true,
+        },
       })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean();
+        .sort({
+          createdAt: -1,
+        })
+        .skip(
+          (page - 1) * limit
+        )
+        .limit(limit)
+        .lean();
 
-    const total = await Message.countDocuments({
-      conversationId,
-      deleted: {
-        $ne: true,
-      },
-    });
+    const total =
+      await Message.countDocuments({
+        conversationId,
+        organizationId,
+        deleted: {
+          $ne: true,
+        },
+      });
+
+    const orderedMessages =
+      messages.reverse();
 
     return res.status(200).json({
       success: true,
 
-      data: messages.reverse(),
+      data:
+        orderedMessages,
 
-      messages: messages.reverse(),
+      messages:
+        orderedMessages,
 
       page,
 
@@ -116,7 +157,8 @@ export const getConversationMessages = async (req, res) => {
 
       total,
 
-      hasMore: page * limit < total,
+      hasMore:
+        page * limit < total,
     });
   } catch (error) {
     console.error(
@@ -126,20 +168,26 @@ export const getConversationMessages = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to load conversation messages.",
-      error: error.message,
+      message:
+        "Failed to load conversation messages.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    SEND MESSAGE
-   POST /api/conversations/:id/messages
+   POST /api/messages/conversation/:conversationId
 ========================================================== */
 
-export const sendMessage = async (req, res) => {
+export const sendMessage = async (
+  req,
+  res
+) => {
   try {
-    const conversationId = req.params.id;
+    const conversationId =
+      req.params.conversationId;
 
     const {
       text = "",
@@ -154,17 +202,39 @@ export const sendMessage = async (req, res) => {
         : "";
 
     /* ------------------------------------------------------
-       Verify conversation
+       Resolve authenticated organization
     ------------------------------------------------------ */
 
-    const conversation = await Conversation.findById(
-      conversationId
-    );
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
+       Verify conversation
+       TENANT-SCOPED
+    ------------------------------------------------------ */
+
+    const conversation =
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
 
     if (!conversation) {
       return res.status(404).json({
         success: false,
-        message: "Conversation not found.",
+        message:
+          "Conversation not found.",
       });
     }
 
@@ -180,40 +250,51 @@ export const sendMessage = async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message: "Cannot send an empty message.",
+        message:
+          "Cannot send an empty message.",
       });
     }
 
     /* ------------------------------------------------------
        Create message
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
-    const message = await Message.create({
-      conversationId,
+    const message =
+      await Message.create({
+        organizationId,
 
-      senderId: req.user.id,
+        conversationId,
 
-      senderRole:
-        senderRole ||
-        req.user.role,
+        senderId:
+          req.user.id,
 
-      text: cleanText,
+        senderRole:
+          senderRole ||
+          req.user.role,
 
-      attachments:
-        Array.isArray(attachments)
-          ? attachments
-          : [],
+        text:
+          cleanText,
 
-      voiceNote,
+        attachments:
+          Array.isArray(attachments)
+            ? attachments
+            : [],
 
-      status: "sent",
+        voiceNote,
 
-      delivered: true,
+        status:
+          "sent",
 
-      read: false,
+        delivered:
+          true,
 
-      deliveredAt: new Date(),
-    });
+        read:
+          false,
+
+        deliveredAt:
+          new Date(),
+      });
 
     /* ------------------------------------------------------
        Last message preview
@@ -223,27 +304,36 @@ export const sendMessage = async (req, res) => {
       cleanText ||
       (voiceNote
         ? "🎤 Voice Note"
-        : Array.isArray(attachments) &&
+        : Array.isArray(
+            attachments
+          ) &&
           attachments.length
         ? "📎 Attachment"
         : "");
 
     conversation.lastMessage = {
-      text: previewText,
+      text:
+        previewText,
 
-      senderId: req.user.id,
+      senderId:
+        req.user.id,
 
-      senderRole: req.user.role,
+      senderRole:
+        req.user.role,
 
-      createdAt: message.createdAt,
+      createdAt:
+        message.createdAt,
     };
 
-    conversation.updatedAt = new Date();
+    conversation.updatedAt =
+      new Date();
 
-    conversation.lastUpdated = new Date();
+    conversation.lastUpdated =
+      new Date();
 
     conversation.unreadCount =
-      (conversation.unreadCount || 0) + 1;
+      (conversation.unreadCount || 0) +
+      1;
 
     await conversation.save();
 
@@ -252,15 +342,21 @@ export const sendMessage = async (req, res) => {
     ------------------------------------------------------ */
 
     req.io
-      ?.to(conversationId.toString())
-      .emit("message_received", message);
+      ?.to(
+        conversationId.toString()
+      )
+      .emit(
+        "message_received",
+        message
+      );
 
     return res.status(201).json({
       success: true,
 
       message,
 
-      data: message,
+      data:
+        message,
     });
   } catch (error) {
     console.error(
@@ -270,22 +366,29 @@ export const sendMessage = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to send message.",
-      error: error.message,
+      message:
+        "Failed to send message.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    EDIT MESSAGE
-   PATCH /api/conversations/messages/:messageId
+   PATCH /api/messages/:messageId
 ========================================================== */
 
-export const editMessage = async (req, res) => {
+export const editMessage = async (
+  req,
+  res
+) => {
   try {
-    const { messageId } = req.params;
+    const { messageId } =
+      req.params;
 
-    const { text } = req.body;
+    const { text } =
+      req.body;
 
     /* ------------------------------------------------------
        Validate
@@ -297,22 +400,45 @@ export const editMessage = async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message: "Message text is required.",
+        message:
+          "Message text is required.",
       });
     }
 
     /* ------------------------------------------------------
-       Find message
+       Resolve authenticated organization
     ------------------------------------------------------ */
 
-    const message = await Message.findById(
-      messageId
-    );
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
+       Find message
+       TENANT-SCOPED
+    ------------------------------------------------------ */
+
+    const message =
+      await Message.findOne({
+        _id: messageId,
+        organizationId,
+      });
 
     if (!message) {
       return res.status(404).json({
         success: false,
-        message: "Message not found.",
+        message:
+          "Message not found.",
       });
     }
 
@@ -323,7 +449,8 @@ export const editMessage = async (req, res) => {
     if (message.deleted) {
       return res.status(400).json({
         success: false,
-        message: "Deleted messages cannot be edited.",
+        message:
+          "Deleted messages cannot be edited.",
       });
     }
 
@@ -347,29 +474,38 @@ export const editMessage = async (req, res) => {
        Update message
     ------------------------------------------------------ */
 
-    message.text = text.trim();
+    message.text =
+      text.trim();
 
-    message.edited = true;
+    message.edited =
+      true;
 
-    message.editedAt = new Date();
+    message.editedAt =
+      new Date();
 
     await message.save();
 
     /* ------------------------------------------------------
        Update conversation preview if this
        is the latest message
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const conversation =
-      await Conversation.findById(
-        message.conversationId
-      );
+      await Conversation.findOne({
+        _id:
+          message.conversationId,
+
+        organizationId,
+      });
 
     if (conversation) {
       const latestMessage =
         await Message.findOne({
           conversationId:
             message.conversationId,
+
+          organizationId,
 
           deleted: {
             $ne: true,
@@ -384,7 +520,8 @@ export const editMessage = async (req, res) => {
           message._id.toString()
       ) {
         conversation.lastMessage = {
-          text: message.text,
+          text:
+            message.text,
 
           senderId:
             message.senderId,
@@ -411,14 +548,19 @@ export const editMessage = async (req, res) => {
       ?.to(
         message.conversationId.toString()
       )
-      .emit("message_edited", message);
+      .emit(
+        "message_edited",
+        message
+      );
 
     return res.status(200).json({
       success: true,
 
-      message: "Message updated successfully.",
+      message:
+        "Message updated successfully.",
 
-      data: message,
+      data:
+        message,
     });
   } catch (error) {
     console.error(
@@ -428,20 +570,63 @@ export const editMessage = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to edit message.",
-      error: error.message,
+      message:
+        "Failed to edit message.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    GET TYPING STATUS
-   GET /api/conversations/:id/typing
+   GET /api/messages/conversation/:conversationId/typing
 ========================================================== */
 
-export const getTypingStatus = async (req, res) => {
+export const getTypingStatus = async (
+  req,
+  res
+) => {
   try {
-    const { id } = req.params;
+    const conversationId =
+      req.params.conversationId;
+
+    /* ------------------------------------------------------
+       Resolve authenticated organization
+    ------------------------------------------------------ */
+
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
+       Verify conversation
+       TENANT-SCOPED
+    ------------------------------------------------------ */
+
+    const conversation =
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
+
+    if (!conversation) {
+      return res.status(404).json({
+        success: false,
+        message:
+          "Conversation not found.",
+      });
+    }
 
     /*
      * Typing state is normally maintained by Socket.io.
@@ -454,9 +639,10 @@ export const getTypingStatus = async (req, res) => {
       success: true,
 
       data: {
-        conversationId: id,
+        conversationId,
 
-        typing: false,
+        typing:
+          false,
       },
     });
   } catch (error) {
@@ -467,15 +653,17 @@ export const getTypingStatus = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to get typing status.",
-      error: error.message,
+      message:
+        "Failed to get typing status.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    SEND TYPING STATUS
-   POST /api/conversations/:id/typing
+   POST /api/messages/conversation/:conversationId/typing
 ========================================================== */
 
 export const sendTypingStatus = async (
@@ -483,19 +671,47 @@ export const sendTypingStatus = async (
   res
 ) => {
   try {
-    const { id } = req.params;
+    const conversationId =
+      req.params.conversationId;
 
     const {
       typing = false,
     } = req.body;
 
+    /* ------------------------------------------------------
+       Resolve authenticated organization
+    ------------------------------------------------------ */
+
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
+       Verify conversation
+       TENANT-SCOPED
+    ------------------------------------------------------ */
+
     const conversation =
-      await Conversation.findById(id);
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
 
     if (!conversation) {
       return res.status(404).json({
         success: false,
-        message: "Conversation not found.",
+        message:
+          "Conversation not found.",
       });
     }
 
@@ -507,24 +723,33 @@ export const sendTypingStatus = async (
     ------------------------------------------------------ */
 
     req.io
-      ?.to(id.toString())
-      .emit("typing_status", {
-        conversationId: id,
+      ?.to(
+        conversationId.toString()
+      )
+      .emit(
+        "typing_status",
+        {
+          conversationId,
 
-        userId: req.user.id,
+          userId:
+            req.user.id,
 
-        typing: typingState,
-      });
+          typing:
+            typingState,
+        }
+      );
 
     return res.status(200).json({
       success: true,
 
       data: {
-        conversationId: id,
+        conversationId,
 
-        userId: req.user.id,
+        userId:
+          req.user.id,
 
-        typing: typingState,
+        typing:
+          typingState,
       },
     });
   } catch (error) {
@@ -535,15 +760,17 @@ export const sendTypingStatus = async (
 
     return res.status(500).json({
       success: false,
-      message: "Failed to update typing status.",
-      error: error.message,
+      message:
+        "Failed to update typing status.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    MARK MESSAGE AS READ
-   PATCH /api/conversations/messages/:messageId/read
+   PATCH /api/messages/:messageId/read
 ========================================================== */
 
 export const markMessageRead = async (
@@ -555,18 +782,39 @@ export const markMessageRead = async (
       req.params;
 
     /* ------------------------------------------------------
+       Resolve authenticated organization
+    ------------------------------------------------------ */
+
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
        Find message
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const message =
-      await Message.findById(
-        messageId
-      );
+      await Message.findOne({
+        _id: messageId,
+        organizationId,
+      });
 
     if (!message) {
       return res.status(404).json({
         success: false,
-        message: "Message not found.",
+        message:
+          "Message not found.",
       });
     }
 
@@ -580,7 +828,8 @@ export const markMessageRead = async (
 
         message,
 
-        data: message,
+        data:
+          message,
       });
     }
 
@@ -588,22 +837,29 @@ export const markMessageRead = async (
        Update message
     ------------------------------------------------------ */
 
-    message.read = true;
+    message.read =
+      true;
 
-    message.status = "read";
+    message.status =
+      "read";
 
-    message.readAt = new Date();
+    message.readAt =
+      new Date();
 
     await message.save();
 
     /* ------------------------------------------------------
        Update conversation unread count
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const conversation =
-      await Conversation.findById(
-        message.conversationId
-      );
+      await Conversation.findOne({
+        _id:
+          message.conversationId,
+
+        organizationId,
+      });
 
     if (conversation) {
       const unreadCount =
@@ -611,7 +867,10 @@ export const markMessageRead = async (
           conversationId:
             message.conversationId,
 
-          read: false,
+          organizationId,
+
+          read:
+            false,
 
           deleted: {
             $ne: true,
@@ -635,23 +894,27 @@ export const markMessageRead = async (
       ?.to(
         message.conversationId.toString()
       )
-      .emit("message_read", {
-        conversationId:
-          message.conversationId,
+      .emit(
+        "message_read",
+        {
+          conversationId:
+            message.conversationId,
 
-        messageId:
-          message._id,
+          messageId:
+            message._id,
 
-        readAt:
-          message.readAt,
-      });
+          readAt:
+            message.readAt,
+        }
+      );
 
     return res.status(200).json({
       success: true,
 
       message,
 
-      data: message,
+      data:
+        message,
     });
   } catch (error) {
     console.error(
@@ -661,15 +924,17 @@ export const markMessageRead = async (
 
     return res.status(500).json({
       success: false,
-      message: "Failed to mark message as read.",
-      error: error.message,
+      message:
+        "Failed to mark message as read.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    DELETE MESSAGE
-   DELETE /api/conversations/messages/:messageId
+   DELETE /api/messages/:messageId
 ========================================================== */
 
 export const deleteMessage = async (
@@ -681,18 +946,39 @@ export const deleteMessage = async (
       req.params;
 
     /* ------------------------------------------------------
+       Resolve authenticated organization
+    ------------------------------------------------------ */
+
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
+
+    /* ------------------------------------------------------
        Find message
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const message =
-      await Message.findById(
-        messageId
-      );
+      await Message.findOne({
+        _id: messageId,
+        organizationId,
+      });
 
     if (!message) {
       return res.status(404).json({
         success: false,
-        message: "Message not found.",
+        message:
+          "Message not found.",
       });
     }
 
@@ -716,35 +1002,46 @@ export const deleteMessage = async (
        Soft delete
     ------------------------------------------------------ */
 
-    message.deleted = true;
+    message.deleted =
+      true;
 
-    message.deletedAt = new Date();
+    message.deletedAt =
+      new Date();
 
     message.deletedBy =
       req.user.id;
 
-    message.text = "";
+    message.text =
+      "";
 
-    message.attachments = [];
+    message.attachments =
+      [];
 
-    message.voiceNote = null;
+    message.voiceNote =
+      null;
 
     await message.save();
 
     /* ------------------------------------------------------
        Update conversation preview
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const conversation =
-      await Conversation.findById(
-        message.conversationId
-      );
+      await Conversation.findOne({
+        _id:
+          message.conversationId,
+
+        organizationId,
+      });
 
     if (conversation) {
       const latestMessage =
         await Message.findOne({
           conversationId:
             message.conversationId,
+
+          organizationId,
 
           deleted: {
             $ne: true,
@@ -791,13 +1088,16 @@ export const deleteMessage = async (
       ?.to(
         message.conversationId.toString()
       )
-      .emit("message_deleted", {
-        conversationId:
-          message.conversationId,
+      .emit(
+        "message_deleted",
+        {
+          conversationId:
+            message.conversationId,
 
-        messageId:
-          message._id,
-      });
+          messageId:
+            message._id,
+        }
+      );
 
     return res.status(200).json({
       success: true,
@@ -805,7 +1105,8 @@ export const deleteMessage = async (
       message:
         "Message deleted successfully.",
 
-      deletedMessage: message,
+      deletedMessage:
+        message,
     });
   } catch (error) {
     console.error(
@@ -815,15 +1116,17 @@ export const deleteMessage = async (
 
     return res.status(500).json({
       success: false,
-      message: "Failed to delete message.",
-      error: error.message,
+      message:
+        "Failed to delete message.",
+      error:
+        error.message,
     });
   }
 };
 
 /* ==========================================================
    UPLOAD VOICE MESSAGE
-   POST /api/conversations/:id/voice
+   POST /api/messages/conversation/:conversationId/voice
 ========================================================== */
 
 export const uploadVoiceMessage = async (
@@ -831,23 +1134,43 @@ export const uploadVoiceMessage = async (
   res
 ) => {
   try {
-    const {
-      id: conversationId,
-    } = req.params;
+    const conversationId =
+      req.params.conversationId;
+
+    /* ------------------------------------------------------
+       Resolve authenticated organization
+    ------------------------------------------------------ */
+
+    const organization =
+      await resolveFromRequest(req);
+
+    if (!organization) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Organization context is required.",
+      });
+    }
+
+    const organizationId =
+      organization._id;
 
     /* ------------------------------------------------------
        Verify conversation
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const conversation =
-      await Conversation.findById(
-        conversationId
-      );
+      await Conversation.findOne({
+        _id: conversationId,
+        organizationId,
+      });
 
     if (!conversation) {
       return res.status(404).json({
         success: false,
-        message: "Conversation not found.",
+        message:
+          "Conversation not found.",
       });
     }
 
@@ -858,7 +1181,8 @@ export const uploadVoiceMessage = async (
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        message: "Voice note file is required.",
+        message:
+          "Voice note file is required.",
       });
     }
 
@@ -885,10 +1209,13 @@ export const uploadVoiceMessage = async (
 
     /* ------------------------------------------------------
        Create message
+       TENANT-SCOPED
     ------------------------------------------------------ */
 
     const message =
       await Message.create({
+        organizationId,
+
         conversationId,
 
         senderId:
@@ -897,17 +1224,22 @@ export const uploadVoiceMessage = async (
         senderRole:
           req.user.role,
 
-        text: "",
+        text:
+          "",
 
-        attachments: [],
+        attachments:
+          [],
 
         voiceNote,
 
-        delivered: true,
+        delivered:
+          true,
 
-        read: false,
+        read:
+          false,
 
-        status: "sent",
+        status:
+          "sent",
 
         deliveredAt:
           new Date(),
@@ -918,7 +1250,8 @@ export const uploadVoiceMessage = async (
     ------------------------------------------------------ */
 
     conversation.lastMessage = {
-      text: "🎤 Voice Note",
+      text:
+        "🎤 Voice Note",
 
       senderId:
         req.user.id,
@@ -937,7 +1270,8 @@ export const uploadVoiceMessage = async (
       new Date();
 
     conversation.unreadCount =
-      (conversation.unreadCount || 0) + 1;
+      (conversation.unreadCount || 0) +
+      1;
 
     await conversation.save();
 
@@ -959,7 +1293,8 @@ export const uploadVoiceMessage = async (
 
       message,
 
-      data: message,
+      data:
+        message,
     });
   } catch (error) {
     console.error(
@@ -969,8 +1304,10 @@ export const uploadVoiceMessage = async (
 
     return res.status(500).json({
       success: false,
-      message: "Voice note upload failed.",
-      error: error.message,
+      message:
+        "Voice note upload failed.",
+      error:
+        error.message,
     });
   }
 };
@@ -996,4 +1333,3 @@ export default {
 
   uploadVoiceMessage,
 };
-

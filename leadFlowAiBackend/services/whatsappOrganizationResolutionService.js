@@ -1,6 +1,11 @@
 /**
  * ==========================================================
  *
+ * WHATSAPP ORGANIZATION RESOLVER
+ * LeadFlow AI
+ *
+ * ==========================================================
+ *
  * PURPOSE
  * ----------------------------------------------------------
  *
@@ -19,7 +24,7 @@
  *     ↓
  * phone_number_id
  *     ↓
- * This service
+ * organizationResolverService
  *     ↓
  * Organization
  *     ↓
@@ -39,61 +44,79 @@
  *
  *     metadata.phone_number_id
  *
- * This prevents one organization's WhatsApp messages from
- * being accidentally assigned to another organization.
+ * Organization resolution is centralized through:
+ *
+ *     services/organizationResolverService.js
+ *
+ * This file intentionally contains NO direct Organization
+ * database queries.
  *
  * ==========================================================
  */
 
-import Organization from "../models/organization.js";
+import {
+  resolveByWhatsApp,
+} from "../services/organizationResolverService.js";
 
+/* ==========================================================
+   NORMALIZE PHONE NUMBER ID
+========================================================== */
 
-// ==========================================================
-// NORMALIZE PHONE NUMBER ID
-// ==========================================================
-//
-// Meta provides phone_number_id as a string.
-//
-// We normalize it before querying MongoDB.
-//
-// ==========================================================
-
+/**
+ * Meta provides phone_number_id as a string.
+ *
+ * We normalize it before passing it to the shared resolver.
+ */
 const normalizePhoneNumberId = (
   phoneNumberId
 ) => {
 
   if (
     phoneNumberId ===
-    undefined ||
+      undefined ||
     phoneNumberId ===
-    null
+      null
   ) {
 
     return null;
+
   }
 
   const normalized =
-    String(phoneNumberId).trim();
+    String(
+      phoneNumberId
+    ).trim();
 
-  return normalized || null;
+  return (
+    normalized || null
+  );
 };
 
+/* ==========================================================
+   RESOLVE ORGANIZATION FROM PHONE NUMBER ID
+========================================================== */
 
-// ==========================================================
-// RESOLVE ORGANIZATION FROM PHONE NUMBER ID
-// ==========================================================
-//
-// Primary resolver.
-//
-// Example:
-//
-// const organization =
-//   await resolveOrganizationFromWhatsApp(
-//     phoneNumberId
-//   );
-//
-// ==========================================================
-
+/**
+ * Primary WhatsApp organization resolver.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ *
+ * Organization lookup is delegated to the shared:
+ *
+ *     resolveByWhatsApp()
+ *
+ * The shared resolver is responsible for checking the
+ * organization's WhatsApp phone number ID and active/
+ * enabled state.
+ *
+ * Example:
+ *
+ * const organization =
+ *   await resolveOrganizationFromWhatsApp(
+ *     phoneNumberId
+ *   );
+ */
 export const resolveOrganizationFromWhatsApp =
   async (
     phoneNumberId
@@ -104,16 +127,14 @@ export const resolveOrganizationFromWhatsApp =
       phoneNumberId
     );
 
-
-    // ========================================================
-    // VALIDATE PHONE NUMBER ID
-    // ========================================================
+    /* ======================================================
+       VALIDATE PHONE NUMBER ID
+    ====================================================== */
 
     const normalizedPhoneNumberId =
       normalizePhoneNumberId(
         phoneNumberId
       );
-
 
     if (
       !normalizedPhoneNumberId
@@ -124,42 +145,21 @@ export const resolveOrganizationFromWhatsApp =
       );
 
       return null;
+
     }
 
-
-    // ========================================================
-    // FIND ORGANIZATION
-    // ========================================================
-    //
-    // IMPORTANT:
-    //
-    // The updated Organization model uses:
-    //
-    // whatsappPhoneNumberId
-    //
-    // and:
-    //
-    // whatsappBusinessNumber
-    //
-    // We do NOT use the generic organization.phone field.
-    //
-    // ========================================================
+    /* ======================================================
+       SHARED ORGANIZATION RESOLUTION
+    ====================================================== */
 
     const organization =
-      await Organization.findOne({
+      await resolveByWhatsApp(
+        normalizedPhoneNumberId
+      );
 
-        whatsappPhoneNumberId:
-          normalizedPhoneNumberId,
-
-        isActive:
-          true,
-
-      });
-
-
-    // ========================================================
-    // ORGANIZATION NOT FOUND
-    // ========================================================
+    /* ======================================================
+       ORGANIZATION NOT FOUND
+    ====================================================== */
 
     if (
       !organization
@@ -171,12 +171,12 @@ export const resolveOrganizationFromWhatsApp =
       );
 
       return null;
+
     }
 
-
-    // ========================================================
-    // SUCCESS
-    // ========================================================
+    /* ======================================================
+       SUCCESS
+    ====================================================== */
 
     console.log(
       "✅ WhatsApp organization resolved:",
@@ -200,24 +200,22 @@ export const resolveOrganizationFromWhatsApp =
       }
     );
 
-
     return organization;
+
   };
 
+/* ==========================================================
+   RESOLVE ORGANIZATION DIRECTLY FROM META WEBHOOK VALUE
+========================================================== */
 
-// ==========================================================
-// RESOLVE ORGANIZATION DIRECTLY FROM META WEBHOOK VALUE
-// ==========================================================
-//
-// Meta webhook:
-//
-// value.metadata.phone_number_id
-//
-// This helper extracts the ID and delegates to the primary
-// resolver.
-//
-// ==========================================================
-
+/**
+ * Meta webhook:
+ *
+ * value.metadata.phone_number_id
+ *
+ * This helper extracts the ID and delegates to the primary
+ * shared organization resolver.
+ */
 export const resolveWhatsAppOrganizationFromWebhook =
   async (
     value
@@ -227,10 +225,9 @@ export const resolveWhatsAppOrganizationFromWebhook =
       "📲 Resolving organization from WhatsApp webhook..."
     );
 
-
-    // ========================================================
-    // VALIDATE WEBHOOK VALUE
-    // ========================================================
+    /* ======================================================
+       VALIDATE WEBHOOK VALUE
+    ====================================================== */
 
     if (
       !value
@@ -241,32 +238,31 @@ export const resolveWhatsAppOrganizationFromWebhook =
       );
 
       return null;
+
     }
 
-
-    // ========================================================
-    // EXTRACT META PHONE NUMBER ID
-    // ========================================================
+    /* ======================================================
+       EXTRACT META PHONE NUMBER ID
+    ====================================================== */
 
     const phoneNumberId =
-      value?.metadata?.phone_number_id;
-
+      value
+        ?.metadata
+        ?.phone_number_id;
 
     console.log(
       "📱 Meta phone_number_id:",
       phoneNumberId
     );
 
-
-    // ========================================================
-    // RESOLVE ORGANIZATION
-    // ========================================================
+    /* ======================================================
+       RESOLVE ORGANIZATION
+    ====================================================== */
 
     const organization =
       await resolveOrganizationFromWhatsApp(
         phoneNumberId
       );
-
 
     if (
       !organization
@@ -277,57 +273,59 @@ export const resolveWhatsAppOrganizationFromWebhook =
       );
 
       return null;
+
     }
 
-
     return organization;
+
   };
 
+/* ==========================================================
+   REQUIRE WHATSAPP ORGANIZATION
+========================================================== */
 
-// ==========================================================
-// REQUIRE WHATSAPP ORGANIZATION
-// ==========================================================
-//
-// This version throws when an organization cannot be found.
-//
-// Useful when the calling operation cannot continue without
-// a valid organization.
-//
-// ==========================================================
-
+/**
+ * This version throws when an organization cannot be found.
+ *
+ * Useful when the calling operation cannot continue without
+ * a valid organization.
+ */
 export const requireWhatsAppOrganization =
   async (
     phoneNumberId
   ) => {
 
-    const organization =
-      await resolveOrganizationFromWhatsApp(
+    const normalizedPhoneNumberId =
+      normalizePhoneNumberId(
         phoneNumberId
       );
 
+    const organization =
+      await resolveOrganizationFromWhatsApp(
+        normalizedPhoneNumberId
+      );
 
     if (
       !organization
     ) {
 
       throw new Error(
-        `No active LeadFlow AI organization is connected to WhatsApp phoneNumberId: ${phoneNumberId}`
+        `No active LeadFlow AI organization is connected to WhatsApp phoneNumberId: ${normalizedPhoneNumberId || "unknown"}`
       );
+
     }
 
-
     return organization;
+
   };
 
+/* ==========================================================
+   REQUIRE ORGANIZATION FROM WEBHOOK
+========================================================== */
 
-// ==========================================================
-// REQUIRE ORGANIZATION FROM WEBHOOK
-// ==========================================================
-//
-// Convenience helper for webhook controllers.
-//
-// ==========================================================
-
+/**
+ * Convenience helper for webhook controllers.
+ */
 export const requireWhatsAppOrganizationFromWebhook =
   async (
     value
@@ -338,29 +336,29 @@ export const requireWhatsAppOrganizationFromWebhook =
         value
       );
 
-
     if (
       !organization
     ) {
 
       const phoneNumberId =
-        value?.metadata?.phone_number_id ||
+        value
+          ?.metadata
+          ?.phone_number_id ||
         "unknown";
-
 
       throw new Error(
         `No active LeadFlow AI organization is connected to WhatsApp phoneNumberId: ${phoneNumberId}`
       );
+
     }
 
-
     return organization;
+
   };
 
-
-// ==========================================================
-// DEFAULT EXPORT
-// ==========================================================
+/* ==========================================================
+   DEFAULT EXPORT
+========================================================== */
 
 export default {
 

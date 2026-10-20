@@ -1,142 +1,67 @@
 /**
  * ==========================================================
  *
- * AI INGESTION CONTROLLER
+ * LeadFlow AI
  *
  * Production entry point for customer conversations.
  *
  * ==========================================================
  *
- * CHANNEL ARCHITECTURE
+ * RESPONSIBILITIES
  * ==========================================================
  *
- * WhatsApp
- *    ↓
- * WhatsApp Business Number
- *    ↓
- * WhatsApp Adapter
- *    ↓
- * req.normalizedMessage
- *    ↓
- * Resolve Organization
- *    ↓
- * ingestMessage()
- *
- *
- * SMS
- *    ↓
- * SMS Number
- *    ↓
- * SMS Adapter
- *    ↓
- * req.normalizedMessage
- *    ↓
- * Resolve Organization
- *    ↓
- * ingestMessage()
- *
- *
- * Website
- *    ↓
- * Tenant Context / Default Organization
- *    ↓
- * Website Adapter
- *    ↓
- * req.normalizedMessage
- *    ↓
- * Resolve Organization
- *    ↓
- * ingestMessage()
- *
- *
- * Facebook
- *    ↓
- * Page / Business Account
- *    ↓
- * Facebook Adapter
- *    ↓
- * req.normalizedMessage
- *    ↓
- * Resolve Organization
- *    ↓
- * ingestMessage()
+ * • Resolve tenant through centralized organization resolver
+ * • Normalize public / adapter input
+ * • Webhook idempotency
+ * • AI extraction
+ * • Deterministic extraction
+ * • CURRENT MESSAGE WINS
+ * • Existing lead memory fills missing information
+ * • Canonical intent persistence in the Lead document
+ * • Canonical lifecycle transition
+ * • Canonical score calculation
+ * • Durable critical Lead events through Outbox
+ * • Auto-assignment
+ * • Conversation qualification/state synchronization
+ * • Customer Message persistence
+ * • Non-critical realtime events
+ * • AI auto reply
  *
  * ==========================================================
  *
- * NORMALIZED MESSAGE CONTRACT
+ * CANONICAL AUTHORITIES
  * ==========================================================
  *
- * Channel adapters convert provider-specific payloads into:
+ * Tenant:
+ *   services/organizationResolverService.js
  *
- * {
- *   channel,
- *   organizationId,
- *   customer: {
- *     name,
- *     phone,
- *     externalId
- *   },
- *   message: {
- *     text,
- *     type,
- *     externalMessageId
- *   },
- *   metadata: {}
- * }
+ * Extraction:
+ *   services/aiQualificationService.js
+ *   services/aiIngestionService.js
  *
- * ==========================================================
+ * Lead intent:
+ *   services/leadIntentPersistenceService.js
  *
- * EXTRACTION ARCHITECTURE
- * ==========================================================
+ * Lead lifecycle:
+ *   services/leadLifeCycleService.js
  *
- * Current customer message
- *          ↓
- * AI extraction
- *          ↓
- * deterministic extraction
- *          ↓
- * normalized extraction
- *          ↓
- * CURRENT MESSAGE WINS
- *          ↓
- * existing lead memory fills ONLY genuinely missing fields
+ * Lead scoring:
+ *   services/leadScoringRulesEngine.js
  *
- * ==========================================================
+ * Assignment:
+ *   services/leadAutoAssignmentService.js
+ *   services/assignmentConflictResolver.js
  *
- * WEBHOOK IDEMPOTENCY
- * ==========================================================
+ * Reliable events:
+ *   services/outboxIntegrationService.js
+ *   workers/outboxWorker.js
  *
- * Provider message
- *          ↓
- * organizationId
- *          +
- * source
- *          +
- * externalMessageId
- *          ↓
- * Message lookup
- *          ↓
- * already processed?
- *      ↙          ↘
- *    YES           NO
- *     ↓             ↓
- * IGNORE         AI PROCESSING
+ * Conversation:
+ *   services/conversationContextService.js
+ *   services/conversationStateEngine.js
  *
- * IMPORTANT:
- *
- * The Message model also contains a unique compound index:
- *
- * organizationId + source + externalMessageId
- *
- * Therefore the controller uses TWO layers:
- *
- * 1. Fast duplicate lookup before processing.
- *
- * 2. MongoDB unique-index protection when two identical
- *    webhooks arrive concurrently.
- *
- * The second layer prevents a concurrent duplicate from
- * reaching sendAutoReply().
+ * Auto reply:
+ *   controllers/aiAutoReplyController.js
  *
  * ==========================================================
  */
@@ -164,7 +89,15 @@ import {
 
 import {
   calculateLeadScore,
+  getLeadCategory,
+  normalizeIntent,
+  isValidCanonicalIntent,
 } from "../services/leadScoringRulesEngine.js";
+
+import {
+  determineLeadStatus,
+  transitionLeadStatus,
+} from "../services/leadLifeCycleService.js";
 
 import leadEventBus, {
   LEAD_EVENTS,
@@ -175,32 +108,59 @@ import {
 } from "../services/leadAutoAssignmentService.js";
 
 import {
+  withReliableTransaction,
+  addLeadCreatedEvent,
+  addLeadStatusChangedEvent,
+  addLeadScoredEvent,
+  addLeadWonEvent,
+  addLeadLostEvent,
+} from "../services/outboxIntegrationService.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
+import {
   safeString,
   normalizePhone,
   normalizeBedrooms,
   normalizeBudget,
   normalizeMoveDate,
   normalizeLocation,
-  normalizeIntent,
-
-  resolveOrganizationId,
   isValidOrganizationId,
-
   resolveSource,
-
   extractStructuredCustomerData,
   mergeExtractedData,
-
   synchronizeAIInsights,
   synchronizeConversationMemory,
-
   debugExtraction,
 } from "../services/aiIngestionService.js";
 
 
+// ==========================================================
+// CONSTANTS
+// ==========================================================
+
+const VALID_SOURCES = Object.freeze([
+  "whatsapp",
+  "sms",
+  "website",
+  "facebook",
+]);
+
+const VALID_LIFECYCLE_STATUSES = Object.freeze([
+  "new",
+  "contacted",
+  "qualified",
+  "viewing",
+  "negotiation",
+  "won",
+  "lost",
+]);
+
 
 // ==========================================================
-// DETECT HTTP RESPONSE
+// HTTP RESPONSE DETECTION
 // ==========================================================
 
 const isHttpResponse = (
@@ -209,13 +169,10 @@ const isHttpResponse = (
 
   return Boolean(
     res &&
-    typeof res.status ===
-      "function" &&
-    typeof res.json ===
-      "function"
+    typeof res.status === "function" &&
+    typeof res.json === "function"
   );
 };
-
 
 
 // ==========================================================
@@ -228,15 +185,54 @@ const hasNormalizedMessage = (
 
   return Boolean(
     req?.normalizedMessage &&
-    typeof req.normalizedMessage ===
-      "object"
+    typeof req.normalizedMessage === "object" &&
+    !Array.isArray(
+      req.normalizedMessage
+    )
   );
 };
 
 
+// ==========================================================
+// WEBSITE IDEMPOTENCY KEY
+// ==========================================================
+
+const getWebsiteIdempotencyKey = (
+  req
+) => {
+
+  const rawKey =
+    req?.headers?.["x-idempotency-key"];
+
+  const normalizedKey =
+    safeString(
+      Array.isArray(rawKey)
+        ? rawKey[0]
+        : rawKey
+    ).trim();
+
+  return normalizedKey || null;
+};
+
 
 // ==========================================================
-// PREPARE NORMALIZED INGESTION INPUT
+// PREPARE INGESTION INPUT
+// ==========================================================
+//
+// Supports both:
+//
+// 1. Public website request:
+//      req.body = {
+//        phone,
+//        message
+//      }
+//
+// 2. Channel adapter:
+//      req.normalizedMessage
+//
+// The trusted source comes from req.source / req.channel
+// or the adapter normalized message.
+//
 // ==========================================================
 
 const prepareIngestionInput = (
@@ -246,10 +242,75 @@ const prepareIngestionInput = (
   const normalizedMessage =
     req?.normalizedMessage;
 
+  const requestSource =
+    safeString(
+      req?.source ||
+      req?.channel
+    ).toLowerCase();
 
 
   // ========================================================
-  // NEW STANDARDIZED ADAPTER CONTRACT
+  // PUBLIC WEBSITE BODY
+  // ========================================================
+  //
+  // The website route intentionally forwards:
+  //
+  // {
+  //   phone,
+  //   message
+  // }
+  //
+  // We preserve this exact contract.
+  //
+  // ========================================================
+
+  if (
+    requestSource === "website" &&
+    typeof req?.body?.message === "string" &&
+    req.body.message.trim()
+  ) {
+
+    return {
+
+      source:
+        "website",
+
+      phone:
+        req.body?.phone ??
+        null,
+
+      customerName:
+        req?.customerName ||
+        req?.channelCustomer?.name ||
+        req?.customer?.name ||
+        null,
+
+      externalId:
+        req?.channelCustomer?.externalId ||
+        req?.customer?.externalId ||
+        null,
+
+      message:
+        req.body.message,
+
+      messageType:
+        "text",
+
+      // The direct public website route does not currently
+      // provide a stable external provider message ID.
+      externalMessageId:
+        null,
+
+      metadata:
+        req?.channelMetadata ||
+        {},
+
+    };
+  }
+
+
+  // ========================================================
+  // STANDARDIZED CHANNEL ADAPTER CONTRACT
   // ========================================================
 
   if (
@@ -262,33 +323,17 @@ const prepareIngestionInput = (
       normalizedMessage?.customer ||
       {};
 
-
-
     const message =
       normalizedMessage?.message ||
       {};
 
-
-
-    const organizationId =
-      normalizedMessage?.organizationId ||
-      req?.organizationId ||
-      req?.organization?._id ||
-      req?.user?.organizationId ||
-      null;
-
-
-
     const source =
       safeString(
-        normalizedMessage?.channel
+        normalizedMessage?.channel ||
+        requestSource
       ).toLowerCase();
 
-
-
     return {
-
-      organizationId,
 
       source,
 
@@ -309,7 +354,7 @@ const prepareIngestionInput = (
         "",
 
       messageType:
-        message?.type ??
+        message?.type ||
         "text",
 
       externalMessageId:
@@ -318,11 +363,11 @@ const prepareIngestionInput = (
 
       metadata:
         normalizedMessage?.metadata ||
+        req?.channelMetadata ||
         {},
 
     };
   }
-
 
 
   // ========================================================
@@ -333,21 +378,10 @@ const prepareIngestionInput = (
     req?.body ||
     {};
 
-
-
   return {
 
-    organizationId:
-      req?.organizationId ||
-      req?.organization?._id ||
-      req?.user?.organizationId ||
-      null,
-
     source:
-      safeString(
-        req?.source ||
-        req?.channel
-      ).toLowerCase(),
+      requestSource,
 
     phone:
       body?.phone ??
@@ -382,49 +416,62 @@ const prepareIngestionInput = (
 };
 
 
-
 // ==========================================================
-// SAFE LEAD STATUS
+// PUBLIC BODY VALIDATION
 // ==========================================================
 
-const normalizeLeadStatus = (
-  value,
-  fallback = "new"
+const validatePublicHttpBody = (
+  req
 ) => {
 
-  const status =
-    safeString(
-      value
-    ).toLowerCase();
-
-  if (!status) {
-    return fallback;
-  }
-
-  const allowedStatuses = [
-
-    "new",
-    "contacted",
-    "qualified",
-    "hot",
-    "converted",
-    "lost",
-    "closed",
-
-  ];
-
   if (
-    allowedStatuses.includes(
-      status
-    )
+    !req?.body ||
+    typeof req.body !== "object" ||
+    Array.isArray(req.body)
   ) {
 
-    return status;
+    const error =
+      new Error(
+        "Ingestion request body is required."
+      );
+
+    error.status = 400;
+
+    throw error;
   }
 
-  return fallback;
-};
 
+  const allowedBodyFields = [
+    "phone",
+    "message",
+  ];
+
+
+  const unexpectedBodyFields =
+    Object.keys(
+      req.body
+    ).filter(
+      (field) =>
+        !allowedBodyFields.includes(
+          field
+        )
+    );
+
+
+  if (
+    unexpectedBodyFields.length > 0
+  ) {
+
+    const error =
+      new Error(
+        `Only phone and message are accepted in req.body. Unexpected field(s): ${unexpectedBodyFields.join(", ")}`
+      );
+
+    error.status = 400;
+
+    throw error;
+  }
+};
 
 
 // ==========================================================
@@ -449,7 +496,8 @@ const isValidConversationStatus = (
   }
 
   const enumValues =
-    statusPath.enumValues || [];
+    statusPath.enumValues ||
+    [];
 
   return enumValues.includes(
     value
@@ -457,24 +505,24 @@ const isValidConversationStatus = (
 };
 
 
+// ==========================================================
+// LEAD STATUS SAFETY
+// ==========================================================
+
+const isCanonicalLeadStatus = (
+  value
+) => {
+
+  return VALID_LIFECYCLE_STATUSES.includes(
+    safeString(
+      value
+    ).toLowerCase()
+  );
+};
+
 
 // ==========================================================
-// WEBHOOK IDEMPOTENCY DUPLICATE ERROR DETECTION
-// ==========================================================
-//
-// MongoDB returns error code 11000 when the unique
-// organizationId + source + externalMessageId index is
-// violated.
-//
-// IMPORTANT:
-//
-// We only treat the error as a webhook duplicate when the
-// duplicate-key information actually refers to the external
-// message identity.
-//
-// Other MongoDB duplicate-key errors must continue to throw
-// normally so that real database problems are not hidden.
-//
+// EXTERNAL MESSAGE DUPLICATE ERROR DETECTION
 // ==========================================================
 
 const isExternalMessageDuplicateError = (
@@ -482,35 +530,20 @@ const isExternalMessageDuplicateError = (
 ) => {
 
   if (
-    !error
+    !error ||
+    error.code !== 11000
   ) {
 
     return false;
   }
-
-
-
-  if (
-    error.code !==
-      11000
-  ) {
-
-    return false;
-  }
-
-
 
   const keyPattern =
     error?.keyPattern ||
     {};
 
-
-
   const keyValue =
     error?.keyValue ||
     {};
-
-
 
   const hasExternalMessageKey =
     Object.prototype.hasOwnProperty.call(
@@ -522,8 +555,6 @@ const isExternalMessageDuplicateError = (
       "externalMessageId"
     );
 
-
-
   const hasOrganizationKey =
     Object.prototype.hasOwnProperty.call(
       keyPattern,
@@ -533,8 +564,6 @@ const isExternalMessageDuplicateError = (
       keyValue,
       "organizationId"
     );
-
-
 
   const hasSourceKey =
     Object.prototype.hasOwnProperty.call(
@@ -546,8 +575,6 @@ const isExternalMessageDuplicateError = (
       "source"
     );
 
-
-
   return (
     hasExternalMessageKey &&
     hasOrganizationKey &&
@@ -555,23 +582,38 @@ const isExternalMessageDuplicateError = (
   );
 };
 
+const assertExternalMessageMatches = (
+  existingMessage,
+  incomingMessage
+) => {
+  if (!existingMessage?._id) {
+    throw new Error(
+      "Cannot validate a duplicate without an existing message."
+    );
+  }
 
+  const existingText = String(
+    existingMessage.text ?? ""
+  ).trim();
+
+  const incomingText = String(
+    incomingMessage ?? ""
+  ).trim();
+
+  if (existingText !== incomingText) {
+    const error = new Error(
+      "This external message ID has already been used for different message content."
+    );
+
+    error.status = 409;
+    error.code = "EXTERNAL_MESSAGE_ID_CONFLICT";
+
+    throw error;
+  }
+};
 
 // ==========================================================
-// LOAD EXISTING EXTERNAL MESSAGE AFTER DUPLICATE RACE
-// ==========================================================
-//
-// When two identical webhooks arrive at nearly the same time:
-//
-// Request A:
-//   Message.create() → succeeds
-//
-// Request B:
-//   Message.create() → E11000
-//
-// Request B uses this helper to retrieve the message that
-// won the race.
-//
+// FIND EXISTING EXTERNAL MESSAGE
 // ==========================================================
 
 const findExistingExternalMessage = async (
@@ -589,39 +631,30 @@ const findExistingExternalMessage = async (
     return null;
   }
 
+  return Message
+    .findOne({
 
+      organizationId,
 
-  return Message.findOne({
+      source:
+        normalizedSource,
 
-    organizationId,
-
-    source:
-      normalizedSource,
-
-    externalMessageId,
-
-  })
-    .select({
-
-      _id: 1,
-
-      organizationId: 1,
-
-      conversationId: 1,
-
-      leadId: 1,
-
-      source: 1,
-
-      externalMessageId: 1,
-
-      createdAt: 1,
+      externalMessageId,
 
     })
+    .select({
+  _id: 1,
+  organizationId: 1,
+  conversationId: 1,
+  leadId: 1,
+  source: 1,
+  externalMessageId: 1,
+  text: 1,
+  senderRole: 1,
+  createdAt: 1,
+})
     .lean();
 };
-
-
 
 // ==========================================================
 // BUILD DUPLICATE RESPONSE
@@ -633,82 +666,319 @@ const buildDuplicateResponse = (
   externalMessageId,
   existingExternalMessage
 ) => {
+  if (!existingExternalMessage?._id) {
+    throw new Error(
+      "Cannot build a confirmed duplicate response without an existing message."
+    );
+  }
 
   console.log(
-    "♻️ DUPLICATE WHATSAPP MESSAGE IGNORED"
+    "♻️ DUPLICATE EXTERNAL MESSAGE IGNORED"
   );
 
-
-
   console.log({
-
     organizationId,
-
-    source:
-      normalizedSource,
-
+    source: normalizedSource,
     externalMessageId,
-
-    existingMessageId:
-      existingExternalMessage?._id ||
-      null,
-
-    conversationId:
-      existingExternalMessage?.conversationId ||
-      null,
-
-    leadId:
-      existingExternalMessage?.leadId ||
-      null,
-
-    originalCreatedAt:
-      existingExternalMessage?.createdAt ||
-      null,
-
+    existingMessageId: existingExternalMessage._id,
+    conversationId: existingExternalMessage.conversationId || null,
+    leadId: existingExternalMessage.leadId || null,
+    originalCreatedAt: existingExternalMessage.createdAt || null,
   });
 
-
-
   return {
-
-    success:
-      true,
-
-    duplicate:
-      true,
-
-    message:
-      "Duplicate external message ignored.",
-
+    success: true,
+    duplicate: true,
+    message: "Duplicate external message ignored.",
     data: {
-
-      duplicate:
-        true,
-
+      duplicate: true,
       externalMessageId,
-
-      source:
-        normalizedSource,
-
+      source: normalizedSource,
       organizationId,
-
-      existingMessageId:
-        existingExternalMessage?._id ||
-        null,
-
-      conversationId:
-        existingExternalMessage?.conversationId ||
-        null,
-
-      leadId:
-        existingExternalMessage?.leadId ||
-        null,
-
+      existingMessageId: existingExternalMessage._id,
+      conversationId: existingExternalMessage.conversationId || null,
+      leadId: existingExternalMessage.leadId || null,
     },
-
   };
 };
 
+// ==========================================================
+// APPLY EXTRACTED DATA TO LEAD
+// ==========================================================
+
+const applyExtractedDataToLead = (
+  lead,
+  extractedData,
+  aiResult,
+  aiInsights,
+  customerName,
+  phone,
+  normalizedSource
+) => {
+
+  if (
+    customerName
+  ) {
+
+    lead.name =
+      customerName;
+  }
+
+
+  if (
+    phone
+  ) {
+
+    lead.phone =
+      phone;
+  }
+
+
+  lead.source =
+    normalizedSource;
+
+
+  // ========================================================
+  // BUDGET
+  // ========================================================
+
+  if (
+    extractedData?.budget !== undefined &&
+    extractedData?.budget !== null &&
+    extractedData?.budget !== ""
+  ) {
+
+    const budget =
+      normalizeBudget(
+        extractedData.budget
+      );
+
+    if (
+      budget !== null
+    ) {
+
+      console.log(
+        "💰 CURRENT MESSAGE BUDGET:",
+        budget
+      );
+
+      lead.budget =
+        budget;
+    }
+  }
+
+
+  // ========================================================
+  // LOCATION
+  // ========================================================
+
+  if (
+    extractedData?.location
+  ) {
+
+    const location =
+      normalizeLocation(
+        extractedData.location
+      );
+
+    if (
+      location
+    ) {
+
+      console.log(
+        "📍 CURRENT MESSAGE LOCATION:",
+        location
+      );
+
+      lead.location =
+        location;
+    }
+  }
+
+
+  // ========================================================
+  // BEDROOMS
+  // ========================================================
+
+  if (
+    extractedData?.bedrooms !== undefined &&
+    extractedData?.bedrooms !== null &&
+    extractedData?.bedrooms !== ""
+  ) {
+
+    const bedrooms =
+      normalizeBedrooms(
+        extractedData.bedrooms
+      );
+
+    if (
+      bedrooms !== null
+    ) {
+
+      console.log(
+        "🛏️ CURRENT MESSAGE BEDROOMS:",
+        bedrooms
+      );
+
+      lead.bedrooms =
+        bedrooms;
+    }
+  }
+
+
+  // ========================================================
+  // MOVE DATE
+  // ========================================================
+
+  if (
+    extractedData?.moveDate
+  ) {
+
+    const moveDate =
+      normalizeMoveDate(
+        extractedData.moveDate
+      );
+
+    if (
+      moveDate
+    ) {
+
+      console.log(
+        "📅 CURRENT MESSAGE MOVE DATE:",
+        moveDate
+      );
+
+      lead.moveDate =
+        moveDate;
+    }
+  }
+
+
+  // ========================================================
+  // URGENCY
+  // ========================================================
+
+  if (
+    typeof extractedData?.urgent ===
+      "boolean"
+  ) {
+
+    console.log(
+      "🚨 CURRENT MESSAGE URGENCY:",
+      extractedData.urgent
+    );
+
+    lead.urgent =
+      extractedData.urgent;
+  }
+
+
+  // ========================================================
+  // AI INSIGHTS
+  // ========================================================
+
+  lead.aiInsights = {
+
+    ...(lead.aiInsights || {}),
+
+    ...(aiInsights || {}),
+
+  };
+
+
+  // ========================================================
+  // CANONICAL INTENT
+  // ========================================================
+
+  const normalizedLeadIntent =
+    normalizeIntent(
+      extractedData?.intent
+    );
+
+
+  if (
+    normalizedLeadIntent &&
+    isValidCanonicalIntent(
+      normalizedLeadIntent
+    )
+  ) {
+
+    lead.intent =
+      normalizedLeadIntent;
+
+    lead.aiInsights = {
+
+      ...(lead.aiInsights || {}),
+
+      intent:
+        normalizedLeadIntent,
+
+    };
+
+  }
+
+
+  // ========================================================
+  // AI INSIGHT SYNCHRONIZATION
+  // ========================================================
+
+  synchronizeAIInsights(
+    lead,
+    {
+      ...(aiResult || {}),
+
+      insights:
+        aiInsights || {},
+
+    }
+  );
+
+
+  return lead;
+};
+
+
+// ==========================================================
+// CALCULATE COMPLETION
+// ==========================================================
+
+const updateLeadCompletion = (
+  lead
+) => {
+
+  const hasBudget =
+    lead.budget !== undefined &&
+    lead.budget !== null;
+
+  const hasLocation =
+    Boolean(
+      lead.location
+    );
+
+  const hasBedrooms =
+    lead.bedrooms !== undefined &&
+    lead.bedrooms !== null;
+
+  const hasMoveDate =
+    Boolean(
+      lead.moveDate
+    );
+
+  lead.isComplete =
+    Boolean(
+      hasBudget &&
+      hasLocation &&
+      hasBedrooms &&
+      hasMoveDate
+    );
+
+  return {
+    hasBudget,
+    hasLocation,
+    hasBedrooms,
+    hasMoveDate,
+  };
+};
 
 
 // ==========================================================
@@ -739,26 +1009,8 @@ const processIngestion = async (
   }
 
 
-
-  if (
-    !req.body ||
-    typeof req.body !== "object"
-  ) {
-
-    const error =
-      new Error(
-        "Ingestion request body is required."
-      );
-
-    error.status = 400;
-
-    throw error;
-  }
-
-
-
   // ========================================================
-  // 1A. NORMALIZED MESSAGE CONTRACT
+  // 2. PREPARE INPUT
   // ========================================================
 
   const ingestionInput =
@@ -767,67 +1019,23 @@ const processIngestion = async (
     );
 
 
-
   // ========================================================
-  // 1B. REQUEST BODY CONTRACT
+  // 3. RESOLVE ORGANIZATION
   // ========================================================
 
-  const allowedBodyFields = [
-    "phone",
-    "message",
-  ];
-
-  const unexpectedBodyFields =
-    Object.keys(
-      req.body
-    ).filter(
-      (field) =>
-        !allowedBodyFields.includes(
-          field
-        )
+  const organization =
+    await resolveFromRequest(
+      req
     );
-
-  if (
-    unexpectedBodyFields.length > 0
-  ) {
-
-    const error =
-      new Error(
-        `Only phone and message are accepted in req.body. Unexpected field(s): ${unexpectedBodyFields.join(", ")}`
-      );
-
-    error.status = 400;
-
-    throw error;
-  }
-
-
-
-  // ========================================================
-  // 2. RESOLVE ORGANIZATION
-  // ========================================================
-
-  if (
-    ingestionInput.organizationId &&
-    !req.organizationId
-  ) {
-
-    req.organizationId =
-      ingestionInput.organizationId;
-  }
-
 
 
   const organizationId =
-    resolveOrganizationId(
-      req
-    ) ||
-    ingestionInput.organizationId;
-
+    organization?._id ||
+    null;
 
 
   // ========================================================
-  // 3. RESOLVE SOURCE
+  // 4. SOURCE
   // ========================================================
 
   if (
@@ -840,7 +1048,6 @@ const processIngestion = async (
   }
 
 
-
   if (
     ingestionInput.source &&
     !req.channel
@@ -851,57 +1058,82 @@ const processIngestion = async (
   }
 
 
-
   const normalizedSource =
-    resolveSource(
-      req
-    ) ||
-    ingestionInput.source;
-
+    (
+      resolveSource(
+        req
+      ) ||
+      ingestionInput.source ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
 
 
   // ========================================================
-  // 4. EXTRACT INPUT
+  // 5. INPUT VALUES
   // ========================================================
 
-  const rawPhone =
-    ingestionInput.phone;
-
-
+  const phone =
+    normalizePhone(
+      ingestionInput.phone
+    );
 
   const message =
-    ingestionInput.message;
+    safeString(
+      ingestionInput.message
+    );
 
 
-
-  // ========================================================
-  // EXTERNAL PROVIDER MESSAGE ID
-  // ========================================================
-  //
-  // This is the provider's unique message identifier.
-  //
-  // WhatsApp:
-  //
-  //     wamid....
-  //
-  // It is NOT the MongoDB Message _id.
-  //
-  // It is used to prevent webhook retries from triggering
-  // AI processing and automatic replies again.
-  //
-  // ========================================================
-
-  const externalMessageId =
+  const rawExternalMessageId =
     safeString(
       ingestionInput.externalMessageId
     ) ||
     null;
 
 
+  // ========================================================
+  // WEBSITE IDEMPOTENCY
+  // ========================================================
 
-  // ========================================================
-  // CUSTOMER NAME
-  // ========================================================
+  const websiteIdempotencyKey =
+    normalizedSource === "website"
+      ? getWebsiteIdempotencyKey(req)
+      : null;
+
+
+  if (
+    normalizedSource === "website" &&
+    !rawExternalMessageId &&
+    !websiteIdempotencyKey
+  ) {
+
+    const error =
+      new Error(
+        "X-Idempotency-Key header is required for website ingestion."
+      );
+
+    error.status = 400;
+
+    throw error;
+  }
+
+
+  const externalMessageId =
+    rawExternalMessageId ||
+    (
+      normalizedSource === "website" &&
+      websiteIdempotencyKey
+        ? `website:${websiteIdempotencyKey}`
+        : null
+    );
+
+
+  const ingestionOperationId =
+    externalMessageId
+      ? `${normalizedSource}:${externalMessageId}`
+      : null;
+
 
   const channelCustomerName =
     safeString(
@@ -912,17 +1144,9 @@ const processIngestion = async (
     );
 
 
-
   // ========================================================
-  // PHONE
+  // DEBUG
   // ========================================================
-
-  const phone =
-    normalizePhone(
-      rawPhone
-    );
-
-
 
   console.log(
     "\n=========================================================="
@@ -961,15 +1185,12 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 5. VALIDATE MESSAGE
+  // 6. VALIDATE MESSAGE
   // ========================================================
 
   if (
-    typeof message !==
-      "string" ||
-    !message.trim()
+    !message
   ) {
 
     const error =
@@ -983,14 +1204,8 @@ const processIngestion = async (
   }
 
 
-
-  const cleanMessage =
-    message.trim();
-
-
-
   // ========================================================
-  // 5A. VALIDATE PHONE
+  // 7. VALIDATE PHONE
   // ========================================================
 
   if (
@@ -1008,9 +1223,8 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 6. VALIDATE ORGANIZATION
+  // 8. VALIDATE ORGANIZATION
   // ========================================================
 
   if (
@@ -1034,22 +1248,21 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 7. VALIDATE SOURCE
+  // 9. VALIDATE SOURCE
   // ========================================================
 
   if (
-    !normalizedSource
+    !VALID_SOURCES.includes(
+      normalizedSource
+    )
   ) {
 
     console.error(
       "❌ AI INGESTION ERROR: Invalid lead source.",
       {
         source:
-          req?.source ||
-          req?.channel ||
-          "website",
+          normalizedSource,
       }
     );
 
@@ -1064,34 +1277,8 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 7A. WEBHOOK IDEMPOTENCY CHECK
-  // ========================================================
-  //
-  // IMPORTANT:
-  //
-  // This check MUST happen BEFORE:
-  //
-  //     analyzeMessage()
-  //     Lead lookup
-  //     Lead creation
-  //     Conversation updates
-  //     Events
-  //     sendAutoReply()
-  //
-  // The provider's external message ID is scoped by:
-  //
-  //     organizationId
-  //     source
-  //     externalMessageId
-  //
-  // This prevents normal webhook retries from being
-  // processed more than once.
-  //
-  // MongoDB's unique compound index provides the second,
-  // race-safe protection for simultaneous webhook deliveries.
-  //
+  // 10. WEBHOOK IDEMPOTENCY
   // ========================================================
 
   if (
@@ -1110,10 +1297,14 @@ const processIngestion = async (
       );
 
 
-
     if (
       existingExternalMessage
     ) {
+
+      assertExternalMessageMatches(
+        existingExternalMessage,
+        message
+      );
 
       return buildDuplicateResponse(
 
@@ -1129,7 +1320,6 @@ const processIngestion = async (
     }
 
 
-
     console.log(
       "🆕 NEW EXTERNAL MESSAGE ID:",
       externalMessageId
@@ -1137,18 +1327,16 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 8. AI QUALIFICATION
+  // 11. AI QUALIFICATION
   // ========================================================
 
   const aiResult =
     await Promise.resolve(
       analyzeMessage(
-        cleanMessage
+        message
       )
     );
-
 
 
   console.log(
@@ -1157,11 +1345,9 @@ const processIngestion = async (
   );
 
 
-
   console.log(
     "AI Extraction:"
   );
-
 
 
   console.dir(
@@ -1172,33 +1358,24 @@ const processIngestion = async (
   );
 
 
-
-  // ========================================================
-  // 9. EXTRACT AI DATA
-  // ========================================================
-
   const aiExtractedData =
     aiResult?.extracted ||
     aiResult?.extractedData ||
     {};
-
-
 
   const aiInsights =
     aiResult?.insights ||
     {};
 
 
-
   // ========================================================
-  // 9A. DETERMINISTIC EXTRACTION
+  // 12. DETERMINISTIC EXTRACTION
   // ========================================================
 
   const deterministicData =
     extractStructuredCustomerData(
-      cleanMessage
+      message
     );
-
 
 
   console.log(
@@ -1207,9 +1384,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 9A.1 RESOLVE CUSTOMER NAME
+  // 13. CUSTOMER NAME
   // ========================================================
 
   let customerName =
@@ -1220,7 +1396,6 @@ const processIngestion = async (
     "";
 
 
-
   console.log(
     "👤 RESOLVED CUSTOMER NAME:",
     customerName ||
@@ -1228,9 +1403,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 9B. MERGE EXTRACTION
+  // 14. MERGE EXTRACTION
   // ========================================================
 
   const extractedData =
@@ -1240,14 +1414,8 @@ const processIngestion = async (
     );
 
 
-
-  // ========================================================
-  // 9B.1 NORMALIZED EXTRACTION
-  // ========================================================
-
   const normalizedExtraction =
     extractedData;
-
 
 
   console.log(
@@ -1256,14 +1424,13 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 9C. FULL EXTRACTION DEBUG
+  // 15. FULL EXTRACTION DEBUG
   // ========================================================
 
   debugExtraction(
 
-    cleanMessage,
+    message,
 
     aiResult,
 
@@ -1276,9 +1443,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 10. LOAD CONVERSATION CONTEXT
+  // 16. LOAD CONVERSATION
   // ========================================================
 
   let conversation =
@@ -1291,7 +1457,6 @@ const processIngestion = async (
       phone
 
     );
-
 
 
   console.log(
@@ -1308,7 +1473,6 @@ const processIngestion = async (
   );
 
 
-
   if (
     conversation
   ) {
@@ -1319,7 +1483,6 @@ const processIngestion = async (
     );
 
 
-
     console.log(
       "🔗 EXISTING CONVERSATION - LEAD ID:",
       conversation.leadId ||
@@ -1327,11 +1490,9 @@ const processIngestion = async (
     );
 
 
-
     console.log(
       "📚 Conversation Context:"
     );
-
 
 
     console.dir(
@@ -1349,20 +1510,19 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 11. FIND EXISTING LEAD
+  // 17. FIND EXISTING LEAD
   // ========================================================
 
-  let lead = null;
-
+  let existingLead =
+    null;
 
 
   if (
     phone
   ) {
 
-    lead =
+    existingLead =
       await Lead.findOne({
 
         phone,
@@ -1373,13 +1533,12 @@ const processIngestion = async (
   }
 
 
-
   if (
-    !lead &&
+    !existingLead &&
     customerName
   ) {
 
-    lead =
+    existingLead =
       await Lead.findOne({
 
         name:
@@ -1396,41 +1555,37 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 11A. RESOLVE NAME FROM EXISTING LEAD
+  // 18. RESOLVE NAME FROM EXISTING LEAD
   // ========================================================
 
   if (
     !customerName &&
-    lead?.name &&
-    lead.name !== "Unknown"
+    existingLead?.name &&
+    existingLead.name !== "Unknown"
   ) {
 
     customerName =
       safeString(
-        lead.name
+        existingLead.name
       );
   }
 
 
-
   // ========================================================
-  // DEBUG EXISTING LEAD
+  // 19. EXISTING LEAD DEBUG
   // ========================================================
 
   if (
-    lead
+    existingLead
   ) {
 
     console.log(
       "♻️ EXISTING LEAD FOUND:"
     );
 
-
-
     console.dir(
-      lead.toObject(),
+      existingLead.toObject(),
       {
         depth: null,
       }
@@ -1444,25 +1599,27 @@ const processIngestion = async (
   }
 
 
-
-  // ========================================================
-  // 12. DETERMINE NEW LEAD
-  // ========================================================
-
   const isNewLead =
-    !lead;
-
+    !existingLead;
 
 
   // ========================================================
-  // 13. CREATE LEAD
+  // 20. CANDIDATE LEAD STATE
   // ========================================================
+
+  let candidateLead;
+
 
   if (
-    !lead
+    existingLead
   ) {
 
-    lead =
+    candidateLead =
+      existingLead;
+
+  } else {
+
+    candidateLead =
       new Lead({
 
         name:
@@ -1470,8 +1627,7 @@ const processIngestion = async (
           "Unknown",
 
         phone:
-          phone ||
-          "",
+          phone,
 
         status:
           "new",
@@ -1482,10 +1638,10 @@ const processIngestion = async (
           normalizedSource,
 
         intent:
-          normalizeIntent(
-            normalizedExtraction?.intent
-          ) ||
           "",
+
+        score:
+          0,
 
         assignedTo:
           null,
@@ -1497,489 +1653,759 @@ const processIngestion = async (
           null,
 
         assignedSource:
-          "auto",
+          null,
 
       });
+  }
 
 
+  // ========================================================
+  // 21. APPLY EXTRACTION TO CANDIDATE
+  // ========================================================
 
-    console.log(
-      "🆕 NEW LEAD CREATED IN MEMORY:",
-      {
+  applyExtractedDataToLead(
 
-        source:
-          normalizedSource,
+    candidateLead,
 
-        organizationId:
-          String(
-            organizationId
-          ),
+    extractedData,
 
-        intent:
-          lead.intent ||
-          "",
+    aiResult,
 
+    aiInsights,
+
+    customerName,
+
+    phone,
+
+    normalizedSource
+
+  );
+
+
+  // ========================================================
+  // 22. COMPLETION
+  // ========================================================
+
+  const completion =
+    updateLeadCompletion(
+      candidateLead
+    );
+
+
+  // ========================================================
+  // 23. DETERMINE CANONICAL LIFECYCLE
+  // ========================================================
+
+  const candidateStatus =
+    determineLeadStatus(
+      candidateLead,
+      aiResult || {}
+    );
+
+
+  if (
+    candidateStatus &&
+    isCanonicalLeadStatus(
+      candidateStatus
+    ) &&
+    candidateStatus !== candidateLead.status
+  ) {
+
+    transitionLeadStatus(
+      candidateLead,
+      candidateStatus
+    );
+  }
+
+
+  if (
+    !isCanonicalLeadStatus(
+      candidateLead.status
+    )
+  ) {
+
+    transitionLeadStatus(
+      candidateLead,
+      "new"
+    );
+  }
+
+
+  // ========================================================
+  // 24. CALCULATE CANONICAL SCORE
+  // ========================================================
+
+  candidateLead.score =
+    calculateLeadScore(
+      candidateLead
+    );
+
+
+  const candidateCategory =
+    getLeadCategory(
+      candidateLead.score
+    );
+
+
+  console.log(
+    "🎯 CANDIDATE LEAD SCORE:",
+    candidateLead.score
+  );
+
+
+  console.log(
+    "🏷️ CANDIDATE SCORE CATEGORY:",
+    candidateCategory
+  );
+
+
+  console.log(
+    "🔄 CANDIDATE LIFECYCLE STATUS:",
+    candidateLead.status
+  );
+
+
+  // ========================================================
+  // 25. TRANSACTIONAL LEAD + OUTBOX
+  // ========================================================
+
+  let lead;
+
+  let previousStatus =
+    "new";
+
+  let previousScore =
+    0;
+
+  let previousCategory =
+    "new";
+
+  let createdInsideTransaction =
+    false;
+
+
+  const transactionResult =
+  await withReliableTransaction(
+    async (session) => {
+
+        console.log(
+          "=================================================="
+        );
+
+        console.log(
+          "🔐 LEAD + OUTBOX TRANSACTION START"
+        );
+
+        console.log(
+          "=================================================="
+        );
+
+
+        // ====================================================
+        // 25A. RELOAD AUTHORITATIVE LEAD INSIDE TRANSACTION
+        // ====================================================
+
+        let transactionalLead =
+          null;
+
+
+        if (
+          existingLead?._id
+        ) {
+
+          transactionalLead =
+            await Lead.findOne({
+
+              _id:
+                existingLead._id,
+
+              organizationId,
+
+            }).session(
+              session
+            );
+
+
+          if (
+            !transactionalLead
+          ) {
+
+            throw new Error(
+              "Existing Lead could not be reloaded inside the tenant-scoped transaction."
+            );
+          }
+
+        } else {
+
+          transactionalLead =
+            new Lead({
+
+              name:
+                customerName ||
+                "Unknown",
+
+              phone:
+                phone,
+
+              status:
+                "new",
+
+              organizationId,
+
+              source:
+                normalizedSource,
+
+              intent:
+                "",
+
+              score:
+                0,
+
+              assignedTo:
+                null,
+
+              assignedBy:
+                null,
+
+              assignedAt:
+                null,
+
+              assignedSource:
+                null,
+
+            });
+
+
+          createdInsideTransaction =
+            true;
+        }
+
+
+        // ====================================================
+        // 25B. SNAPSHOT PREVIOUS CANONICAL STATE
+        // ====================================================
+
+        previousStatus =
+          isCanonicalLeadStatus(
+            transactionalLead.status
+          )
+            ? transactionalLead.status
+            : "new";
+
+
+        previousScore =
+          Number(
+            transactionalLead.score ||
+            0
+          );
+
+
+        previousCategory =
+          getLeadCategory(
+            previousScore
+          );
+
+
+        // ====================================================
+        // 25C. APPLY CURRENT MESSAGE DATA
+        // ====================================================
+
+        applyExtractedDataToLead(
+
+          transactionalLead,
+
+          extractedData,
+
+          aiResult,
+
+          aiInsights,
+
+          customerName,
+
+          phone,
+
+          normalizedSource
+
+        );
+
+
+        // ====================================================
+        // 25D. UPDATE COMPLETION
+        // ====================================================
+
+        updateLeadCompletion(
+          transactionalLead
+        );
+
+
+        // ====================================================
+        // 25E. DETERMINE CANONICAL STATUS
+        // ====================================================
+
+        const desiredStatus =
+          determineLeadStatus(
+            transactionalLead,
+            aiResult || {}
+          );
+
+
+        if (
+          desiredStatus &&
+          desiredStatus !== transactionalLead.status
+        ) {
+
+          transitionLeadStatus(
+            transactionalLead,
+            desiredStatus
+          );
+        }
+
+
+        if (
+          !isCanonicalLeadStatus(
+            transactionalLead.status
+          )
+        ) {
+
+          transitionLeadStatus(
+            transactionalLead,
+            "new"
+          );
+        }
+
+
+        // ====================================================
+        // 25F. CALCULATE SCORE FROM FINAL TRANSACTIONAL LEAD
+        // ====================================================
+
+        const finalScore =
+          calculateLeadScore(
+            transactionalLead
+          );
+
+
+        const finalCategory =
+          getLeadCategory(
+            finalScore
+          );
+
+
+        transactionalLead.score =
+          finalScore;
+
+
+        // ====================================================
+        // 25G. DEBUG TRANSACTIONAL LEAD
+        // ====================================================
+
+        console.log(
+          "========== LEAD BEFORE TRANSACTION SAVE =========="
+        );
+
+
+        console.dir(
+          transactionalLead.toObject(),
+          {
+            depth: null,
+          }
+        );
+
+
+        console.log(
+          "=================================================="
+        );
+
+
+// ====================================================
+// 25H. TEST FAILURE INJECTION — LEAD SAVE
+// ====================================================
+
+if (
+  process.env.TEST_FORCE_LEAD_SAVE_FAILURE === "true"
+) {
+
+  console.warn(
+    "⚠️ TEST: Forcing Lead save failure inside transaction."
+  );
+
+  throw new Error(
+    "TEST: Lead persistence failed inside transaction."
+  );
+}
+
+        // ====================================================
+        // 25H. SAVE LEAD WITH REAL CLIENT SESSION
+        // ====================================================
+
+        await transactionalLead.save({
+          session,
+        });
+
+
+        console.log(
+          "✅ LEAD SAVED INSIDE TRANSACTION:",
+          transactionalLead._id.toString()
+        );
+
+
+        // ====================================================
+        // 25I. CRITICAL OUTBOX EVENT: LEAD CREATED
+        // ====================================================
+
+        if (
+          createdInsideTransaction
+        ) {
+
+          await addLeadCreatedEvent({
+
+            session,
+
+            lead:
+              transactionalLead,
+
+            organizationId,
+
+            operationId:
+              ingestionOperationId,
+
+            metadata: {
+
+              source:
+                normalizedSource,
+
+              externalMessageId,
+
+              customerName:
+                customerName ||
+                transactionalLead.name ||
+                null,
+
+            },
+
+          });
+
+
+          console.log(
+            "📦 OUTBOX: LEAD_CREATED"
+          );
+        }
+
+
+        // ====================================================
+        // 25J. CRITICAL OUTBOX EVENT: STATUS
+        // ====================================================
+
+        const finalStatus =
+          transactionalLead.status;
+
+
+        if (
+          previousStatus !==
+          finalStatus
+        ) {
+
+          await addLeadStatusChangedEvent({
+
+            session,
+
+            lead:
+              transactionalLead,
+
+            previousStatus,
+
+            organizationId,
+
+            operationId:
+              ingestionOperationId,
+
+            metadata: {
+
+              source:
+                normalizedSource,
+
+              externalMessageId,
+
+            },
+
+          });
+
+
+          console.log(
+            "📦 OUTBOX: LEAD_STATUS_CHANGED",
+            {
+              previousStatus,
+              status:
+                finalStatus,
+            }
+          );
+
+
+          // ==================================================
+          // WON / LOST SPECIAL EVENTS
+          // ==================================================
+
+          if (
+            finalStatus ===
+            "won"
+          ) {
+
+            await addLeadWonEvent({
+
+              session,
+
+              lead:
+                transactionalLead,
+
+              organizationId,
+
+              operationId:
+                ingestionOperationId,
+
+              metadata: {
+
+                source:
+                  normalizedSource,
+
+                externalMessageId,
+
+              },
+
+            });
+
+
+            console.log(
+              "📦 OUTBOX: LEAD_WON"
+            );
+          }
+
+
+          if (
+            finalStatus ===
+            "lost"
+          ) {
+
+            await addLeadLostEvent({
+
+              session,
+
+              lead:
+                transactionalLead,
+
+              organizationId,
+
+              operationId:
+                ingestionOperationId,
+
+              metadata: {
+
+                source:
+                  normalizedSource,
+
+                externalMessageId,
+
+              },
+
+            });
+
+
+            console.log(
+              "📦 OUTBOX: LEAD_LOST"
+            );
+          }
+        }
+
+
+        // ====================================================
+        // 25K. CRITICAL OUTBOX EVENT: SCORE
+        // ====================================================
+
+        const scoreChanged =
+          previousScore !==
+          finalScore;
+
+        const categoryChanged =
+          previousCategory !==
+          finalCategory;
+
+
+        if (
+          createdInsideTransaction ||
+          scoreChanged ||
+          categoryChanged
+        ) {
+
+          await addLeadScoredEvent({
+
+            session,
+
+            lead:
+              transactionalLead,
+
+            previousScore,
+
+            previousCategory,
+
+            score:
+              finalScore,
+
+            category:
+              finalCategory,
+
+            organizationId,
+
+            operationId:
+              ingestionOperationId,
+
+            metadata: {
+
+              source:
+                normalizedSource,
+
+              externalMessageId,
+
+            },
+
+          });
+
+
+          console.log(
+            "📦 OUTBOX: LEAD_SCORED",
+            {
+              previousScore,
+              score:
+                finalScore,
+              previousCategory,
+              category:
+                finalCategory,
+            }
+          );
+        }
+
+
+        console.log(
+          "✅ LEAD + OUTBOX TRANSACTION READY TO COMMIT"
+        );
+
+
+        return {
+
+          lead:
+            transactionalLead,
+
+          score:
+            finalScore,
+
+          category:
+            finalCategory,
+
+          status:
+            finalStatus,
+
+          created:
+            createdInsideTransaction,
+
+          previousStatus,
+
+          previousScore,
+
+          previousCategory,
+
+        };
       }
     );
-  }
 
 
-
-  // ========================================================
-  // 14. PROGRESSIVE CUSTOMER ENRICHMENT
-  // ========================================================
-
-  if (
-    customerName
-  ) {
-
-    lead.name =
-      customerName;
-  }
-
-
-
-  if (
-    phone
-  ) {
-
-    lead.phone =
-      phone;
-  }
-
+  lead =
+    transactionResult.lead;
 
 
   // ========================================================
-  // 15. SOURCE
-  // ========================================================
-
-  lead.source =
-    normalizedSource;
-
-
-
-  // ========================================================
-  // 16. BUDGET
-  // ========================================================
-
-  if (
-    extractedData.budget !==
-      undefined &&
-    extractedData.budget !==
-      null &&
-    extractedData.budget !==
-      ""
-  ) {
-
-    const budget =
-      normalizeBudget(
-        extractedData.budget
-      );
-
-
-
-    if (
-      budget !== null
-    ) {
-
-      console.log(
-        "💰 CURRENT MESSAGE BUDGET:",
-        budget
-      );
-
-
-
-      lead.budget =
-        budget;
-    }
-  }
-
-
-
-  // ========================================================
-  // 17. LOCATION
-  // ========================================================
-
-  if (
-    extractedData.location
-  ) {
-
-    const location =
-      normalizeLocation(
-        extractedData.location
-      );
-
-
-
-    if (
-      location
-    ) {
-
-      console.log(
-        "📍 CURRENT MESSAGE LOCATION:",
-        location
-      );
-
-
-
-      lead.location =
-        location;
-    }
-  }
-
-
-
-  // ========================================================
-  // 18. BEDROOMS
-  // ========================================================
-
-  if (
-    extractedData.bedrooms !==
-      undefined &&
-    extractedData.bedrooms !==
-      null &&
-    extractedData.bedrooms !==
-      ""
-  ) {
-
-    const bedrooms =
-      normalizeBedrooms(
-        extractedData.bedrooms
-      );
-
-
-
-    if (
-      bedrooms !== null
-    ) {
-
-      console.log(
-        "🛏️ CURRENT MESSAGE BEDROOMS:",
-        bedrooms
-      );
-
-
-
-      lead.bedrooms =
-        bedrooms;
-    }
-  }
-
-
-
-  // ========================================================
-  // 19. MOVE DATE
-  // ========================================================
-
-  if (
-    extractedData.moveDate
-  ) {
-
-    const moveDate =
-      normalizeMoveDate(
-        extractedData.moveDate
-      );
-
-
-
-    if (
-      moveDate
-    ) {
-
-      console.log(
-        "📅 CURRENT MESSAGE MOVE DATE:",
-        moveDate
-      );
-
-
-
-      lead.moveDate =
-        moveDate;
-    }
-  }
-
-
-
-  // ========================================================
-  // 20. URGENCY
-  // ========================================================
-
-  if (
-    typeof extractedData.urgent ===
-      "boolean"
-  ) {
-
-    console.log(
-      "🚨 CURRENT MESSAGE URGENCY:",
-      extractedData.urgent
-    );
-
-
-
-    lead.urgent =
-      extractedData.urgent;
-  }
-
-
-
-  // ========================================================
-  // 21. AI INSIGHTS
-  // ========================================================
-
-  lead.aiInsights = {
-
-    ...(lead.aiInsights || {}),
-
-    ...aiInsights,
-
-  };
-
-
-
-  // ========================================================
-  // 21A. INTENT MEMORY
-  // ========================================================
-
-  if (
-    extractedData.intent
-  ) {
-
-    const normalizedIntentValue =
-      normalizeIntent(
-        extractedData.intent
-      );
-
-
-
-    if (
-      normalizedIntentValue
-    ) {
-
-      lead.aiInsights = {
-
-        ...(lead.aiInsights || {}),
-
-        intent:
-          normalizedIntentValue,
-
-      };
-    }
-  }
-
-
-
-  // ========================================================
-  // 21B. SYNCHRONIZE AI INSIGHTS
-  // ========================================================
-
-  synchronizeAIInsights(
-    lead,
-    {
-      ...aiResult,
-
-      insights:
-        aiInsights,
-
-    }
-  );
-
-
-
-  // ========================================================
-  // 21C. LEAD INTENT
-  // ========================================================
-
-  const normalizedLeadIntent =
-    normalizeIntent(
-      extractedData?.intent
-    );
-
-
-
-  if (
-    normalizedLeadIntent
-  ) {
-
-    lead.intent =
-      normalizedLeadIntent;
-  }
-
-
-
-  // ========================================================
-  // 22. LEAD STATUS
-  // ========================================================
-
-  if (
-    aiResult?.stage
-  ) {
-
-    lead.status =
-      normalizeLeadStatus(
-        aiResult.stage,
-        lead.status ||
-        "new"
-      );
-  }
-
-
-
-  if (
-    !lead.status
-  ) {
-
-    lead.status =
-      "new";
-  }
-
-
-
-  // ========================================================
-  // 23. CALCULATE LEAD SCORE
-  // ========================================================
-
-  lead.score =
-    calculateLeadScore(
-      lead
-    );
-
-
-
-  console.log(
-    "🎯 LEAD SCORE:",
-    lead.score
-  );
-
-
-
-  // ========================================================
-  // 23A. SYNCHRONIZE BUYING INTENT AGAINST FINAL SCORE
-  // ========================================================
-
-  synchronizeAIInsights(
-    lead,
-    {
-      ...aiResult,
-
-      score:
-        lead.score,
-
-      insights:
-        aiInsights,
-
-    }
-  );
-
-
-
-  // ========================================================
-  // 24. COMPLETION STATE
-  // ========================================================
-
-  const hasBudget =
-    lead.budget !==
-      undefined &&
-    lead.budget !==
-      null;
-
-
-
-  const hasLocation =
-    Boolean(
-      lead.location
-    );
-
-
-
-  const hasBedrooms =
-    lead.bedrooms !==
-      undefined &&
-    lead.bedrooms !==
-      null;
-
-
-
-  const hasMoveDate =
-    Boolean(
-      lead.moveDate
-    );
-
-
-
-  lead.isComplete =
-    hasBudget &&
-    hasLocation &&
-    hasBedrooms &&
-    hasMoveDate;
-
-
-
-  // ========================================================
-  // 25. DEBUG LEAD
+  // 26. TRANSACTION RESULT DEBUG
   // ========================================================
 
   console.log(
-    "========== LEAD BEFORE SAVE =========="
+    "=================================================="
   );
-
-
-
-  console.dir(
-    lead.toObject(),
-    {
-      depth: null,
-    }
-  );
-
-
 
   console.log(
-    "======================================"
+    "✅ LEAD + OUTBOX TRANSACTION COMMITTED"
   );
-
-
-
-  // ========================================================
-  // 26. SAVE LEAD
-  // ========================================================
-
-  await lead.save();
-
-
 
   console.log(
-    "✅ LEAD SAVED:",
-    lead._id.toString()
+    "=================================================="
   );
 
+  console.log({
+
+    leadId:
+      lead?._id,
+
+    organizationId,
+
+    status:
+      lead?.status,
+
+    score:
+      lead?.score,
+
+    category:
+      transactionResult?.category,
+
+    previousStatus:
+      transactionResult?.previousStatus,
+
+    previousScore:
+      transactionResult?.previousScore,
+
+  });
 
 
   // ========================================================
-  // 26A. POST-SAVE EXTRACTION VERIFICATION
+  // 27. POST-TRANSACTION LEAD VERIFICATION
   // ========================================================
+
+  const persistedLead =
+    await Lead.findOne({
+
+      _id:
+        lead._id,
+
+      organizationId,
+
+    });
+
+
+  if (
+    !persistedLead
+  ) {
+
+    throw new Error(
+      "Lead could not be reloaded after transaction commit."
+    );
+  }
+
+
+  lead =
+    persistedLead;
+
 
   console.log(
     "\n=========================================================="
   );
 
-
-
   console.log(
     "🔍 POST-SAVE LEAD EXTRACTION VERIFICATION"
   );
-
-
 
   console.log(
     "=========================================================="
   );
 
 
-
   console.table({
 
     message:
-      cleanMessage,
+      message,
 
     budget:
       lead.budget ??
@@ -2013,6 +2439,11 @@ const processIngestion = async (
       lead.score ??
       0,
 
+    scoreCategory:
+      getLeadCategory(
+        lead.score
+      ),
+
     status:
       lead.status ||
       "",
@@ -2024,30 +2455,36 @@ const processIngestion = async (
   });
 
 
-
   console.log(
     "==========================================================\n"
   );
 
 
+  // ========================================================
+  // 28. AUTO ASSIGNMENT
+  // ========================================================
 
-  // ========================================================
-  // 27. AUTO ASSIGNMENT
-  // ========================================================
+  let assignmentResult =
+    null;
+
 
   try {
 
-    await autoAssignLead(
-      lead
-    );
-
+    assignmentResult =
+      await autoAssignLead(
+        lead
+      );
 
 
     const assignedLead =
-      await Lead.findById(
-        lead._id
-      );
+      await Lead.findOne({
 
+        _id:
+          lead._id,
+
+        organizationId,
+
+      });
 
 
     if (
@@ -2060,10 +2497,8 @@ const processIngestion = async (
     }
 
 
-
     lead =
       assignedLead;
-
 
 
     console.log(
@@ -2073,15 +2508,30 @@ const processIngestion = async (
         leadId:
           lead._id,
 
+        accepted:
+          assignmentResult?.accepted ??
+          null,
+
+        reason:
+          assignmentResult?.reason ||
+          null,
+
         assignedTo:
           lead.assignedTo,
 
-        agent:
-          lead.agent,
+        assignedSource:
+          lead.assignedSource,
+
+        previousAgentId:
+          assignmentResult?.previousAgentId ||
+          null,
+
+        assignmentEventQueued:
+          assignmentResult?.assignmentEventQueued ??
+          null,
 
       }
     );
-
 
 
   } catch (
@@ -2093,18 +2543,25 @@ const processIngestion = async (
       assignmentError.message
     );
 
-
-
     console.error(
       assignmentError
     );
   }
 
 
+  // ========================================================
+  // 29. UPDATE CONVERSATION QUALIFICATION
+  // ========================================================
 
-  // ========================================================
-  // 28. UPDATE CONVERSATION QUALIFICATION MEMORY
-  // ========================================================
+  if (
+    !conversation
+  ) {
+
+    throw new Error(
+      "Conversation context could not be created or loaded."
+    );
+  }
+
 
   conversation =
     await updateConversationQualification(
@@ -2116,9 +2573,8 @@ const processIngestion = async (
     );
 
 
-
   // ========================================================
-  // 28A. FORCE CURRENT LEAD MEMORY INTO CONVERSATION
+  // 30. FORCE CURRENT LEAD MEMORY INTO CONVERSATION
   // ========================================================
 
   synchronizeConversationMemory(
@@ -2130,9 +2586,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 29. DETECT CONVERSATION STAGE
+  // 31. DETECT CONVERSATION STAGE
   // ========================================================
 
   const stage =
@@ -2141,16 +2596,14 @@ const processIngestion = async (
     );
 
 
-
   console.log(
     "💬 DETECTED CONVERSATION STAGE:",
     stage
   );
 
 
-
   // ========================================================
-  // 30. CONVERSATION STATE ENGINE
+  // 32. CONVERSATION STATE ENGINE
   // ========================================================
 
   const state =
@@ -2167,16 +2620,14 @@ const processIngestion = async (
     );
 
 
-
   console.log(
     "🧠 CONVERSATION STATE:",
     state
   );
 
 
-
   // ========================================================
-  // 30A. SYNCHRONIZE STATE MEMORY
+  // 33. SYNCHRONIZE STATE MEMORY
   // ========================================================
 
   if (
@@ -2193,9 +2644,8 @@ const processIngestion = async (
   }
 
 
-
   // ========================================================
-  // 31. UPDATE CONVERSATION METADATA
+  // 34. UPDATE CONVERSATION METADATA
   // ========================================================
 
   conversation.customerName =
@@ -2209,7 +2659,6 @@ const processIngestion = async (
     "Unknown";
 
 
-
   if (
     lead.phone
   ) {
@@ -2219,10 +2668,8 @@ const processIngestion = async (
   }
 
 
-
   conversation.leadId =
     lead._id;
-
 
 
   conversation.stage =
@@ -2236,21 +2683,18 @@ const processIngestion = async (
     "collect_location";
 
 
-
   conversation.lastUpdated =
     new Date();
 
 
-
   // ========================================================
-  // 31A. CONVERSATION STATUS
+  // 35. CONVERSATION STATUS
   // ========================================================
 
   const candidateConversationStatus =
     safeString(
       state?.status
     ).toLowerCase();
-
 
 
   if (
@@ -2263,12 +2707,12 @@ const processIngestion = async (
 
     conversation.status =
       candidateConversationStatus;
+
   }
 
 
-
   // ========================================================
-  // 31B. FINAL QUALIFICATION MEMORY SYNC
+  // 36. FINAL CONVERSATION MEMORY SYNC
   // ========================================================
 
   synchronizeConversationMemory(
@@ -2279,20 +2723,32 @@ const processIngestion = async (
 
   );
 
+// ========================================================
+// 37. TEST FAILURE INJECTION — CONVERSATION SAVE
+// ========================================================
 
+if (
+  process.env.TEST_FORCE_CONVERSATION_SAVE_FAILURE === "true"
+) {
+  console.warn(
+    "⚠️ TEST: Forcing Conversation save failure."
+  );
+
+  throw new Error(
+    "TEST: Conversation persistence failed."
+  );
+}
 
   // ========================================================
-  // SAVE CONVERSATION
+  // 37. SAVE CONVERSATION
   // ========================================================
 
   await conversation.save();
 
 
-
   console.log(
     "💬 SAVED CONVERSATION:"
   );
-
 
 
   console.dir(
@@ -2303,38 +2759,27 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 32. CREATE CUSTOMER MESSAGE
-  // ========================================================
-  //
-  // IMPORTANT:
-  //
-  // source + externalMessageId are now persisted so the
-  // same provider message can be recognized if the webhook
-  // is delivered again.
-  //
-  // For WhatsApp this stores the Meta wamid.
-  //
-  // RACE-SAFE IDEMPOTENCY:
-  //
-  // The earlier findOne() protects normal webhook retries.
-  //
-  // The unique MongoDB index protects the case where two
-  // identical webhooks pass findOne() simultaneously.
-  //
-  // If this create receives the external-message duplicate
-  // key error, this request loses the race and MUST stop
-  // before:
-  //
-  //     conversation counters
-  //     events
-  //     sendAutoReply()
-  //
+  // 38. CREATE CUSTOMER MESSAGE
   // ========================================================
 
   let customerMessage;
 
+  // ========================================================
+// 38A. TEST FAILURE INJECTION — MESSAGE CREATE
+// ========================================================
+
+if (
+  process.env.TEST_FORCE_MESSAGE_CREATE_FAILURE === "true"
+) {
+  console.warn(
+    "⚠️ TEST: Forcing customer Message persistence failure."
+  );
+
+  throw new Error(
+    "TEST: Customer message persistence failed."
+  );
+}
 
 
   try {
@@ -2368,7 +2813,7 @@ const processIngestion = async (
           "",
 
         text:
-          cleanMessage,
+          message,
 
         status:
           "sent",
@@ -2378,13 +2823,10 @@ const processIngestion = async (
 
       });
 
+
   } catch (
     messageCreateError
   ) {
-
-    // ======================================================
-    // CONCURRENT WEBHOOK RACE
-    // ======================================================
 
     if (
       externalMessageId &&
@@ -2396,7 +2838,6 @@ const processIngestion = async (
       console.log(
         "♻️ CONCURRENT DUPLICATE WEBHOOK DETECTED"
       );
-
 
 
       console.log({
@@ -2414,7 +2855,6 @@ const processIngestion = async (
       });
 
 
-
       const existingExternalMessage =
         await findExistingExternalMessage(
 
@@ -2427,10 +2867,14 @@ const processIngestion = async (
         );
 
 
-
       if (
         existingExternalMessage
       ) {
+
+        assertExternalMessageMatches(
+  existingExternalMessage,
+  message
+);
 
         return buildDuplicateResponse(
 
@@ -2446,69 +2890,31 @@ const processIngestion = async (
       }
 
 
+      console.error(
+  "⚠️ DUPLICATE KEY CONFLICT COULD NOT BE RESOLVED",
+  {
+    organizationId,
+    source: normalizedSource,
+    externalMessageId,
+    mongoErrorCode: messageCreateError?.code,
+    mongoKeyPattern: messageCreateError?.keyPattern,
+  }
+);
 
-      /*
-       * Extremely defensive fallback.
-       *
-       * MongoDB reported the unique-key conflict, but the
-       * winning document is not immediately visible to this
-       * read. Do not continue to send an automatic reply.
-       */
+const recoveryError = new Error(
+  "An inbound message conflict occurred, but the existing message could not be confirmed."
+);
 
-      console.warn(
-        "⚠️ Duplicate external message was detected, but the existing Message could not be loaded immediately."
-      );
+recoveryError.status = 503;
+recoveryError.code =
+  "INBOUND_DUPLICATE_RECOVERY_FAILED";
 
-
-
-      return {
-
-        success:
-          true,
-
-        duplicate:
-          true,
-
-        message:
-          "Duplicate external message ignored.",
-
-        data: {
-
-          duplicate:
-            true,
-
-          externalMessageId,
-
-          source:
-            normalizedSource,
-
-          organizationId,
-
-          existingMessageId:
-            null,
-
-          conversationId:
-            conversation?._id ||
-            null,
-
-          leadId:
-            lead?._id ||
-            null,
-
-        },
-
-      };
+throw recoveryError;
     }
 
 
-
-    // ======================================================
-    // NOT AN IDEMPOTENCY ERROR
-    // ======================================================
-
     throw messageCreateError;
   }
-
 
 
   console.log(
@@ -2517,9 +2923,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 33. UPDATE CONVERSATION COUNTERS
+  // 39. UPDATE CONVERSATION COUNTERS
   // ========================================================
 
   conversation.messageCount =
@@ -2530,7 +2935,6 @@ const processIngestion = async (
     ) + 1;
 
 
-
   conversation.unreadCount =
 
     Number(
@@ -2539,11 +2943,10 @@ const processIngestion = async (
     ) + 1;
 
 
-
   conversation.lastMessage = {
 
     text:
-      cleanMessage,
+      message,
 
     senderId:
       null,
@@ -2557,14 +2960,11 @@ const processIngestion = async (
   };
 
 
-
   conversation.lastUpdated =
     new Date();
 
 
-
   await conversation.save();
-
 
 
   console.log(
@@ -2572,71 +2972,14 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 34. NEW LEAD EVENT
-  // ========================================================
-
-  if (
-    isNewLead
-  ) {
-
-    leadEventBus.emit(
-
-      LEAD_EVENTS.NEW_LEAD,
-
-      lead
-
-    );
-
-
-
-    console.log(
-      "📡 Emitting NEW_LEAD"
-    );
-  }
-
-
-
-  // ========================================================
-  // 35. HOT LEAD EVENT
-  // ========================================================
-
-  if (
-    Number(
-      lead.score
-    ) >= 70
-  ) {
-
-    leadEventBus.emit(
-
-      LEAD_EVENTS.HOT_LEAD,
-
-      lead
-
-    );
-
-
-
-    console.log(
-      "🔥 HOT_LEAD triggered"
-    );
-  }
-
-
-
-  // ========================================================
-  // 36. PIPELINE EVENT
+  // 40. NON-CRITICAL REALTIME PIPELINE EVENT
   // ========================================================
 
   leadEventBus.emit(
-
-    LEAD_EVENTS.PIPELINE_UPDATE,
-
-    lead
-
-  );
-
+  LEAD_EVENTS.PIPELINE_UPDATED,
+  lead
+);
 
 
   console.log(
@@ -2644,14 +2987,13 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 37. CONVERSATION UPDATE EVENT
+  // 41. NON-CRITICAL CONVERSATION UPDATE
   // ========================================================
 
   leadEventBus.emit(
 
-    LEAD_EVENTS.CONVERSATION_UPDATE,
+    LEAD_EVENTS.CONVERSATION_UPDATED,
 
     {
 
@@ -2669,17 +3011,20 @@ const processIngestion = async (
   );
 
 
+  console.log(
+    "💬 CONVERSATION_UPDATE sent"
+  );
+
 
   // ========================================================
-  // 38. DEBUG NEXT STEP
+  // 42. DEBUG NEXT STEP
   // ========================================================
 
   const missingFields = [];
 
 
-
   if (
-    !hasBudget
+    !completion.hasBudget
   ) {
 
     missingFields.push(
@@ -2688,9 +3033,8 @@ const processIngestion = async (
   }
 
 
-
   if (
-    !hasLocation
+    !completion.hasLocation
   ) {
 
     missingFields.push(
@@ -2699,9 +3043,8 @@ const processIngestion = async (
   }
 
 
-
   if (
-    !hasBedrooms
+    !completion.hasBedrooms
   ) {
 
     missingFields.push(
@@ -2710,16 +3053,14 @@ const processIngestion = async (
   }
 
 
-
   if (
-    !hasMoveDate
+    !completion.hasMoveDate
   ) {
 
     missingFields.push(
       "moveDate"
     );
   }
-
 
 
   if (
@@ -2732,12 +3073,10 @@ const processIngestion = async (
   }
 
 
-
   console.log(
     "🧠 Missing Fields:",
     missingFields
   );
-
 
 
   console.log(
@@ -2747,24 +3086,8 @@ const processIngestion = async (
   );
 
 
-
   // ========================================================
-  // 39. AUTO REPLY
-  // ========================================================
-  //
-  // normalizedSource is trusted because it came from the
-  // channel adapter / normalized message contract.
-  //
-  // We explicitly pass the source forward so the outbound
-  // transport layer knows whether this conversation came from:
-  //
-  //     whatsapp
-  //     sms
-  //     website
-  //     facebook
-  //
-  // The customer's message cannot choose the transport.
-  //
+  // 43. AUTO REPLY
   // ========================================================
 
   console.log(
@@ -2773,50 +3096,78 @@ const processIngestion = async (
   );
 
 
-
   console.log(
     "📡 AUTO REPLY CHANNEL:",
     normalizedSource
   );
 
 
+  const autoReplyResult =
+    await sendAutoReply(
 
-  await sendAutoReply(
+      lead,
 
-    lead,
+      aiResult,
 
-    aiResult,
+      conversation,
 
-    conversation,
+      state,
 
-    state,
+      {
 
-    {
+        ...extractedData,
 
-      ...extractedData,
+        channel:
+          normalizedSource,
 
-      channel:
-        normalizedSource,
+        source:
+          normalizedSource,
 
-      source:
-        normalizedSource,
+        organizationId:
+          organizationId,
 
-      organizationId:
-        organizationId,
+        channelMetadata:
+          ingestionInput.metadata ||
+          req?.channelMetadata ||
+          {},
 
-      channelMetadata:
-        ingestionInput.metadata ||
-        req?.channelMetadata ||
-        {},
+      }
 
-    }
+    );
 
+
+  console.log(
+    "📨 AUTO REPLY RESULT:",
+    autoReplyResult
   );
 
 
+  // ========================================================
+  // 44. RELOAD FINAL LEAD
+  // ========================================================
+
+  const finalLead =
+    await Lead.findOne({
+
+      _id:
+        lead._id,
+
+      organizationId,
+
+    });
+
+
+  if (
+    finalLead
+  ) {
+
+    lead =
+      finalLead;
+  }
+
 
   // ========================================================
-  // 40. RETURN RESULT
+  // 45. FINAL RESULT
   // ========================================================
 
   return {
@@ -2839,6 +3190,17 @@ const processIngestion = async (
 
       state,
 
+      assignment:
+        assignmentResult,
+
+      autoReply:
+        autoReplyResult,
+
+      scoreCategory:
+        getLeadCategory(
+          lead.score
+        ),
+
       extraction: {
 
         ai:
@@ -2858,7 +3220,6 @@ const processIngestion = async (
 };
 
 
-
 // ==========================================================
 // PUBLIC INGEST MESSAGE
 // ==========================================================
@@ -2868,18 +3229,30 @@ export const ingestMessage = async (
   res
 ) => {
 
-  // ========================================================
-  // DETERMINE CALLING MODE
-  // ========================================================
-
   const httpMode =
     isHttpResponse(
       res
     );
 
 
-
   try {
+
+    // ======================================================
+    // PUBLIC HTTP BODY CONTRACT
+    // ======================================================
+
+    if (
+      httpMode &&
+      !hasNormalizedMessage(
+        req
+      )
+    ) {
+
+      validatePublicHttpBody(
+        req
+      );
+    }
+
 
     // ======================================================
     // PROCESS
@@ -2889,7 +3262,6 @@ export const ingestMessage = async (
       await processIngestion(
         req
       );
-
 
 
     // ======================================================
@@ -2910,13 +3282,11 @@ export const ingestMessage = async (
     }
 
 
-
     // ======================================================
     // INTERNAL CALLER
     // ======================================================
 
     return result;
-
 
 
   } catch (
@@ -2931,18 +3301,13 @@ export const ingestMessage = async (
       "❌ AI INGESTION FAILED:"
     );
 
-
-
     console.error(
       error
     );
 
-
-
     console.error(
       error?.stack
     );
-
 
 
     // ======================================================
@@ -2969,21 +3334,20 @@ export const ingestMessage = async (
               : "AI ingestion failed.",
 
           error:
-            error.message,
+            error?.message ||
+            "AI ingestion failed.",
 
         });
     }
 
 
-
     // ======================================================
     // INTERNAL ERROR
-    // ========================================================
+    // ======================================================
 
     throw error;
   }
 };
-
 
 
 // ==========================================================

@@ -21,8 +21,12 @@
  * ==========================================================
  */
 
-import Property from "../models/Property.js";
-import PropertyFeature from "../models/PropertyFeature.js";
+import Property from "../models/property.js";
+import PropertyFeature from "../models/propertyFeature.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
 
 /**
  * ==========================================================
@@ -30,9 +34,38 @@ import PropertyFeature from "../models/PropertyFeature.js";
  * ==========================================================
  */
 
-const buildOrganizationQuery = (req) => ({
-  organizationId: req.user.organizationId,
-});
+/**
+ * Resolve the authenticated organization through the
+ * centralized organization-resolution boundary.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Organization identity is never taken directly from:
+ *
+ * • req.body
+ * • req.query
+ * • req.params
+ *
+ * The centralized organizationResolverService.js is the
+ * trusted organization-resolution boundary.
+ */
+const buildOrganizationQuery = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (!organization) {
+    return null;
+  }
+
+  return {
+    organizationId:
+      organization._id,
+  };
+};
 
 /**
  * ==========================================================
@@ -42,9 +75,36 @@ const buildOrganizationQuery = (req) => ({
  * ==========================================================
  */
 
-export const getPropertyFeatures = async (req, res) => {
+export const getPropertyFeatures = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    VERIFY ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -52,15 +112,17 @@ export const getPropertyFeatures = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      isArchived: false,
+        isArchived: false,
 
-    });
+      });
 
     if (!property) {
 
@@ -80,25 +142,27 @@ export const getPropertyFeatures = async (req, res) => {
     ==========================================================
     */
 
-    const features = await PropertyFeature.find({
+    const features =
+      await PropertyFeature.find({
 
-      property: property._id,
+        property:
+          property._id,
 
-      active: true,
-
-    })
-
-      .sort({
-
-        category: 1,
-
-        displayOrder: 1,
-
-        createdAt: 1,
+        active: true,
 
       })
 
-      .lean();
+        .sort({
+
+          category: 1,
+
+          displayOrder: 1,
+
+          createdAt: 1,
+
+        })
+
+        .lean();
 
     return res.status(200).json({
 
@@ -114,7 +178,9 @@ export const getPropertyFeatures = async (req, res) => {
 
   catch (error) {
 
-    console.error("GET PROPERTY FEATURES ERROR");
+    console.error(
+      "GET PROPERTY FEATURES ERROR"
+    );
 
     console.error(error);
 
@@ -122,7 +188,8 @@ export const getPropertyFeatures = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -138,9 +205,36 @@ export const getPropertyFeatures = async (req, res) => {
  * ==========================================================
  */
 
-export const createPropertyFeature = async (req, res) => {
+export const createPropertyFeature = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    VERIFY ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -148,15 +242,17 @@ export const createPropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      isArchived: false,
+        isArchived: false,
 
-    });
+      });
 
     if (!property) {
 
@@ -196,7 +292,8 @@ export const createPropertyFeature = async (req, res) => {
 
         success: false,
 
-        message: "Feature name and value are required.",
+        message:
+          "Feature name and value are required.",
 
       });
 
@@ -208,33 +305,39 @@ export const createPropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    const feature = await PropertyFeature.create({
+    const feature =
+      await PropertyFeature.create({
 
-      property: property._id,
+        property:
+          property._id,
 
-      organizationId: property.organizationId,
+        organizationId:
+          property.organizationId,
 
-      name,
+        name,
 
-      value,
+        value,
 
-      type,
+        type,
 
-      category,
+        category,
 
-      displayOrder,
+        displayOrder,
 
-      createdBy: req.user._id,
+        createdBy:
+          req.user._id,
 
-    });
+      });
 
     return res.status(201).json({
 
       success: true,
 
-      message: "Property feature created successfully.",
+      message:
+        "Property feature created successfully.",
 
-      data: feature,
+      data:
+        feature,
 
     });
 
@@ -242,7 +345,9 @@ export const createPropertyFeature = async (req, res) => {
 
   catch (error) {
 
-    console.error("CREATE PROPERTY FEATURE ERROR");
+    console.error(
+      "CREATE PROPERTY FEATURE ERROR"
+    );
 
     console.error(error);
 
@@ -250,7 +355,8 @@ export const createPropertyFeature = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -266,19 +372,42 @@ export const createPropertyFeature = async (req, res) => {
  * ==========================================================
  */
 
-export const updatePropertyFeature = async (req, res) => {
+export const updatePropertyFeature = async (
+  req,
+  res
+) => {
 
   try {
 
-    const feature = await PropertyFeature.findOne({
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
 
-      _id: req.params.featureId,
+    if (!organizationQuery) {
 
-      ...buildOrganizationQuery(req),
+      return res.status(401).json({
 
-      active: true,
+        success: false,
 
-    });
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
+
+    const feature =
+      await PropertyFeature.findOne({
+
+        _id:
+          req.params.featureId,
+
+        ...organizationQuery,
+
+        active: true,
+
+      });
 
     if (!feature) {
 
@@ -286,7 +415,8 @@ export const updatePropertyFeature = async (req, res) => {
 
         success: false,
 
-        message: "Property feature not found.",
+        message:
+          "Property feature not found.",
 
       });
 
@@ -329,10 +459,12 @@ export const updatePropertyFeature = async (req, res) => {
     }
 
     if (displayOrder !== undefined) {
-      feature.displayOrder = displayOrder;
+      feature.displayOrder =
+        displayOrder;
     }
 
-    feature.updatedBy = req.user._id;
+    feature.updatedBy =
+      req.user._id;
 
     await feature.save();
 
@@ -340,9 +472,11 @@ export const updatePropertyFeature = async (req, res) => {
 
       success: true,
 
-      message: "Property feature updated successfully.",
+      message:
+        "Property feature updated successfully.",
 
-      data: feature,
+      data:
+        feature,
 
     });
 
@@ -350,7 +484,9 @@ export const updatePropertyFeature = async (req, res) => {
 
   catch (error) {
 
-    console.error("UPDATE PROPERTY FEATURE ERROR");
+    console.error(
+      "UPDATE PROPERTY FEATURE ERROR"
+    );
 
     console.error(error);
 
@@ -358,7 +494,8 @@ export const updatePropertyFeature = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -376,9 +513,36 @@ export const updatePropertyFeature = async (req, res) => {
  * ==========================================================
  */
 
-export const deletePropertyFeature = async (req, res) => {
+export const deletePropertyFeature = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -386,15 +550,17 @@ export const deletePropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    const feature = await PropertyFeature.findOne({
+    const feature =
+      await PropertyFeature.findOne({
 
-      _id: req.params.featureId,
+        _id:
+          req.params.featureId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      active: true,
+        active: true,
 
-    });
+      });
 
     if (!feature) {
 
@@ -402,7 +568,8 @@ export const deletePropertyFeature = async (req, res) => {
 
         success: false,
 
-        message: "Property feature not found.",
+        message:
+          "Property feature not found.",
 
       });
 
@@ -414,9 +581,11 @@ export const deletePropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    feature.active = false;
+    feature.active =
+      false;
 
-    feature.updatedBy = req.user._id;
+    feature.updatedBy =
+      req.user._id;
 
     await feature.save();
 
@@ -424,7 +593,8 @@ export const deletePropertyFeature = async (req, res) => {
 
       success: true,
 
-      message: "Property feature deleted successfully.",
+      message:
+        "Property feature deleted successfully.",
 
     });
 
@@ -432,7 +602,9 @@ export const deletePropertyFeature = async (req, res) => {
 
   catch (error) {
 
-    console.error("DELETE PROPERTY FEATURE ERROR");
+    console.error(
+      "DELETE PROPERTY FEATURE ERROR"
+    );
 
     console.error(error);
 
@@ -440,7 +612,8 @@ export const deletePropertyFeature = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -456,9 +629,36 @@ export const deletePropertyFeature = async (req, res) => {
  * ==========================================================
  */
 
-export const restorePropertyFeature = async (req, res) => {
+export const restorePropertyFeature = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -466,15 +666,17 @@ export const restorePropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    const feature = await PropertyFeature.findOne({
+    const feature =
+      await PropertyFeature.findOne({
 
-      _id: req.params.featureId,
+        _id:
+          req.params.featureId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-      active: false,
+        active: false,
 
-    });
+      });
 
     if (!feature) {
 
@@ -482,7 +684,8 @@ export const restorePropertyFeature = async (req, res) => {
 
         success: false,
 
-        message: "Archived property feature not found.",
+        message:
+          "Archived property feature not found.",
 
       });
 
@@ -494,9 +697,11 @@ export const restorePropertyFeature = async (req, res) => {
     ==========================================================
     */
 
-    feature.active = true;
+    feature.active =
+      true;
 
-    feature.updatedBy = req.user._id;
+    feature.updatedBy =
+      req.user._id;
 
     await feature.save();
 
@@ -504,9 +709,11 @@ export const restorePropertyFeature = async (req, res) => {
 
       success: true,
 
-      message: "Property feature restored successfully.",
+      message:
+        "Property feature restored successfully.",
 
-      data: feature,
+      data:
+        feature,
 
     });
 
@@ -514,7 +721,9 @@ export const restorePropertyFeature = async (req, res) => {
 
   catch (error) {
 
-    console.error("RESTORE PROPERTY FEATURE ERROR");
+    console.error(
+      "RESTORE PROPERTY FEATURE ERROR"
+    );
 
     console.error(error);
 
@@ -522,7 +731,8 @@ export const restorePropertyFeature = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 

@@ -1,9 +1,7 @@
 /**
  * ==========================================================
- *
- * File:
- *
- * leadFlowAiBackend/controllers/propertyImageController.js
+ * PROPERTY IMAGE CONTROLLER
+ * ==========================================================
  *
  * Base URL:
  *
@@ -39,48 +37,36 @@
  *
  * ==========================================================
  *
- * PROJECT STRUCTURE
+ * IMPORTANT TENANT SECURITY
+ * ----------------------------------------------------------
  *
- * leadFlowAiBackend/
+ * This controller does NOT access Conversation documents.
  *
- * ├── controllers/
- * │   └── propertyImageController.js   <-- THIS FILE
- * │
- * ├── middleware/
- * │   ├── authMiddleware.js
- * │   └── uploadPropertyImages.js
- * │
- * ├── models/
- * │   ├── property.js
- * │   └── propertyImage.js
- * │
- * ├── routes/
- * │   └── propertyImageRoutes.js
- * │
- * ├── uploads/
- * │   └── properties/
- * │
- * └── server.js
+ * Organization resolution is delegated to the centralized
+ * organizationResolverService.js boundary.
+ *
+ * Property and PropertyImage access is isolated by:
+ *
+ * organizationId
+ *
+ * Every property lookup is scoped to the resolved
+ * organizationId.
+ *
+ * Every PropertyImage lookup is scoped to:
+ *
+ * • organizationId
+ * • property
+ * • image _id where applicable
+ *
+ * Client-supplied organization IDs are never used.
  *
  * ==========================================================
  *
  * IMPORTANT UPLOAD RULE
+ * ----------------------------------------------------------
  *
  * Every successful upload creates a NEW PropertyImage
  * document.
- *
- * Example:
- *
- * Upload 1:
- * 1787928505786-111111111.jpg
- *
- * Upload 2:
- * 1787928509000-222222222.jpg
- *
- * Upload 3:
- * 1787928512000-333333333.jpg
- *
- * These are three separate PropertyImage documents.
  *
  * ==========================================================
  */
@@ -92,55 +78,39 @@ import { fileURLToPath } from "url";
 import Property from "../models/property.js";
 import PropertyImage from "../models/propertyImage.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
 
 /* ==========================================================
    CURRENT FILE LOCATION
 ========================================================== */
 
-const __filename = fileURLToPath(import.meta.url);
+const __filename =
+  fileURLToPath(import.meta.url);
 
-const __dirname = path.dirname(__filename);
-
+const __dirname =
+  path.dirname(__filename);
 
 /* ==========================================================
    PROPERTY IMAGE UPLOAD DIRECTORY
 ========================================================== */
 
-/**
- * THIS FILE:
- *
- * leadFlowAiBackend/controllers/propertyImageController.js
- *
- * __dirname:
- *
- * leadFlowAiBackend/controllers
- *
- * ../uploads/properties:
- *
- * leadFlowAiBackend/uploads/properties
- *
- * IMPORTANT:
- *
- * There is NO src folder in this backend.
- *
- * Therefore:
- *
- * ../uploads/properties
- *
- * is the correct path.
- */
-
-const propertyUploadsDirectory = path.resolve(
-  __dirname,
-  "../uploads/properties"
-);
-
+const propertyUploadsDirectory =
+  path.resolve(
+    __dirname,
+    "../uploads/properties"
+  );
 
 /* ==========================================================
    CREATE UPLOAD DIRECTORY IF NEEDED
 ========================================================== */
 
-if (!fs.existsSync(propertyUploadsDirectory)) {
+if (
+  !fs.existsSync(
+    propertyUploadsDirectory
+  )
+) {
   fs.mkdirSync(
     propertyUploadsDirectory,
     {
@@ -148,7 +118,6 @@ if (!fs.existsSync(propertyUploadsDirectory)) {
     }
   );
 }
-
 
 /* ==========================================================
    DEBUG UPLOAD DIRECTORY
@@ -168,35 +137,106 @@ console.log(
 
 console.log(
   "📂 DIRECTORY EXISTS:",
-  fs.existsSync(propertyUploadsDirectory)
+  fs.existsSync(
+    propertyUploadsDirectory
+  )
 );
 
 console.log(
   "=================================================="
 );
 
-
 /* ==========================================================
    HELPERS
 ========================================================== */
 
-
 /**
- * Get organization ID from authenticated user.
+ * Resolve the authenticated organization through the
+ * centralized organization-resolution boundary.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Organization identity is NOT resolved directly from:
+ *
+ * • req.body
+ * • req.query
+ * • req.params
+ *
+ * The centralized organizationResolverService.js is the
+ * single resolution boundary.
+ *
+ * The resolved organization's _id is then used for all
+ * tenant-scoped Property and PropertyImage operations.
  */
-const getOrganizationId = (req) => {
+const getOrganizationId = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (!organization) {
+    return null;
+  }
+
   return (
-    req.user?.organizationId ||
-    req.user?.organization?._id ||
+    organization._id ||
     null
   );
 };
 
+/**
+ * Get authenticated organization.
+ *
+ * This is the HTTP-facing helper used by controller
+ * endpoints.
+ */
+const requireOrganization = async (
+  req,
+  res
+) => {
+  try {
+    const organizationId =
+      await getOrganizationId(
+        req
+      );
+
+    if (!organizationId) {
+      res.status(401).json({
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+      });
+
+      return null;
+    }
+
+    return organizationId;
+  } catch (error) {
+    console.error(
+      "ORGANIZATION RESOLUTION ERROR:",
+      error
+    );
+
+    res.status(401).json({
+      success: false,
+
+      message:
+        "Unable to resolve authenticated organization.",
+    });
+
+    return null;
+  }
+};
 
 /**
  * Get authenticated user ID.
  */
-const getUserId = (req) => {
+const getUserId = (
+  req
+) => {
   return (
     req.user?._id ||
     req.user?.id ||
@@ -204,51 +244,15 @@ const getUserId = (req) => {
   );
 };
 
-
-/**
- * Require organization.
- */
-const requireOrganization = (
-  req,
-  res
-) => {
-  const organizationId =
-    getOrganizationId(req);
-
-  if (!organizationId) {
-    res.status(401).json({
-      success: false,
-
-      message:
-        "Authenticated user does not have an organizationId.",
-    });
-
-    return null;
-  }
-
-  return organizationId;
-};
-
-
 /* ==========================================================
    IMAGE URL
 ========================================================== */
-
 
 /**
  * Build browser-accessible image URL.
  *
  * NEVER expose the physical filesystem path
  * to the browser.
- *
- * Physical:
- *
- * C:\MERN\leadFlow AI\leadFlowAiBackend\
- * uploads\properties\image.jpg
- *
- * Browser:
- *
- * http://localhost:5000/uploads/properties/image.jpg
  */
 const buildImageUrl = (
   req,
@@ -276,11 +280,9 @@ const buildImageUrl = (
   );
 };
 
-
 /* ==========================================================
    PHYSICAL FILE PATH
 ========================================================== */
-
 
 /**
  * Resolve physical image path.
@@ -306,7 +308,6 @@ const getPhysicalImagePath = (
   );
 };
 
-
 /**
  * Verify uploaded file exists physically.
  */
@@ -316,16 +317,6 @@ const verifyUploadedFile = (
   if (!file) {
     return false;
   }
-
-  /**
-   * Multer diskStorage normally provides:
-   *
-   * file.path
-   *
-   * and:
-   *
-   * file.filename
-   */
 
   if (
     file.path &&
@@ -349,11 +340,9 @@ const verifyUploadedFile = (
   );
 };
 
-
 /* ==========================================================
    SERIALIZATION
 ========================================================== */
-
 
 /**
  * Return consistent PropertyImage shape.
@@ -366,7 +355,8 @@ const serializeImage = (
   }
 
   const data =
-    typeof image.toObject === "function"
+    typeof image.toObject ===
+    "function"
       ? image.toObject()
       : image;
 
@@ -393,30 +383,44 @@ const serializeImage = (
       data.altText || "",
 
     isCover:
-      Boolean(data.isCover),
+      Boolean(
+        data.isCover
+      ),
 
     displayOrder:
-      Number(data.displayOrder || 0),
+      Number(
+        data.displayOrder || 0
+      ),
 
     width:
-      Number(data.width || 0),
+      Number(
+        data.width || 0
+      ),
 
     height:
-      Number(data.height || 0),
+      Number(
+        data.height || 0
+      ),
 
     size:
-      Number(data.size || 0),
+      Number(
+        data.size || 0
+      ),
 
     mimeType:
       data.mimeType || "",
 
     aiTags:
-      Array.isArray(data.aiTags)
+      Array.isArray(
+        data.aiTags
+      )
         ? data.aiTags
         : [],
 
     aiScore:
-      Number(data.aiScore || 0),
+      Number(
+        data.aiScore || 0
+      ),
 
     active:
       data.active !== false,
@@ -432,14 +436,19 @@ const serializeImage = (
   };
 };
 
-
 /* ==========================================================
    PROPERTY OWNERSHIP
 ========================================================== */
 
-
 /**
  * Find property belonging to organization.
+ *
+ * TENANT SECURITY:
+ * ----------------------------------------------------------
+ * propertyId alone is NEVER sufficient.
+ *
+ * Both property ID and resolved organization ID
+ * are required.
  */
 const getOwnedProperty = async (
   propertyId,
@@ -453,59 +462,52 @@ const getOwnedProperty = async (
   });
 };
 
-
 /* ==========================================================
    FIND REPLACEMENT COVER
 ========================================================== */
-
 
 /**
  * Find the next active image that can become
  * the cover image.
  */
-const findReplacementCover = async (
-  propertyId,
-  organizationId,
-  excludedImageId = null
-) => {
-  const query = {
-    property:
-      propertyId,
-
+const findReplacementCover =
+  async (
+    propertyId,
     organizationId,
+    excludedImageId = null
+  ) => {
+    const query = {
+      property:
+        propertyId,
 
-    active:
-      true,
-  };
+      organizationId,
 
-  if (excludedImageId) {
-    query._id = {
-      $ne:
-        excludedImageId,
+      active:
+        true,
     };
-  }
 
-  return PropertyImage.findOne(
-    query
-  ).sort({
-    displayOrder:
-      1,
+    if (excludedImageId) {
+      query._id = {
+        $ne:
+          excludedImageId,
+      };
+    }
 
-    createdAt:
-      1,
-  });
-};
+    return PropertyImage.findOne(
+      query
+    ).sort({
+      displayOrder:
+        1,
 
+      createdAt:
+        1,
+    });
+  };
 
 /* ==========================================================
    GET PROPERTY IMAGES
 ========================================================== */
 
-/**
- * GET
- *
- * /api/properties/:propertyId/images
- */
 export const getPropertyImages =
   async (
     req,
@@ -513,7 +515,7 @@ export const getPropertyImages =
   ) => {
     try {
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -596,16 +598,10 @@ export const getPropertyImages =
     }
   };
 
-
 /* ==========================================================
    GET SINGLE IMAGE
 ========================================================== */
 
-/**
- * GET
- *
- * /api/properties/:propertyId/images/:imageId
- */
 export const getPropertyImageById =
   async (
     req,
@@ -613,7 +609,7 @@ export const getPropertyImageById =
   ) => {
     try {
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -679,16 +675,10 @@ export const getPropertyImageById =
     }
   };
 
-
 /* ==========================================================
    GET CURRENT COVER IMAGE
 ========================================================== */
 
-/**
- * GET
- *
- * /api/properties/:propertyId/images/cover
- */
 export const getCoverImage =
   async (
     req,
@@ -696,7 +686,7 @@ export const getCoverImage =
   ) => {
     try {
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -724,7 +714,9 @@ export const getCoverImage =
         });
       }
 
-      if (!property.coverImage) {
+      if (
+        !property.coverImage
+      ) {
         return res.status(200).json({
           success:
             true,
@@ -835,42 +827,18 @@ export const getCoverImage =
     }
   };
 
-
 /* ==========================================================
    CREATE PROPERTY IMAGE
 ========================================================== */
 
-/**
- * POST
- *
- * /api/properties/:propertyId/images
- *
- * Current route uses:
- *
- * uploadCoverImage = upload.single("coverImage")
- *
- * Therefore:
- *
- * req.file
- *
- * contains the uploaded image.
- *
- * Every successful upload creates a NEW
- * PropertyImage document.
- */
 export const createPropertyImage =
   async (
     req,
     res
   ) => {
     try {
-
-      /* ======================================================
-         ORGANIZATION
-      ====================================================== */
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -879,18 +847,8 @@ export const createPropertyImage =
         return;
       }
 
-
-      /* ======================================================
-         USER
-      ====================================================== */
-
       const userId =
         getUserId(req);
-
-
-      /* ======================================================
-         DEBUG
-      ====================================================== */
 
       console.log(
         "=================================================="
@@ -921,7 +879,6 @@ export const createPropertyImage =
       );
 
       if (req.file) {
-
         console.log(
           "Original name:",
           req.file.originalname
@@ -954,11 +911,6 @@ export const createPropertyImage =
         "=================================================="
       );
 
-
-      /* ======================================================
-         PROPERTY
-      ====================================================== */
-
       const property =
         await getOwnedProperty(
           req.params.propertyId,
@@ -975,30 +927,14 @@ export const createPropertyImage =
         });
       }
 
-
-      /* ======================================================
-         COLLECT UPLOADED FILES
-      ====================================================== */
-
       let uploadedFiles = [];
 
-
-      /**
-       * upload.single()
-       */
       if (req.file) {
         uploadedFiles.push(
           req.file
         );
       }
 
-
-      /**
-       * upload.array()
-       *
-       * Kept for compatibility if the middleware
-       * is changed later.
-       */
       if (
         Array.isArray(
           req.files
@@ -1009,19 +945,12 @@ export const createPropertyImage =
         );
       }
 
-
-      /**
-       * upload.fields()
-       *
-       * Kept for compatibility with the
-       * uploadPropertyMedia middleware.
-       */
       if (
         req.files &&
         !Array.isArray(req.files) &&
-        typeof req.files === "object"
+        typeof req.files ===
+          "object"
       ) {
-
         if (
           Array.isArray(
             req.files.coverImage
@@ -1043,22 +972,12 @@ export const createPropertyImage =
         }
       }
 
-
-      /* ======================================================
-         REMOVE INVALID FILE REFERENCES
-      ====================================================== */
-
       uploadedFiles =
         uploadedFiles.filter(
           (file) =>
             file &&
             file.filename
         );
-
-
-      /* ======================================================
-         REMOVE DUPLICATES
-      ====================================================== */
 
       uploadedFiles =
         uploadedFiles.filter(
@@ -1074,11 +993,6 @@ export const createPropertyImage =
             ) === index
         );
 
-
-      /* ======================================================
-         NO FILE
-      ====================================================== */
-
       if (
         uploadedFiles.length ===
         0
@@ -1092,15 +1006,9 @@ export const createPropertyImage =
         });
       }
 
-
-      /* ======================================================
-         VERIFY PHYSICAL FILES
-      ====================================================== */
-
       for (
         const file of uploadedFiles
       ) {
-
         const expectedPath =
           getPhysicalImagePath(
             file.filename
@@ -1178,11 +1086,6 @@ export const createPropertyImage =
         }
       }
 
-
-      /* ======================================================
-         EXISTING COVER
-      ====================================================== */
-
       const existingCover =
         await PropertyImage.findOne({
           property:
@@ -1197,11 +1100,6 @@ export const createPropertyImage =
             true,
         });
 
-
-      /* ======================================================
-         COVER REQUEST
-      ====================================================== */
-
       const requestedCover =
         String(
           req.body?.isCover ||
@@ -1209,13 +1107,7 @@ export const createPropertyImage =
         ).toLowerCase() ===
         "true";
 
-
-      /* ======================================================
-         CREATE NEW IMAGE DOCUMENTS
-      ====================================================== */
-
       const createdImages = [];
-
 
       for (
         let index = 0;
@@ -1223,14 +1115,8 @@ export const createPropertyImage =
         uploadedFiles.length;
         index++
       ) {
-
         const file =
           uploadedFiles[index];
-
-
-        /* ====================================================
-           IMAGE URL
-        ==================================================== */
 
         const imageUrl =
           buildImageUrl(
@@ -1239,7 +1125,6 @@ export const createPropertyImage =
           );
 
         if (!imageUrl) {
-
           console.error(
             "Unable to create image URL for file:",
             file.filename
@@ -1247,11 +1132,6 @@ export const createPropertyImage =
 
           continue;
         }
-
-
-        /* ====================================================
-           DETERMINE COVER
-        ==================================================== */
 
         const shouldBeCover =
           (
@@ -1265,13 +1145,7 @@ export const createPropertyImage =
               uploadedFiles.length - 1
           );
 
-
-        /* ====================================================
-           DEMOTE CURRENT COVER
-        ==================================================== */
-
         if (shouldBeCover) {
-
           await PropertyImage.updateMany(
             {
               property:
@@ -1294,11 +1168,6 @@ export const createPropertyImage =
           );
         }
 
-
-        /* ====================================================
-           GET NEXT DISPLAY ORDER
-        ==================================================== */
-
         const latestImage =
           await PropertyImage.findOne({
             property:
@@ -1315,26 +1184,16 @@ export const createPropertyImage =
             )
             .lean();
 
-
         let nextDisplayOrder =
           Number(
             latestImage?.displayOrder ||
             0
           ) + 1;
 
-
-        /**
-         * Cover image is displayed first.
-         */
         if (shouldBeCover) {
           nextDisplayOrder =
             1;
         }
-
-
-        /* ====================================================
-           CREATE PROPERTY IMAGE
-        ==================================================== */
 
         console.log(
           "Creating PropertyImage:"
@@ -1359,23 +1218,8 @@ export const createPropertyImage =
             nextDisplayOrder,
         });
 
-
-        /**
-         * IMPORTANT:
-         *
-         * Use file.filename.
-         *
-         * DO NOT use:
-         *
-         * req.file.filename
-         *
-         * because the loop may be processing
-         * a different file.
-         */
-
         const image =
           await PropertyImage.create({
-
             property:
               property._id,
 
@@ -1384,9 +1228,6 @@ export const createPropertyImage =
             url:
               imageUrl,
 
-            /**
-             * Actual uploaded filename.
-             */
             publicId:
               file.filename,
 
@@ -1439,23 +1280,16 @@ export const createPropertyImage =
               userId,
           });
 
-
-        /* ====================================================
-           VERIFY MONGODB DOCUMENT
-        ==================================================== */
-
         if (
           !image ||
           !image._id
         ) {
-
           console.error(
             "PropertyImage.create() did not return a valid document."
           );
 
           continue;
         }
-
 
         console.log(
           "PropertyImage created successfully:"
@@ -1478,13 +1312,7 @@ export const createPropertyImage =
             image.isCover,
         });
 
-
-        /* ====================================================
-           UPDATE PROPERTY COVER
-        ==================================================== */
-
         if (shouldBeCover) {
-
           await Property.findOneAndUpdate(
             {
               _id:
@@ -1506,26 +1334,15 @@ export const createPropertyImage =
           );
         }
 
-
-        /* ====================================================
-           STORE CREATED IMAGE
-        ==================================================== */
-
         createdImages.push(
           image
         );
       }
 
-
-      /* ======================================================
-         SAFETY CHECK
-      ====================================================== */
-
       if (
         createdImages.length ===
         0
       ) {
-
         return res.status(500).json({
           success:
             false,
@@ -1535,11 +1352,6 @@ export const createPropertyImage =
         });
       }
 
-
-      /* ======================================================
-         FINAL PROPERTY
-      ====================================================== */
-
       const updatedProperty =
         await Property.findOne({
           _id:
@@ -1548,13 +1360,7 @@ export const createPropertyImage =
           organizationId,
         }).lean();
 
-
-      /* ======================================================
-         RESPONSE
-      ====================================================== */
-
       return res.status(201).json({
-
         success:
           true,
 
@@ -1581,7 +1387,6 @@ export const createPropertyImage =
       });
 
     } catch (error) {
-
       console.error(
         "=================================================="
       );
@@ -1609,7 +1414,6 @@ export const createPropertyImage =
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -1620,25 +1424,18 @@ export const createPropertyImage =
     }
   };
 
-
 /* ==========================================================
    SET COVER IMAGE
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/:imageId/cover
- */
 export const setCoverImage =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1646,7 +1443,6 @@ export const setCoverImage =
       if (!organizationId) {
         return;
       }
-
 
       const property =
         await getOwnedProperty(
@@ -1663,7 +1459,6 @@ export const setCoverImage =
             "Property not found.",
         });
       }
-
 
       const image =
         await PropertyImage.findOne({
@@ -1688,11 +1483,6 @@ export const setCoverImage =
             "Property image not found.",
         });
       }
-
-
-      /* ====================================================
-         DEMOTE OTHER COVERS
-      ==================================================== */
 
       await PropertyImage.updateMany(
         {
@@ -1720,11 +1510,6 @@ export const setCoverImage =
         }
       );
 
-
-      /* ====================================================
-         PROMOTE IMAGE
-      ==================================================== */
-
       image.isCover =
         true;
 
@@ -1732,11 +1517,6 @@ export const setCoverImage =
         1;
 
       await image.save();
-
-
-      /* ====================================================
-         UPDATE PROPERTY
-      ==================================================== */
 
       await Property.findOneAndUpdate(
         {
@@ -1753,9 +1533,7 @@ export const setCoverImage =
         }
       );
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -1769,14 +1547,12 @@ export const setCoverImage =
       });
 
     } catch (error) {
-
       console.error(
         "SET COVER IMAGE ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -1787,25 +1563,18 @@ export const setCoverImage =
     }
   };
 
-
 /* ==========================================================
    UPDATE IMAGE ORDER
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/:imageId/order
- */
 export const updateImageOrder =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1813,7 +1582,6 @@ export const updateImageOrder =
       if (!organizationId) {
         return;
       }
-
 
       const property =
         await getOwnedProperty(
@@ -1831,12 +1599,10 @@ export const updateImageOrder =
         });
       }
 
-
       const displayOrder =
         Number(
           req.body?.displayOrder
         );
-
 
       if (
         !Number.isInteger(
@@ -1844,9 +1610,7 @@ export const updateImageOrder =
         ) ||
         displayOrder < 1
       ) {
-
         return res.status(400).json({
-
           success:
             false,
 
@@ -1854,7 +1618,6 @@ export const updateImageOrder =
             "displayOrder must be a positive integer.",
         });
       }
-
 
       const image =
         await PropertyImage.findOne({
@@ -1870,10 +1633,8 @@ export const updateImageOrder =
             true,
         });
 
-
       if (!image) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -1882,15 +1643,12 @@ export const updateImageOrder =
         });
       }
 
-
       image.displayOrder =
         displayOrder;
 
       await image.save();
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -1904,14 +1662,12 @@ export const updateImageOrder =
       });
 
     } catch (error) {
-
       console.error(
         "UPDATE IMAGE ORDER ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -1922,35 +1678,18 @@ export const updateImageOrder =
     }
   };
 
-
 /* ==========================================================
    REORDER ALL IMAGES
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/reorder
- *
- * Body:
- *
- * {
- *   "imageIds": [
- *     "imageId1",
- *     "imageId2",
- *     "imageId3"
- *   ]
- * }
- */
 export const reorderImages =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -1958,7 +1697,6 @@ export const reorderImages =
       if (!organizationId) {
         return;
       }
-
 
       const property =
         await getOwnedProperty(
@@ -1968,7 +1706,6 @@ export const reorderImages =
 
       if (!property) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -1977,10 +1714,8 @@ export const reorderImages =
         });
       }
 
-
       const imageIds =
         req.body?.imageIds;
-
 
       if (
         !Array.isArray(
@@ -1989,9 +1724,7 @@ export const reorderImages =
         imageIds.length ===
           0
       ) {
-
         return res.status(400).json({
-
           success:
             false,
 
@@ -1999,11 +1732,6 @@ export const reorderImages =
             "imageIds must be a non-empty array.",
         });
       }
-
-
-      /* ====================================================
-         CHECK DUPLICATES
-      ==================================================== */
 
       const uniqueIds =
         new Set(
@@ -2013,14 +1741,11 @@ export const reorderImages =
           )
         );
 
-
       if (
         uniqueIds.size !==
         imageIds.length
       ) {
-
         return res.status(400).json({
-
           success:
             false,
 
@@ -2029,14 +1754,8 @@ export const reorderImages =
         });
       }
 
-
-      /* ====================================================
-         GET IMAGES
-      ==================================================== */
-
       const images =
         await PropertyImage.find({
-
           _id: {
             $in:
               imageIds,
@@ -2051,14 +1770,11 @@ export const reorderImages =
             true,
         });
 
-
       if (
         images.length !==
         imageIds.length
       ) {
-
         return res.status(400).json({
-
           success:
             false,
 
@@ -2067,22 +1783,14 @@ export const reorderImages =
         });
       }
 
-
-      /* ====================================================
-         BULK UPDATE
-      ==================================================== */
-
       const bulkOperations =
         imageIds.map(
           (
             imageId,
             index
           ) => ({
-
             updateOne: {
-
               filter: {
-
                 _id:
                   imageId,
 
@@ -2096,9 +1804,7 @@ export const reorderImages =
               },
 
               update: {
-
                 $set: {
-
                   displayOrder:
                     index + 1,
                 },
@@ -2107,19 +1813,12 @@ export const reorderImages =
           })
         );
 
-
       await PropertyImage.bulkWrite(
         bulkOperations
       );
 
-
-      /* ====================================================
-         RETURN UPDATED IMAGES
-      ==================================================== */
-
       const updatedImages =
         await PropertyImage.find({
-
           property:
             property._id,
 
@@ -2129,7 +1828,6 @@ export const reorderImages =
             true,
         })
           .sort({
-
             isCover:
               -1,
 
@@ -2141,9 +1839,7 @@ export const reorderImages =
           })
           .lean();
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -2160,14 +1856,12 @@ export const reorderImages =
       });
 
     } catch (error) {
-
       console.error(
         "REORDER IMAGES ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -2178,25 +1872,18 @@ export const reorderImages =
     }
   };
 
-
 /* ==========================================================
    ACTIVATE IMAGE
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/:imageId/activate
- */
 export const activateImage =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -2204,7 +1891,6 @@ export const activateImage =
       if (!organizationId) {
         return;
       }
-
 
       const property =
         await getOwnedProperty(
@@ -2214,7 +1900,6 @@ export const activateImage =
 
       if (!property) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2223,10 +1908,8 @@ export const activateImage =
         });
       }
 
-
       const image =
         await PropertyImage.findOne({
-
           _id:
             req.params.imageId,
 
@@ -2236,10 +1919,8 @@ export const activateImage =
           organizationId,
         });
 
-
       if (!image) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2248,15 +1929,12 @@ export const activateImage =
         });
       }
 
-
       image.active =
         true;
 
       await image.save();
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -2270,14 +1948,12 @@ export const activateImage =
       });
 
     } catch (error) {
-
       console.error(
         "ACTIVATE IMAGE ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -2288,25 +1964,18 @@ export const activateImage =
     }
   };
 
-
 /* ==========================================================
    DEACTIVATE IMAGE
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/:imageId/deactivate
- */
 export const deactivateImage =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -2314,7 +1983,6 @@ export const deactivateImage =
       if (!organizationId) {
         return;
       }
-
 
       const property =
         await getOwnedProperty(
@@ -2324,7 +1992,6 @@ export const deactivateImage =
 
       if (!property) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2333,10 +2000,8 @@ export const deactivateImage =
         });
       }
 
-
       const image =
         await PropertyImage.findOne({
-
           _id:
             req.params.imageId,
 
@@ -2349,10 +2014,8 @@ export const deactivateImage =
             true,
         });
 
-
       if (!image) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2360,7 +2023,6 @@ export const deactivateImage =
             "Active property image not found.",
         });
       }
-
 
       const wasCover =
         Boolean(
@@ -2374,11 +2036,6 @@ export const deactivateImage =
             image._id
           );
 
-
-      /* ====================================================
-         DEACTIVATE
-      ==================================================== */
-
       image.active =
         false;
 
@@ -2387,15 +2044,8 @@ export const deactivateImage =
 
       await image.save();
 
-
-      /* ====================================================
-         NORMAL IMAGE
-      ==================================================== */
-
       if (!wasCover) {
-
         return res.status(200).json({
-
           success:
             true,
 
@@ -2408,11 +2058,6 @@ export const deactivateImage =
             ),
         });
       }
-
-
-      /* ====================================================
-         CLEAR COVER
-      ==================================================== */
 
       await Property.findOneAndUpdate(
         {
@@ -2432,11 +2077,6 @@ export const deactivateImage =
         }
       );
 
-
-      /* ====================================================
-         FIND REPLACEMENT
-      ==================================================== */
-
       const replacement =
         await findReplacementCover(
           property._id,
@@ -2444,13 +2084,7 @@ export const deactivateImage =
           image._id
         );
 
-
-      /* ====================================================
-         SET REPLACEMENT
-      ==================================================== */
-
       if (replacement) {
-
         await PropertyImage.updateMany(
           {
             property:
@@ -2472,7 +2106,6 @@ export const deactivateImage =
           }
         );
 
-
         replacement.isCover =
           true;
 
@@ -2480,7 +2113,6 @@ export const deactivateImage =
           1;
 
         await replacement.save();
-
 
         await Property.findOneAndUpdate(
           {
@@ -2498,9 +2130,7 @@ export const deactivateImage =
         );
       }
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -2523,14 +2153,12 @@ export const deactivateImage =
       });
 
     } catch (error) {
-
       console.error(
         "DEACTIVATE IMAGE ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -2541,25 +2169,18 @@ export const deactivateImage =
     }
   };
 
-
 /* ==========================================================
    UPDATE IMAGE METADATA
 ========================================================== */
 
-/**
- * PATCH
- *
- * /api/properties/:propertyId/images/:imageId
- */
 export const updatePropertyImage =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -2568,10 +2189,8 @@ export const updatePropertyImage =
         return;
       }
 
-
       const image =
         await PropertyImage.findOne({
-
           _id:
             req.params.imageId,
 
@@ -2584,10 +2203,8 @@ export const updatePropertyImage =
             true,
         });
 
-
       if (!image) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2596,49 +2213,30 @@ export const updatePropertyImage =
         });
       }
 
-
-      /* ====================================================
-         CAPTION
-      ==================================================== */
-
       if (
         req.body?.caption !==
         undefined
       ) {
-
         image.caption =
           req.body.caption;
       }
-
-
-      /* ====================================================
-         ALT TEXT
-      ==================================================== */
 
       if (
         req.body?.altText !==
         undefined
       ) {
-
         image.altText =
           req.body.altText;
       }
-
-
-      /* ====================================================
-         DISPLAY ORDER
-      ==================================================== */
 
       if (
         req.body?.displayOrder !==
         undefined
       ) {
-
         const displayOrder =
           Number(
             req.body.displayOrder
           );
-
 
         if (
           !Number.isInteger(
@@ -2646,9 +2244,7 @@ export const updatePropertyImage =
           ) ||
           displayOrder < 1
         ) {
-
           return res.status(400).json({
-
             success:
               false,
 
@@ -2657,37 +2253,21 @@ export const updatePropertyImage =
           });
         }
 
-
         image.displayOrder =
           displayOrder;
       }
-
-
-      /* ====================================================
-         AI TAGS
-      ==================================================== */
 
       if (
         req.body?.aiTags !==
         undefined
       ) {
-
         let aiTags =
           req.body.aiTags;
 
-
-        /**
-         * Accept JSON string from multipart/form-data.
-         *
-         * Example:
-         *
-         * '["living-room","modern"]'
-         */
         if (
           typeof aiTags ===
           "string"
         ) {
-
           try {
             aiTags =
               JSON.parse(
@@ -2695,7 +2275,6 @@ export const updatePropertyImage =
               );
           } catch {
             return res.status(400).json({
-
               success:
                 false,
 
@@ -2705,15 +2284,12 @@ export const updatePropertyImage =
           }
         }
 
-
         if (
           !Array.isArray(
             aiTags
           )
         ) {
-
           return res.status(400).json({
-
             success:
               false,
 
@@ -2722,35 +2298,25 @@ export const updatePropertyImage =
           });
         }
 
-
         image.aiTags =
           aiTags;
       }
-
-
-      /* ====================================================
-         AI SCORE
-      ==================================================== */
 
       if (
         req.body?.aiScore !==
         undefined
       ) {
-
         const aiScore =
           Number(
             req.body.aiScore
           );
-
 
         if (
           Number.isNaN(
             aiScore
           )
         ) {
-
           return res.status(400).json({
-
             success:
               false,
 
@@ -2759,21 +2325,13 @@ export const updatePropertyImage =
           });
         }
 
-
         image.aiScore =
           aiScore;
       }
 
-
-      /* ====================================================
-         SAVE
-      ==================================================== */
-
       await image.save();
 
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -2787,14 +2345,12 @@ export const updatePropertyImage =
       });
 
     } catch (error) {
-
       console.error(
         "UPDATE PROPERTY IMAGE ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -2805,43 +2361,18 @@ export const updatePropertyImage =
     }
   };
 
-
 /* ==========================================================
    DELETE PROPERTY IMAGE
 ========================================================== */
 
-/**
- * DELETE
- *
- * /api/properties/:propertyId/images/:imageId
- *
- * Database:
- *
- * Soft delete:
- *
- * active = false
- *
- * Physical file:
- *
- * Removed from:
- *
- * leadFlowAiBackend/uploads/properties/
- *
- * If the deleted image is the cover:
- *
- * • clear Property.coverImage
- * • find replacement
- * • promote replacement
- */
 export const deletePropertyImage =
   async (
     req,
     res
   ) => {
     try {
-
       const organizationId =
-        requireOrganization(
+        await requireOrganization(
           req,
           res
         );
@@ -2850,17 +2381,14 @@ export const deletePropertyImage =
         return;
       }
 
-
       const property =
         await getOwnedProperty(
           req.params.propertyId,
           organizationId
         );
 
-
       if (!property) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2869,10 +2397,8 @@ export const deletePropertyImage =
         });
       }
 
-
       const image =
         await PropertyImage.findOne({
-
           _id:
             req.params.imageId,
 
@@ -2885,10 +2411,8 @@ export const deletePropertyImage =
             true,
         });
 
-
       if (!image) {
         return res.status(404).json({
-
           success:
             false,
 
@@ -2896,7 +2420,6 @@ export const deletePropertyImage =
             "Property image not found.",
         });
       }
-
 
       const wasCover =
         Boolean(
@@ -2910,20 +2433,10 @@ export const deletePropertyImage =
             image._id
           );
 
-
-      /* ====================================================
-         PHYSICAL FILE
-      ==================================================== */
-
       const physicalImagePath =
         getPhysicalImagePath(
           image.publicId
         );
-
-
-      /* ====================================================
-         SOFT DELETE
-      ==================================================== */
 
       image.active =
         false;
@@ -2933,20 +2446,13 @@ export const deletePropertyImage =
 
       await image.save();
 
-
-      /* ====================================================
-         DELETE PHYSICAL FILE
-      ==================================================== */
-
       if (
         physicalImagePath &&
         fs.existsSync(
           physicalImagePath
         )
       ) {
-
         try {
-
           fs.unlinkSync(
             physicalImagePath
           );
@@ -2955,9 +2461,7 @@ export const deletePropertyImage =
             "Deleted physical property image:",
             physicalImagePath
           );
-
         } catch (fileError) {
-
           console.error(
             "Unable to delete physical image file:",
             fileError
@@ -2965,15 +2469,8 @@ export const deletePropertyImage =
         }
       }
 
-
-      /* ====================================================
-         NORMAL IMAGE
-      ==================================================== */
-
       if (!wasCover) {
-
         return res.status(200).json({
-
           success:
             true,
 
@@ -2981,11 +2478,6 @@ export const deletePropertyImage =
             "Property image removed successfully.",
         });
       }
-
-
-      /* ====================================================
-         CLEAR COVER REFERENCE
-      ==================================================== */
 
       await Property.findOneAndUpdate(
         {
@@ -3005,11 +2497,6 @@ export const deletePropertyImage =
         }
       );
 
-
-      /* ====================================================
-         FIND REPLACEMENT
-      ==================================================== */
-
       const replacement =
         await findReplacementCover(
           property._id,
@@ -3017,13 +2504,7 @@ export const deletePropertyImage =
           image._id
         );
 
-
-      /* ====================================================
-         SET REPLACEMENT
-      ==================================================== */
-
       if (replacement) {
-
         await PropertyImage.updateMany(
           {
             property:
@@ -3045,7 +2526,6 @@ export const deletePropertyImage =
           }
         );
 
-
         replacement.isCover =
           true;
 
@@ -3053,7 +2533,6 @@ export const deletePropertyImage =
           1;
 
         await replacement.save();
-
 
         await Property.findOneAndUpdate(
           {
@@ -3071,13 +2550,7 @@ export const deletePropertyImage =
         );
       }
 
-
-      /* ====================================================
-         RESPONSE
-      ==================================================== */
-
       return res.status(200).json({
-
         success:
           true,
 
@@ -3095,14 +2568,12 @@ export const deletePropertyImage =
       });
 
     } catch (error) {
-
       console.error(
         "DELETE PROPERTY IMAGE ERROR:",
         error
       );
 
       return res.status(500).json({
-
         success:
           false,
 
@@ -3113,13 +2584,11 @@ export const deletePropertyImage =
     }
   };
 
-
 /* ==========================================================
    DEFAULT EXPORT
 ========================================================== */
 
 export default {
-
   getPropertyImages,
 
   getPropertyImageById,
@@ -3142,4 +2611,3 @@ export default {
 
   deletePropertyImage,
 };
-

@@ -74,182 +74,190 @@ const AdminLanding = () => {
 
   const [error, setError] = useState(null);
 
-  // ========================================================
-  // LOAD DASHBOARD
-  // ========================================================
 
-  const loadDashboard = async () => {
-    try {
-      setLoading(true);
-      setError(null);
+  // ==========================================================
+// LOAD DASHBOARD
+// ==========================================================
 
-      // ====================================================
-      // IMPORTANT
-      // ----------------------------------------------------
-      // We use Promise.allSettled instead of Promise.all.
-      //
-      // Recent activity is not critical enough to prevent
-      // the rest of the admin dashboard from rendering.
-      // ====================================================
+const loadDashboard = async () => {
+  try {
+    setLoading(true);
+    setError(null);
 
-      const results = await Promise.allSettled([
-        userService.getUsers({
-          page: 1,
-          limit: 100,
-        }),
+    console.log("[ADMIN DASHBOARD] Starting data refresh...");
 
-        propertyService.getProperties({
-          page: 1,
-          limit: 100,
-        }),
+    const results = await Promise.allSettled([
+      userService.getUsers({
+        page: 1,
+        limit: 100,
+      }),
 
-        leadService.getLeads({
-          page: 1,
-          limit: 100,
-        }),
+      propertyService.getProperties({
+        page: 1,
+        limit: 100,
+      }),
 
-        dashboardService.getRecentActivity(),
-      ]);
+      leadService.getLeads(),
 
-      // ====================================================
-      // EXTRACT RESULTS
-      // ====================================================
+      dashboardService.getRecentActivity(),
+    ]);
 
-      const [
-        usersResult,
-        propertiesResult,
-        leadsResult,
-        activityResult,
-      ] = results;
+    const [
+      usersResult,
+      propertiesResult,
+      leadsResult,
+      activityResult,
+    ] = results;
 
-      // ====================================================
-      // USERS
-      // ====================================================
+    // ------------------------------------------------------
+    // NORMALIZE API RESPONSE SHAPES
+    // Supports arrays and common paginated API responses.
+    // ------------------------------------------------------
 
-      let users = [];
-
-      if (usersResult.status === "fulfilled") {
-        users =
-          usersResult.value?.data || [];
-      } else {
+    const extractArray = (result, label) => {
+      if (result.status !== "fulfilled") {
         console.error(
-          "Admin dashboard: unable to load users",
-          usersResult.reason
+          `[ADMIN DASHBOARD] Failed to load ${label}:`,
+          result.reason
         );
+
+        return [];
       }
 
-      // ====================================================
-      // PROPERTIES
-      // ====================================================
+      const response = result.value;
 
-      let properties = [];
-
-      if (
-        propertiesResult.status === "fulfilled"
-      ) {
-        properties =
-          propertiesResult.value?.data || [];
-      } else {
-        console.error(
-          "Admin dashboard: unable to load properties",
-          propertiesResult.reason
-        );
+      // Services may return an array directly.
+      if (Array.isArray(response)) {
+        return response;
       }
 
-      // ====================================================
-      // LEADS
-      // ====================================================
+      // Handle common API response structures.
+      const candidates = [
+        response?.data,
+        response?.data?.data,
+        response?.data?.users,
+        response?.data?.properties,
+        response?.data?.leads,
+        response?.users,
+        response?.properties,
+        response?.leads,
+        response?.results,
+      ];
 
-      let leads = [];
-
-      if (leadsResult.status === "fulfilled") {
-        leads =
-          leadsResult.value?.data || [];
-      } else {
-        console.error(
-          "Admin dashboard: unable to load leads",
-          leadsResult.reason
-        );
+      for (const candidate of candidates) {
+        if (Array.isArray(candidate)) {
+          return candidate;
+        }
       }
 
-      // ====================================================
-      // RECENT ACTIVITY
-      // ====================================================
+      console.warn(
+        `[ADMIN DASHBOARD] ${label} response was not an array:`,
+        response
+      );
 
-      if (activityResult.status === "fulfilled") {
-        setActivity(
-          activityResult.value?.data || []
-        );
-      } else {
-        // -----------------------------------------------
-        // Recent activity is optional.
-        //
-        // A 500 from this endpoint should NOT prevent
-        // the admin dashboard from rendering.
-        // -----------------------------------------------
+      return [];
+    };
 
-        console.error(
-          "Admin dashboard: unable to load recent activity",
-          activityResult.reason
-        );
+    const users = extractArray(
+      usersResult,
+      "users"
+    );
 
-        setActivity([]);
-      }
+    const properties = extractArray(
+      propertiesResult,
+      "properties"
+    );
 
-      // ====================================================
-      // SUMMARY
-      // ====================================================
+    const leads = extractArray(
+      leadsResult,
+      "leads"
+    );
 
-      setSummary({
-        totalUsers: users.length,
+    // ------------------------------------------------------
+    // RECENT ACTIVITY
+    // Activity failures must not block the summary cards.
+    // ------------------------------------------------------
 
-        totalAgents: users.filter(
-          (user) =>
-            String(user?.role || "")
-              .toLowerCase() === "agent"
-        ).length,
+    if (activityResult.status === "fulfilled") {
+      const activityResponse = activityResult.value;
 
-        totalProperties:
-          properties.length,
+      const activityItems = Array.isArray(activityResponse)
+        ? activityResponse
+        : Array.isArray(activityResponse?.data)
+          ? activityResponse.data
+          : Array.isArray(activityResponse?.data?.data)
+            ? activityResponse.data.data
+            : [];
 
-        totalLeads:
-          leads.length,
-      });
-
-      // ====================================================
-      // PARTIAL FAILURE NOTICE
-      // ====================================================
-
-      const failedRequests =
-        results.filter(
-          (result) =>
-            result.status === "rejected"
-        );
-
-      if (failedRequests.length > 0) {
-        console.warn(
-          `${failedRequests.length} admin dashboard request(s) failed.`
-        );
-      }
-
-    } catch (err) {
-      // ====================================================
-      // UNEXPECTED ERROR
-      // ====================================================
-
+      setActivity(activityItems);
+    } else {
       console.error(
-        "Unable to load admin dashboard",
-        err
+        "[ADMIN DASHBOARD] Failed to load recent activity:",
+        activityResult.reason
       );
 
-      setError(
-        "Some dashboard information could not be loaded."
-      );
-
-    } finally {
-      setLoading(false);
+      setActivity([]);
     }
-  };
+
+    // ------------------------------------------------------
+    // SUMMARY COUNTS
+    // ------------------------------------------------------
+
+    const nextSummary = {
+      totalUsers: users.length,
+
+      totalAgents: users.filter(
+        (user) =>
+          String(user?.role || "").toLowerCase() === "agent"
+      ).length,
+
+      totalProperties: properties.length,
+
+      totalLeads: leads.length,
+    };
+
+    console.log(
+      "[ADMIN DASHBOARD] Loaded summary:",
+      nextSummary
+    );
+
+    console.log(
+      "[ADMIN DASHBOARD] Record counts:",
+      {
+        users: users.length,
+        properties: properties.length,
+        leads: leads.length,
+      }
+    );
+
+    setSummary(nextSummary);
+
+    // ------------------------------------------------------
+    // PARTIAL FAILURE NOTICE
+    // ------------------------------------------------------
+
+    const failedRequests = results.filter(
+      (result) => result.status === "rejected"
+    );
+
+    if (failedRequests.length > 0) {
+      console.warn(
+        `[ADMIN DASHBOARD] ${failedRequests.length} request(s) failed.`
+      );
+    }
+  } catch (err) {
+    console.error(
+      "[ADMIN DASHBOARD] Unexpected error:",
+      err
+    );
+
+    setError(
+      "Some dashboard information could not be loaded."
+    );
+  } finally {
+    setLoading(false);
+  }
+};
 
   // ========================================================
   // INITIAL LOAD
@@ -264,30 +272,34 @@ const AdminLanding = () => {
   // ========================================================
 
   const dashboardCards = [
-    {
-      title: "Users",
-      value: summary.totalUsers,
-      icon: Users,
-    },
+  {
+    title: "Users",
+    value: summary.totalUsers,
+    icon: Users,
+    to: "/admin/users",
+  },
 
-    {
-      title: "Agents",
-      value: summary.totalAgents,
-      icon: Building2,
-    },
+  {
+    title: "Agents",
+    value: summary.totalAgents,
+    icon: Building2,
+    to: "/admin/agents",
+  },
 
-    {
-      title: "Properties",
-      value: summary.totalProperties,
-      icon: Home,
-    },
+  {
+    title: "Properties",
+    value: summary.totalProperties,
+    icon: Home,
+    to: "/admin/properties",
+  },
 
-    {
-      title: "Leads",
-      value: summary.totalLeads,
-      icon: TrendingUp,
-    },
-  ];
+  {
+    title: "Leads",
+    value: summary.totalLeads,
+    icon: TrendingUp,
+    to: "/admin/leads",
+  },
+];
 
   // ========================================================
   // LOADING
@@ -345,37 +357,41 @@ const AdminLanding = () => {
       ================================================== */}
 
       <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-4">
+  {dashboardCards.map((card) => {
+    const Icon = card.icon;
 
-        {dashboardCards.map((card) => {
-          const Icon = card.icon;
+    return (
+      <Link
+        key={card.title}
+        to={card.to}
+        className="
+          block rounded-xl border bg-card p-6
+          transition-colors hover:border-primary
+          focus-visible:outline-none
+          focus-visible:ring-2
+          focus-visible:ring-primary
+        "
+        aria-label={`View ${card.title}`}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <Icon className="h-7 w-7 text-primary" />
 
-          return (
-            <div
-              key={card.title}
-              className="rounded-xl border bg-card p-6"
-            >
+          <span className="text-3xl font-bold">
+            {card.value}
+          </span>
+        </div>
 
-              <div className="mb-4 flex items-center justify-between">
+        <h3 className="font-semibold">
+          {card.title}
+        </h3>
 
-                <Icon
-                  className="h-7 w-7 text-primary"
-                />
-
-                <span className="text-3xl font-bold">
-                  {card.value}
-                </span>
-
-              </div>
-
-              <h3 className="font-semibold">
-                {card.title}
-              </h3>
-
-            </div>
-          );
-        })}
-
-      </div>
+        <p className="mt-2 text-sm text-muted-foreground">
+          View {card.title.toLowerCase()}
+        </p>
+      </Link>
+    );
+  })}
+</div>
 
       {/* ==================================================
           QUICK NAVIGATION
@@ -402,6 +418,31 @@ const AdminLanding = () => {
               Manage Properties
             </h3>
           </Link>
+
+          {/* ------------------------------------------------
+    LEADS
+------------------------------------------------ */}
+
+<Link
+  to="/admin/leads"
+  className="
+    rounded-xl border bg-card p-6
+    transition-colors hover:border-primary
+    focus-visible:outline-none
+    focus-visible:ring-2
+    focus-visible:ring-primary
+  "
+>
+  <TrendingUp className="mb-3 h-8 w-8 text-primary" />
+
+  <h3 className="font-semibold">
+    Manage Leads
+  </h3>
+
+  <p className="mt-2 text-sm text-muted-foreground">
+    Review, qualify and manage customer enquiries.
+  </p>
+</Link>
 
           {/* ------------------------------------------------
               USERS

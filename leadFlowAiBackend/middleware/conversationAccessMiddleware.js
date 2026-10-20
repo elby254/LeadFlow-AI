@@ -30,6 +30,10 @@ import mongoose from "mongoose";
 import Conversation from "../models/conversation.js";
 import Lead from "../models/lead.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    GET USER ID
 ========================================================== */
@@ -57,6 +61,21 @@ const getRole = (
   )
     .trim()
     .toLowerCase();
+};
+
+/* ==========================================================
+   GET ORGANIZATION ID
+========================================================== */
+
+const getOrganizationId = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  return organization?._id || null;
 };
 
 /* ==========================================================
@@ -100,8 +119,9 @@ export const conversationAccess =
       }
 
       const organizationId =
-        req.user.organizationId ||
-        req.organizationId;
+        await getOrganizationId(
+          req
+        );
 
       const userId =
         getUserId(

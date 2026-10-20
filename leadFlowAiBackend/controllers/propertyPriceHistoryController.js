@@ -1,6 +1,6 @@
 /**
  * ==========================================================
- * 
+ *
  * ----------------------------------------------------------
  * Handles Property Price History.
  *
@@ -19,15 +19,48 @@
 import Property from "../models/property.js";
 import PropertyPriceHistory from "../models/propertyPriceHistory.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /**
  * ==========================================================
  * Helper
  * ==========================================================
  */
 
-const buildOrganizationQuery = (req) => ({
-  organizationId: req.user.organizationId,
-});
+/**
+ * Resolve the authenticated organization through the
+ * centralized organization-resolution boundary.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * Organization identity is never taken directly from:
+ *
+ * • req.body
+ * • req.query
+ * • req.params
+ *
+ * The centralized organizationResolverService.js is the
+ * trusted organization-resolution boundary.
+ */
+const buildOrganizationQuery = async (
+  req
+) => {
+  const organization =
+    await resolveFromRequest(
+      req
+    );
+
+  if (!organization) {
+    return null;
+  }
+
+  return {
+    organizationId:
+      organization._id,
+  };
+};
 
 /**
  * ==========================================================
@@ -37,9 +70,36 @@ const buildOrganizationQuery = (req) => ({
  * ==========================================================
  */
 
-export const getPropertyPriceHistory = async (req, res) => {
+export const getPropertyPriceHistory = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -47,13 +107,15 @@ export const getPropertyPriceHistory = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-    });
+      });
 
     if (!property) {
 
@@ -61,7 +123,8 @@ export const getPropertyPriceHistory = async (req, res) => {
 
         success: false,
 
-        message: "Property not found.",
+        message:
+          "Property not found.",
 
       });
 
@@ -73,35 +136,39 @@ export const getPropertyPriceHistory = async (req, res) => {
     ==========================================================
     */
 
-    const history = await PropertyPriceHistory.find({
+    const history =
+      await PropertyPriceHistory.find({
 
-      property: property._id,
+        property:
+          property._id,
 
-    })
-
-      .populate(
-
-        "changedBy",
-
-        "name email"
-
-      )
-
-      .sort({
-
-        effectiveDate: -1,
+        ...organizationQuery,
 
       })
 
-      .lean();
+        .populate(
+          "changedBy",
+          "name email"
+        )
+
+        .sort({
+
+          effectiveDate:
+            -1,
+
+        })
+
+        .lean();
 
     return res.status(200).json({
 
       success: true,
 
-      count: history.length,
+      count:
+        history.length,
 
-      data: history,
+      data:
+        history,
 
     });
 
@@ -109,7 +176,9 @@ export const getPropertyPriceHistory = async (req, res) => {
 
   catch (error) {
 
-    console.error("GET PROPERTY PRICE HISTORY ERROR");
+    console.error(
+      "GET PROPERTY PRICE HISTORY ERROR"
+    );
 
     console.error(error);
 
@@ -117,7 +186,8 @@ export const getPropertyPriceHistory = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -133,35 +203,60 @@ export const getPropertyPriceHistory = async (req, res) => {
  * ==========================================================
  */
 
-export const getLatestPriceChange = async (req, res) => {
+export const getLatestPriceChange = async (
+  req,
+  res
+) => {
 
   try {
 
-    const latest = await PropertyPriceHistory
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
 
-      .findOne({
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
 
-        property: req.params.propertyId,
+    if (!organizationQuery) {
 
-        ...buildOrganizationQuery(req),
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
+
+    const latest =
+      await PropertyPriceHistory.findOne({
+
+        property:
+          req.params.propertyId,
+
+        ...organizationQuery,
 
       })
 
-      .populate(
+        .populate(
+          "changedBy",
+          "name"
+        )
 
-        "changedBy",
+        .sort({
 
-        "name"
+          effectiveDate:
+            -1,
 
-      )
+        })
 
-      .sort({
-
-        effectiveDate: -1,
-
-      })
-
-      .lean();
+        .lean();
 
     if (!latest) {
 
@@ -169,7 +264,8 @@ export const getLatestPriceChange = async (req, res) => {
 
         success: false,
 
-        message: "No price history found.",
+        message:
+          "No price history found.",
 
       });
 
@@ -179,7 +275,8 @@ export const getLatestPriceChange = async (req, res) => {
 
       success: true,
 
-      data: latest,
+      data:
+        latest,
 
     });
 
@@ -187,7 +284,9 @@ export const getLatestPriceChange = async (req, res) => {
 
   catch (error) {
 
-    console.error("LATEST PRICE HISTORY ERROR");
+    console.error(
+      "LATEST PRICE HISTORY ERROR"
+    );
 
     console.error(error);
 
@@ -195,7 +294,8 @@ export const getLatestPriceChange = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -211,9 +311,36 @@ export const getLatestPriceChange = async (req, res) => {
  * ==========================================================
  */
 
-export const getPriceStatistics = async (req, res) => {
+export const getPriceStatistics = async (
+  req,
+  res
+) => {
 
   try {
+
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
+
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
+
+    if (!organizationQuery) {
+
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
 
     /*
     ==========================================================
@@ -221,13 +348,15 @@ export const getPriceStatistics = async (req, res) => {
     ==========================================================
     */
 
-    const property = await Property.findOne({
+    const property =
+      await Property.findOne({
 
-      _id: req.params.propertyId,
+        _id:
+          req.params.propertyId,
 
-      ...buildOrganizationQuery(req),
+        ...organizationQuery,
 
-    });
+      });
 
     if (!property) {
 
@@ -235,7 +364,8 @@ export const getPriceStatistics = async (req, res) => {
 
         success: false,
 
-        message: "Property not found.",
+        message:
+          "Property not found.",
 
       });
 
@@ -247,15 +377,22 @@ export const getPriceStatistics = async (req, res) => {
     ==========================================================
     */
 
-    const history = await PropertyPriceHistory.find({
+    const history =
+      await PropertyPriceHistory.find({
 
-      property: property._id,
+        property:
+          property._id,
 
-    }).sort({
+        ...organizationQuery,
 
-      effectiveDate: 1,
+      })
 
-    });
+        .sort({
+
+          effectiveDate:
+            1,
+
+        });
 
     if (!history.length) {
 
@@ -265,17 +402,23 @@ export const getPriceStatistics = async (req, res) => {
 
         data: {
 
-          totalChanges: 0,
+          totalChanges:
+            0,
 
-          currentPrice: property.price,
+          currentPrice:
+            property.price,
 
-          highestPrice: property.price,
+          highestPrice:
+            property.price,
 
-          lowestPrice: property.price,
+          lowestPrice:
+            property.price,
 
-          totalIncrease: 0,
+          totalIncrease:
+            0,
 
-          totalDecrease: 0,
+          totalDecrease:
+            0,
 
         },
 
@@ -289,19 +432,25 @@ export const getPriceStatistics = async (req, res) => {
     ==========================================================
     */
 
-    const prices = history.map(item => item.newPrice);
+    const prices =
+      history.map(
+        item =>
+          item.newPrice
+      );
 
-    const increases = history.filter(
+    const increases =
+      history.filter(
+        item =>
+          item.changeType ===
+          "increase"
+      );
 
-      item => item.changeType === "increase"
-
-    );
-
-    const decreases = history.filter(
-
-      item => item.changeType === "decrease"
-
-    );
+    const decreases =
+      history.filter(
+        item =>
+          item.changeType ===
+          "decrease"
+      );
 
     return res.status(200).json({
 
@@ -309,23 +458,35 @@ export const getPriceStatistics = async (req, res) => {
 
       data: {
 
-        totalChanges: history.length,
+        totalChanges:
+          history.length,
 
-        currentPrice: property.price,
+        currentPrice:
+          property.price,
 
-        highestPrice: Math.max(...prices),
+        highestPrice:
+          Math.max(
+            ...prices
+          ),
 
-        lowestPrice: Math.min(...prices),
+        lowestPrice:
+          Math.min(
+            ...prices
+          ),
 
-        totalIncrease: increases.length,
+        totalIncrease:
+          increases.length,
 
-        totalDecrease: decreases.length,
+        totalDecrease:
+          decreases.length,
 
-        firstRecordedPrice: history[0].newPrice,
+        firstRecordedPrice:
+          history[0].newPrice,
 
         latestChange:
-
-          history[history.length - 1],
+          history[
+            history.length - 1
+          ],
 
       },
 
@@ -336,9 +497,7 @@ export const getPriceStatistics = async (req, res) => {
   catch (error) {
 
     console.error(
-
       "PROPERTY PRICE STATISTICS ERROR"
-
     );
 
     console.error(error);
@@ -347,7 +506,8 @@ export const getPriceStatistics = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 
@@ -369,17 +529,46 @@ export const getPriceStatistics = async (req, res) => {
  * ==========================================================
  */
 
-export const deletePriceHistoryRecord = async (req, res) => {
+export const deletePriceHistoryRecord = async (
+  req,
+  res
+) => {
 
   try {
 
-    const history = await PropertyPriceHistory.findOne({
+    /*
+    ==========================================================
+    RESOLVE ORGANIZATION
+    ==========================================================
+    */
 
-      _id: req.params.historyId,
+    const organizationQuery =
+      await buildOrganizationQuery(
+        req
+      );
 
-      ...buildOrganizationQuery(req),
+    if (!organizationQuery) {
 
-    });
+      return res.status(401).json({
+
+        success: false,
+
+        message:
+          "Authenticated user does not belong to a valid active organization.",
+
+      });
+
+    }
+
+    const history =
+      await PropertyPriceHistory.findOne({
+
+        _id:
+          req.params.historyId,
+
+        ...organizationQuery,
+
+      });
 
     if (!history) {
 
@@ -387,7 +576,8 @@ export const deletePriceHistoryRecord = async (req, res) => {
 
         success: false,
 
-        message: "Price history record not found.",
+        message:
+          "Price history record not found.",
 
       });
 
@@ -400,7 +590,6 @@ export const deletePriceHistoryRecord = async (req, res) => {
       success: true,
 
       message:
-
         "Price history record deleted successfully.",
 
     });
@@ -410,9 +599,7 @@ export const deletePriceHistoryRecord = async (req, res) => {
   catch (error) {
 
     console.error(
-
       "DELETE PRICE HISTORY ERROR"
-
     );
 
     console.error(error);
@@ -421,7 +608,8 @@ export const deletePriceHistoryRecord = async (req, res) => {
 
       success: false,
 
-      message: error.message,
+      message:
+        error.message,
 
     });
 

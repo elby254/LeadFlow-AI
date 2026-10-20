@@ -58,10 +58,15 @@ const ContactLead = () => {
 
    const handleSave = async () => {
   try {
+
+    if (!lead?._id) {
+  alert("Cannot save the call because the lead could not be loaded.");
+  return;
+}
     setSaving(true);
 
     await axiosClient.post(
-      `/lead/${lead._id}/call-history`,
+      `/admin/leads/${lead._id}/call-history`,
       {
         outcome: callOutcome,
         notes,
@@ -71,7 +76,7 @@ const ContactLead = () => {
 
     alert("Call saved successfully.");
 
-    navigate(`/lead/${lead._id}`);
+    navigate(`/admin/leads/${lead._id}`);
 
   } catch (error) {
     console.error(error);

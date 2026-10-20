@@ -857,7 +857,6 @@ export const extractBudgetFromMessage = (
 };
 
 
-
 // ==========================================================
 // EXTRACT LOCATION
 // ==========================================================
@@ -876,25 +875,24 @@ export const extractLocationFromMessage = (
   }
 
 
-
   // ========================================================
   // CRITICAL PROTECTION
   // ========================================================
   //
-  // If the entire customer message is a move-date answer,
-  // NEVER classify it as a location.
+  // A complete move-date response must NEVER become a
+  // location.
   //
   // Example:
   //
-  // "Next month"
+  // "next month"
   //
-  // must be:
+  // must remain:
   //
   // moveDate = "next month"
   //
   // and NOT:
   //
-  // location = "Next month"
+  // location = "next month"
   //
   // ========================================================
 
@@ -903,23 +901,130 @@ export const extractLocationFromMessage = (
       text
     )
   ) {
-
     return null;
   }
 
 
+  // ========================================================
+  // LOCATION PATTERNS
+  // ========================================================
+  //
+  // IMPORTANT:
+  //
+  // The extraction stops when it reaches:
+  //
+  // • urgency words
+  // • property-search words
+  // • budget words
+  // • movement/date words
+  // • conjunctions
+  // • punctuation
+  //
+  // Example:
+  //
+  // "available open studio around ruiru urgently"
+  //
+  // becomes:
+  //
+  // location = "ruiru"
+  // urgent   = true
+  //
+  // NOT:
+  //
+  // location = "ruiru urgently"
+  //
+  // ========================================================
 
   const locationPatterns = [
 
-    /\b(?:in|around|near|at|from)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which)\b|[,.!?]|$)/i,
+    /\b(?:in|around|near|at|from)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which|urgent|urgently|asap|immediately|available|availability|open|please|kindly|today|tomorrow|now)\b|[,.!?;:]|$)/i,
 
-    /\b(?:location|area|place)\s+(?:is|would be|should be|of)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which)\b|[,.!?]|$)/i,
+    /\b(?:location|area|place)\s+(?:is|would be|should be|of)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which|urgent|urgently|asap|immediately|available|availability|open|please|kindly|today|tomorrow|now)\b|[,.!?;:]|$)/i,
 
-    /\b(?:interested in|looking in|searching in|want in)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which)\b|[,.!?]|$)/i,
+    /\b(?:interested in|looking in|searching in|want in)\s+([A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,3}?)(?=\s+(?:with|and|for|within|under|over|budget|rent|price|move|moving|bedroom|bedrooms?|bed|beds?|house|apartment|flat|property|that|which|urgent|urgently|asap|immediately|available|availability|open|please|kindly|today|tomorrow|now)\b|[,.!?;:]|$)/i,
 
   ];
 
 
+  // ========================================================
+  // BOUNDARY WORDS
+  // ========================================================
+  //
+  // These are used as a second layer of protection in case
+  // a phrase is captured together with the location.
+  //
+  // ========================================================
+
+  const boundaryPatterns = [
+
+    /\s+urgent(?:ly)?\b/i,
+
+    /\s+asap\b/i,
+
+    /\s+immediately\b/i,
+
+    /\s+as\s+soon\s+as\s+possible\b/i,
+
+    /\s+right\s+away\b/i,
+
+    /\s+now\b/i,
+
+    /\s+available\b/i,
+
+    /\s+availability\b/i,
+
+    /\s+open\b/i,
+
+    /\s+please\b/i,
+
+    /\s+kindly\b/i,
+
+    /\s+looking\s+for\b/i,
+
+    /\s+searching\s+for\b/i,
+
+    /\s+interested\s+in\b/i,
+
+    /\s+with\b/i,
+
+    /\s+and\b/i,
+
+    /\s+for\b/i,
+
+    /\s+within\b/i,
+
+    /\s+under\b/i,
+
+    /\s+over\b/i,
+
+    /\s+budget\b/i,
+
+    /\s+rent\b/i,
+
+    /\s+price\b/i,
+
+    /\s+move\b/i,
+
+    /\s+moving\b/i,
+
+    /\s+bedroom(?:s)?\b/i,
+
+    /\s+house\b/i,
+
+    /\s+apartment\b/i,
+
+    /\s+flat\b/i,
+
+    /\s+property\b/i,
+
+    /[,.!?;:]/,
+
+  ];
+
+
+  // ========================================================
+  // PROCESS LOCATION PATTERNS
+  // ========================================================
 
   for (
     const pattern of locationPatterns
@@ -931,56 +1036,126 @@ export const extractLocationFromMessage = (
       );
 
     if (
-      match &&
+      !match ||
+      !match[1]
+    ) {
+      continue;
+    }
+
+
+    let candidate =
       match[1]
+        .trim();
+
+
+    if (!candidate) {
+      continue;
+    }
+
+
+    // ------------------------------------------------------
+    // Stop at the first known boundary
+    // ------------------------------------------------------
+
+    let boundaryIndex =
+      candidate.length;
+
+
+    for (
+      const boundaryPattern of
+      boundaryPatterns
     ) {
 
-      const locationCandidate =
-        normalizeLocation(
-          match[1]
+      const boundaryMatch =
+        candidate.match(
+          boundaryPattern
         );
 
-
-
-      // ----------------------------------------------------
-      // CRITICAL SECONDARY PROTECTION
-      // ----------------------------------------------------
-      //
-      // Even when a phrase appears after "in", "near",
-      // "around", etc., it must not become a location if
-      // the captured value is actually temporal.
-      //
-      // Example:
-      //
-      // "in next month"
-      //
-      // should never produce:
-      //
-      // location = "next month"
-      //
-      // ----------------------------------------------------
-
       if (
-        locationCandidate &&
-        !isMoveDateLikeText(
-          locationCandidate
-        )
+        boundaryMatch &&
+        typeof boundaryMatch.index ===
+          "number"
       ) {
 
-        return locationCandidate;
+        boundaryIndex =
+          Math.min(
+            boundaryIndex,
+            boundaryMatch.index
+          );
+
       }
+
+    }
+
+
+    candidate =
+      candidate
+        .slice(
+          0,
+          boundaryIndex
+        )
+        .trim();
+
+
+    // ------------------------------------------------------
+    // Remove punctuation
+    // ------------------------------------------------------
+
+    candidate =
+      candidate
+        .replace(
+          /^[,.;:!?-]+|[,.;:!?-]+$/g,
+          ""
+        )
+        .trim();
+
+
+    if (!candidate) {
+      continue;
+    }
+
+
+    // ------------------------------------------------------
+    // Temporal protection
+    // ------------------------------------------------------
+
+    if (
+      isMoveDateLikeText(
+        candidate
+      )
+    ) {
+      continue;
+    }
+
+
+    // ------------------------------------------------------
+    // Normalize location
+    // ------------------------------------------------------
+
+    const normalizedLocation =
+      normalizeLocation(
+        candidate
+      );
+
+
+    if (
+      normalizedLocation &&
+      !isMoveDateLikeText(
+        normalizedLocation
+      )
+    ) {
+
+      return normalizedLocation;
     }
   }
 
 
-
-  // --------------------------------------------------------
-  // Location-only follow-up
-  // --------------------------------------------------------
+  // ========================================================
+  // LOCATION-ONLY FOLLOW-UP
+  // ========================================================
 
   const locationOnlyPattern =
     /^[A-Za-z][A-Za-z0-9'’.-]*(?:\s+[A-Za-z][A-Za-z0-9'’.-]*){0,2}$/;
-
 
 
   if (
@@ -993,62 +1168,65 @@ export const extractLocationFromMessage = (
       text.toLowerCase();
 
 
-
     // ------------------------------------------------------
-    // Single-word exclusions
+    // Words that are definitely NOT locations
     // ------------------------------------------------------
 
-    const excludedWords = [
+    const excludedWords =
+      new Set([
+        "yes",
+        "no",
+        "okay",
+        "ok",
+        "sure",
+        "thanks",
+        "thank",
+        "hello",
+        "hi",
+        "hey",
+        "later",
+        "please",
+        "kindly",
 
-      "yes",
-      "no",
-      "okay",
-      "ok",
-      "sure",
-      "thanks",
-      "thank",
-      "hello",
-      "hi",
-      "hey",
-      "tomorrow",
-      "today",
-      "later",
-      "please",
-      "urgent",
-      "urgently",
-      "asap",
-      "rent",
-      "buy",
-      "buying",
-      "house",
-      "home",
-      "property",
-      "apartment",
-      "flat",
-      "bedroom",
-      "bedrooms",
-      "bed",
-      "beds",
-      "budget",
+        "urgent",
+        "urgently",
+        "asap",
+        "immediately",
 
-      // Temporal words
-      "next",
-      "this",
-      "month",
-      "week",
-      "year",
+        "rent",
+        "buy",
+        "buying",
 
-    ];
+        "house",
+        "home",
+        "property",
+        "apartment",
+        "flat",
 
+        "bedroom",
+        "bedrooms",
+        "bed",
+        "beds",
+
+        "budget",
+
+        "next",
+        "this",
+        "month",
+        "week",
+        "year",
+        "today",
+        "tomorrow",
+
+        "now",
+        "available",
+        "availability",
+        "open",
+      ]);
 
 
     // ------------------------------------------------------
     // Multi-word temporal phrases
-    // ------------------------------------------------------
-    //
-    // These are especially important because "next month"
-    // passes the generic location-only regex.
-    //
     // ------------------------------------------------------
 
     const excludedTemporalPhrases = [
@@ -1056,6 +1234,7 @@ export const extractLocationFromMessage = (
       "next month",
       "next week",
       "next year",
+
       "this month",
       "this week",
       "this year",
@@ -1063,27 +1242,22 @@ export const extractLocationFromMessage = (
     ];
 
 
-
     if (
       excludedTemporalPhrases.includes(
         lower
       )
     ) {
-
       return null;
     }
-
 
 
     if (
-      excludedWords.includes(
+      excludedWords.has(
         lower
       )
     ) {
-
       return null;
     }
-
 
 
     // ------------------------------------------------------
@@ -1095,10 +1269,8 @@ export const extractLocationFromMessage = (
         text
       )
     ) {
-
       return null;
     }
-
 
 
     return normalizeLocation(
@@ -1106,9 +1278,9 @@ export const extractLocationFromMessage = (
     );
   }
 
+
   return null;
 };
-
 
 
 // ==========================================================
@@ -1354,13 +1526,67 @@ export const extractCustomerNameFromMessage = (
     return null;
   }
 
+  // --------------------------------------------------------
+  // Name declaration patterns
+  // --------------------------------------------------------
+
   const patterns = [
 
-    /\bmy\s+name\s+is\s+([A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,2})/i,
+    // Example:
+    // "my name is Sarah Wanjiku"
+    /\bmy\s+name\s+is\s+([A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,3})/i,
 
-    /\b(?:i\s+am|i'm|im|this\s+is)\s+([A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,2})/i,
+    // Examples:
+    // "I'm Kevin looking for..."
+    // "I am John Mwangi looking for..."
+    // "This is Sarah..."
+    /\b(?:i\s+am|i'm|im|this\s+is)\s+([A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,3})/i,
 
   ];
+
+  // --------------------------------------------------------
+  // Words that signal the name has ended
+  // --------------------------------------------------------
+
+  const boundaryPatterns = [
+
+    /\s+looking\s+for\b/i,
+
+    /\s+searching\s+for\b/i,
+
+    /\s+interested\s+in\b/i,
+
+    /\s+looking\s+to\b/i,
+
+    /\s+trying\s+to\b/i,
+
+    /\s+want(?:\s+to)?\b/i,
+
+    /\s+need\b/i,
+
+    /\s+from\b/i,
+
+    /\s+for\b/i,
+
+    /\s+in\b/i,
+
+    /\s+at\b/i,
+
+    /\s+near\b/i,
+
+    /\s+with\b/i,
+
+    /\s+and\b/i,
+
+    /\s+but\b/i,
+
+    /[,.!?;:]/,
+
+  ];
+
+  // --------------------------------------------------------
+  // Words that cannot be valid name starters
+  // --------------------------------------------------------
 
   const stopWords =
     new Set([
@@ -1375,11 +1601,23 @@ export const extractCustomerNameFromMessage = (
       "here",
       "today",
       "tomorrow",
+      "for",
+      "in",
+      "at",
+      "near",
+      "with",
+      "and",
+      "but",
       "a",
       "an",
       "the",
+      "to",
 
     ]);
+
+  // --------------------------------------------------------
+  // Process patterns
+  // --------------------------------------------------------
 
   for (
     const pattern of patterns
@@ -1391,43 +1629,132 @@ export const extractCustomerNameFromMessage = (
       );
 
     if (
-      match &&
+      !match ||
+      !match[1]
+    ) {
+      continue;
+    }
+
+    let candidate =
       match[1]
+        .trim();
+
+    if (!candidate) {
+      continue;
+    }
+
+    // ------------------------------------------------------
+    // Stop at the first known sentence / intent boundary
+    // ------------------------------------------------------
+
+    let boundaryIndex =
+      candidate.length;
+
+    for (
+      const boundaryPattern of
+      boundaryPatterns
     ) {
 
-      const candidate =
-        match[1]
-          .trim()
-          .replace(
-            /[,.!?;:]+$/,
-            ""
-          )
-          .trim();
-
-      if (!candidate) {
-        continue;
-      }
-
-      const firstWord =
-        candidate
-          .split(/\s+/)[0]
-          .toLowerCase();
+      const boundaryMatch =
+        candidate.match(
+          boundaryPattern
+        );
 
       if (
-        stopWords.has(
-          firstWord
-        )
+        boundaryMatch &&
+        typeof boundaryMatch.index ===
+          "number"
       ) {
-        continue;
+
+        boundaryIndex =
+          Math.min(
+            boundaryIndex,
+            boundaryMatch.index
+          );
+
       }
 
-      return candidate;
     }
+
+    candidate =
+      candidate
+        .slice(
+          0,
+          boundaryIndex
+        )
+        .trim();
+
+    // ------------------------------------------------------
+    // Remove trailing punctuation
+    // ------------------------------------------------------
+
+    candidate =
+      candidate
+        .replace(
+          /^[,.;:!?-]+|[,.;:!?-]+$/g,
+          ""
+        )
+        .trim();
+
+    if (!candidate) {
+      continue;
+    }
+
+    // ------------------------------------------------------
+    // Validate candidate words
+    // ------------------------------------------------------
+
+    const words =
+      candidate.split(
+        /\s+/
+      );
+
+    if (
+      !words.length ||
+      words.length > 4
+    ) {
+      continue;
+    }
+
+    // ------------------------------------------------------
+    // Reject candidates containing stop words
+    // ------------------------------------------------------
+
+    const containsStopWord =
+      words.some(
+        (word) =>
+          stopWords.has(
+            word.toLowerCase()
+          )
+      );
+
+    if (
+      containsStopWord
+    ) {
+      continue;
+    }
+
+    // ------------------------------------------------------
+    // Ensure every word looks like a personal name
+    // ------------------------------------------------------
+
+    const validName =
+      words.every(
+        (word) =>
+          /^[A-Za-z][A-Za-z'’-]*$/.test(
+            word
+          )
+      );
+
+    if (!validName) {
+      continue;
+    }
+
+    return candidate;
   }
 
   return null;
 };
-
 
 
 // ==========================================================
@@ -2942,4 +3269,4 @@ export default {
 
   debugExtraction,
 
-};
+}

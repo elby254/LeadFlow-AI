@@ -25,6 +25,10 @@
 import Conversation from "../models/conversation.js";
 import Message from "../models/message.js";
 
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
 /* ==========================================================
    GET USER ID
 ========================================================== */
@@ -40,6 +44,82 @@ const getUserId = (
 };
 
 /* ==========================================================
+   GET AUTHENTICATED ORGANIZATION
+========================================================== */
+
+/**
+ * Resolve the organization from authenticated context.
+ *
+ * IMPORTANT
+ * ----------------------------------------------------------
+ * The viewer must never be allowed to select an
+ * organizationId from the request body/query/params.
+ *
+ * The shared organization resolver is the authoritative
+ * organization boundary.
+ */
+const getAuthenticatedOrganization = async (
+  req
+) => {
+  try {
+    const organization =
+      await resolveFromRequest(
+        req
+      );
+
+    return organization || null;
+  } catch (error) {
+    console.error(
+      "[ViewerConversationController] ORGANIZATION RESOLUTION ERROR:",
+      error
+    );
+
+    return null;
+  }
+};
+
+/* ==========================================================
+   VERIFY CONVERSATION ORGANIZATION
+========================================================== */
+
+/**
+ * Verify that the request-attached conversation belongs
+ * to the authenticated organization.
+ *
+ * This is defense-in-depth.
+ *
+ * Even if conversation middleware already resolved the
+ * conversation, the controller does not blindly trust
+ * conversation.organizationId.
+ */
+const belongsToOrganization = (
+  conversation,
+  organizationId
+) => {
+  if (
+    !conversation ||
+    !organizationId
+  ) {
+    return false;
+  }
+
+  if (
+    !conversation.organizationId
+  ) {
+    return false;
+  }
+
+  return (
+    String(
+      conversation.organizationId
+    ) ===
+    String(
+      organizationId
+    )
+  );
+};
+
+/* ==========================================================
    GET VIEWER CONVERSATIONS
 ========================================================== */
 
@@ -49,26 +129,19 @@ export const getViewerConversations =
     res
   ) => {
     try {
-      const organizationId =
-        req.user?.organizationId;
+      const organization =
+        await getAuthenticatedOrganization(
+          req
+        );
 
       const userId =
         getUserId(
           req
         );
 
-      if (
-        !organizationId
-      ) {
-        return res
-          .status(403)
-          .json({
-            success: false,
-
-            message:
-              "Organization not assigned.",
-          });
-      }
+      /* ====================================================
+         AUTHENTICATION
+      ==================================================== */
 
       if (
         !userId
@@ -82,6 +155,26 @@ export const getViewerConversations =
               "Authenticated user could not be identified.",
           });
       }
+
+      /* ====================================================
+         ORGANIZATION
+      ==================================================== */
+
+      if (
+        !organization
+      ) {
+        return res
+          .status(403)
+          .json({
+            success: false,
+
+            message:
+              "Organization not assigned.",
+          });
+      }
+
+      const organizationId =
+        organization._id;
 
       const {
         page = 1,
@@ -150,6 +243,10 @@ export const getViewerConversations =
           }
         );
       }
+
+      /* ====================================================
+         AUTHORITATIVE VIEWER QUERY
+      ==================================================== */
 
       const query = {
         organizationId,
@@ -276,6 +373,15 @@ export const sendViewerMessage =
           req
         );
 
+      const organization =
+        await getAuthenticatedOrganization(
+          req
+        );
+
+      /* ====================================================
+         CONVERSATION
+      ==================================================== */
+
       if (
         !conversation
       ) {
@@ -289,6 +395,10 @@ export const sendViewerMessage =
           });
       }
 
+      /* ====================================================
+         AUTHENTICATED USER
+      ==================================================== */
+
       if (
         !userId
       ) {
@@ -301,6 +411,89 @@ export const sendViewerMessage =
               "Authenticated user could not be identified.",
           });
       }
+
+      /* ====================================================
+         AUTHENTICATED ORGANIZATION
+      ==================================================== */
+
+      if (
+        !organization
+      ) {
+        return res
+          .status(403)
+          .json({
+            success: false,
+
+            message:
+              "Organization not assigned.",
+          });
+      }
+
+      const organizationId =
+        organization._id;
+
+      /* ====================================================
+         TENANT BOUNDARY
+      ==================================================== */
+      //
+      // Never trust the organization attached to
+      // req.conversation without comparing it to the
+      // authenticated organization.
+      //
+      // This prevents a conversation from one organization
+      // being used to create a message under another
+      // organization context.
+      //
+      // ====================================================
+
+      if (
+        !belongsToOrganization(
+          conversation,
+          organizationId
+        )
+      ) {
+        console.error(
+          "[ViewerConversationController] CONVERSATION ORGANIZATION MISMATCH:",
+          {
+            conversationId:
+              conversation?._id
+                ? String(
+                    conversation._id
+                  )
+                : null,
+
+            conversationOrganizationId:
+              conversation?.organizationId
+                ? String(
+                    conversation.organizationId
+                  )
+                : null,
+
+            authenticatedOrganizationId:
+              String(
+                organizationId
+              ),
+
+            userId:
+              String(
+                userId
+              ),
+          }
+        );
+
+        return res
+          .status(403)
+          .json({
+            success: false,
+
+            message:
+              "You do not have access to this conversation.",
+          });
+      }
+
+      /* ====================================================
+         MESSAGE TEXT
+      ==================================================== */
 
       const text =
         String(
@@ -323,14 +516,19 @@ export const sendViewerMessage =
           });
       }
 
-      /* ------------------------------------------------------
+      /* ====================================================
          CREATE MESSAGE
-      ------------------------------------------------------ */
+      ==================================================== */
+      //
+      // organizationId comes from authenticated context,
+      // NOT from req.body and NOT blindly from the
+      // conversation.
+      //
+      // ====================================================
 
       const message =
         await Message.create({
-          organizationId:
-            conversation.organizationId,
+          organizationId,
 
           conversationId:
             conversation._id,
@@ -363,9 +561,9 @@ export const sendViewerMessage =
             false,
         });
 
-      /* ------------------------------------------------------
+      /* ====================================================
          UPDATE CONVERSATION
-      ------------------------------------------------------ */
+      ==================================================== */
 
       conversation.messageCount =
         Number(
@@ -401,9 +599,9 @@ export const sendViewerMessage =
 
       await conversation.save();
 
-      /* ------------------------------------------------------
+      /* ====================================================
          SOCKET EVENT
-      ------------------------------------------------------ */
+      ==================================================== */
 
       req.io
         ?.to(

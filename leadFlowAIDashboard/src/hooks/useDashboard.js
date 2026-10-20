@@ -48,10 +48,10 @@ const useDashboard = () => {
     fetchSummary();
 
     // REAL-TIME UPDATE TRIGGER
-    socket.on("pipeline_update", fetchSummary);
+    socket.on("PIPELINE_UPDATE", fetchSummary);
 
     return () => {
-      socket.off("pipeline_update", fetchSummary);
+      socket.off("PIPELINE_UPDATE", fetchSummary);
     };
   }, [fetchSummary]);
 

@@ -32,6 +32,7 @@ import {
   Settings,
   LogOut,
   ShieldCheck,
+  TrendingUp,
 } from "lucide-react";
 
 const AdminSidebar = ({ sidebarOpen = true }) => {
@@ -49,6 +50,12 @@ const AdminSidebar = ({ sidebarOpen = true }) => {
      path: "/admin",
      icon: LayoutDashboard,
     },
+
+    {
+  label: "Leads",
+  path: "/admin/leads",
+  icon: TrendingUp,
+},
 
     {
       label: "Properties",

@@ -1,5 +1,30 @@
-// user management file. This controller allows an Admin to manage their team.
+// user management file.
+// This controller allows an Admin to manage their team.
+
 import User from "../models/user.js";
+
+import {
+  resolveFromRequest,
+} from "../services/organizationResolverService.js";
+
+// =====================================================
+// ORGANIZATION RESOLVER
+// =====================================================
+
+/**
+ * Resolve the authenticated user's active organization
+ * through the centralized organization resolver.
+ */
+const getOrganizationId = async (req) => {
+  const organization =
+    await resolveFromRequest(req);
+
+  if (!organization) {
+    return null;
+  }
+
+  return organization._id || null;
+};
 
 // =====================================================
 // GET ALL USERS IN ORGANIZATION
@@ -11,9 +36,18 @@ export const getOrganizationUsers = async (
   res
 ) => {
   try {
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
     const users = await User.find({
-      organizationId:
-        req.user.organizationId,
+      organizationId,
     }).select("-password");
 
     return res.status(200).json({
@@ -39,9 +73,18 @@ export const getAgents = async (
   res
 ) => {
   try {
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
     const agents = await User.find({
-      organizationId:
-        req.user.organizationId,
+      organizationId,
       role: "agent",
     }).select("-password");
 
@@ -68,9 +111,18 @@ export const getViewers = async (
   res
 ) => {
   try {
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
     const viewers = await User.find({
-      organizationId:
-        req.user.organizationId,
+      organizationId,
       role: "viewer",
     }).select("-password");
 
@@ -97,10 +149,19 @@ export const getUserById = async (
   res
 ) => {
   try {
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
     const user = await User.findOne({
       _id: req.params.id,
-      organizationId:
-        req.user.organizationId,
+      organizationId,
     }).select("-password");
 
     if (!user) {
@@ -132,19 +193,29 @@ export const deactivateUser = async (
   res
 ) => {
   try {
-    const user = await User.findOneAndUpdate(
-      {
-        _id: req.params.id,
-        organizationId:
-          req.user.organizationId,
-      },
-      {
-        isActive: false,
-      },
-      {
-        returnDocument: "after",
-      }
-    ).select("-password");
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
+    const user =
+      await User.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          organizationId,
+        },
+        {
+          isActive: false,
+        },
+        {
+          returnDocument: "after",
+        }
+      ).select("-password");
 
     if (!user) {
       return res.status(404).json({
@@ -176,19 +247,29 @@ export const activateUser = async (
   res
 ) => {
   try {
-    const user = await User.findOneAndUpdate(
-      {
-        _id: req.params.id,
-        organizationId:
-          req.user.organizationId,
-      },
-      {
-        isActive: true,
-      },
-      {
-        returnDocument: "after",
-      }
-    ).select("-password");
+    const organizationId =
+      await getOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
+    const user =
+      await User.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          organizationId,
+        },
+        {
+          isActive: true,
+        },
+        {
+          returnDocument: "after",
+        }
+      ).select("-password");
 
     if (!user) {
       return res.status(404).json({
