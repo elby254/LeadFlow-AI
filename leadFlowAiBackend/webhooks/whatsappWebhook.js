@@ -71,13 +71,24 @@ export const verifyWhatsAppWebhook = (
 
 
     const mode =
-      req.query["hub.mode"];
+  req.query["hub.mode"];
 
-    const token =
-      req.query["hub.verify_token"];
+const token =
+  req.query["hub.verify_token"];
 
-    const challenge =
-      req.query["hub.challenge"];
+const challenge =
+  req.query["hub.challenge"];
+
+// Temporary diagnostics: never log the token itself.
+console.log("WhatsApp verification request diagnostics:", {
+  originalUrl: req.originalUrl,
+  queryKeys: Object.keys(req.query || {}),
+  tokenType: typeof token,
+  tokenProvided: Boolean(token),
+  configuredTokenPresent: Boolean(
+    process.env.WHATSAPP_VERIFY_TOKEN
+  ),
+});
 
 
     console.log(
