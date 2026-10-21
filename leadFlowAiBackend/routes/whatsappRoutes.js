@@ -1,51 +1,35 @@
+// routes/whatsappRoutes.js
 import express from "express";
 
-import {
-  verifyWhatsAppWebhook,
-} from "../webhooks/whatsappWebhook.js";
+import { verifyWhatsAppWebhook } from "../webhooks/whatsappWebhook.js";
+import verifyMetaWebhookSignature from "../middleware/verifyMetaWebhookSignature.js";
+import handleWhatsAppStatusWebhook from "../webhooks/handleWhatsappStatusWebhook.js";
+import whatsappAdapter from "../adapters/channels/whatsappAdapter.js";
+import { ingestMessage } from "../controllers/aiIngestionController.js";
 
-const router =
-  express.Router();
+const router = express.Router();
 
 /* ==========================================================
-   META WEBHOOK VERIFICATION
+   GET /api/webhooks/whatsapp
+   Meta webhook verification handshake
 ========================================================== */
+router.get("/", verifyWhatsAppWebhook);
 
-/**
- * ==========================================================
- * GET /api/webhooks/whatsapp
- * ==========================================================
- *
- * Used exclusively by Meta to verify the WhatsApp webhook.
- *
- * IMPORTANT
- * ----------------------------------------------------------
- * This route is intentionally kept separate from the
- * standardized POST channel-ingestion pipeline.
- *
- * GET
- *   ↓
- * Meta verification
- *
- * POST
- *   ↓
- * webhookRoutes.js
- *   ↓
- * whatsappAdapter
- *   ↓
- * AI ingestion
- *
- * ==========================================================
- */
-
-router.get(
+/* ==========================================================
+   POST /api/webhooks/whatsapp
+   Pipeline:
+   1. Verify X-Hub-Signature-256
+   2. Process delivery status callbacks (acknowledge & stop)
+   3. Parse inbound message → req.normalizedMessage
+   4. AI ingestion (org resolution happens inside via
+      resolveFromRequest using phoneNumberId)
+========================================================== */
+router.post(
   "/",
-  verifyWhatsAppWebhook
+  verifyMetaWebhookSignature,
+  handleWhatsAppStatusWebhook,
+  whatsappAdapter,
+  ingestMessage
 );
-
-
-/* ==========================================================
-   EXPORT
-========================================================== */
 
 export default router;
