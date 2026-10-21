@@ -3,7 +3,7 @@ import express from "express";
 
 import { verifyWhatsAppWebhook } from "../webhooks/whatsappWebhook.js";
 import verifyMetaWebhookSignature from "../middleware/verifyMetaWebhookSignature.js";
-import handleWhatsAppStatusWebhook from "../webhooks/handleWhatsappStatusWebhook.js";
+import handleWhatsAppStatusWebhook from "../middleware/handleWhatsAppStatusWebhook.js";
 import whatsappAdapter from "../adapters/channels/whatsappAdapter.js";
 import { ingestMessage } from "../controllers/aiIngestionController.js";
 
